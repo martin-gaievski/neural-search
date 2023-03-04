@@ -6,32 +6,49 @@
 package org.opensearch.neuralsearch.search;
 
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.LongAccumulator;
 
+import lombok.Getter;
+
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.search.Collector;
 import org.apache.lucene.search.HitQueue;
 import org.apache.lucene.search.LeafCollector;
+import org.apache.lucene.search.Query;
 import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
-import org.apache.lucene.search.TopDocsCollector;
+import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TopScoreDocCollector;
 import org.apache.lucene.search.TotalHits;
-import org.apache.lucene.search.Weight;
+import org.apache.lucene.util.PriorityQueue;
+import org.opensearch.neuralsearch.query.CompoundQueryScorer;
 
-public class CompoundTopScoreDocCollector extends TopDocsCollector<ScoreDoc> {
+public class CompoundTopScoreDocCollector<T extends ScoreDoc> implements Collector {
     int docBase;
     float minCompetitiveScore;
     final HitsThresholdChecker hitsThresholdChecker;
     final MaxScoreAccumulator minScoreAcc;
     ScoreDoc pqTop;
+    protected TotalHits.Relation totalHitsRelation = TotalHits.Relation.EQUAL_TO;
+    protected Map<Query, Integer> totalHits;
+    public static final TopDocs EMPTY_TOPDOCS = new TopDocs(new TotalHits(0, TotalHits.Relation.EQUAL_TO), new ScoreDoc[0]);
+    // protected final PriorityQueue<ScoreDoc> pq;
+    int numOfHits;
+
+    @Getter
+    Map<Query, PriorityQueue<ScoreDoc>> compoundScores = new HashMap<>();
 
     public CompoundTopScoreDocCollector(int numHits, HitsThresholdChecker hitsThresholdChecker, MaxScoreAccumulator minScoreAcc) {
-        super(new HitQueue(numHits, true));
+        // this.pq = new HitQueue(numHits, true);
+        numOfHits = numHits;
+        totalHits = new HashMap<>();
         this.hitsThresholdChecker = hitsThresholdChecker;
         this.minScoreAcc = minScoreAcc;
-        pqTop = pq.top();
+        // pqTop = pq.top();
     }
 
     @Override
@@ -39,8 +56,11 @@ public class CompoundTopScoreDocCollector extends TopDocsCollector<ScoreDoc> {
         // reset the minimum competitive score
         docBase = context.docBase;
         minCompetitiveScore = 0f;
+        compoundScores.clear();
 
         return new TopScoreDocCollector.ScorerLeafCollector() {
+            CompoundQueryScorer compoundQueryScorer;
+
             @Override
             public void setScorer(Scorable scorer) throws IOException {
                 super.setScorer(scorer);
@@ -49,37 +69,28 @@ public class CompoundTopScoreDocCollector extends TopDocsCollector<ScoreDoc> {
                 } else {
                     updateGlobalMinCompetitiveScore(scorer);
                 }
+                compoundQueryScorer = (CompoundQueryScorer) scorer;
             }
 
             @Override
             public void collect(int doc) throws IOException {
-                float score = scorer.score();
-
-                // This collector relies on the fact that scorers produce positive values:
-                assert score >= 0; // NOTE: false for NaN
-
-                totalHits++;
-                hitsThresholdChecker.incrementHitCount();
-
-                if (minScoreAcc != null && (totalHits & minScoreAcc.modInterval) == 0) {
-                    updateGlobalMinCompetitiveScore(scorer);
-                }
-
-                if (score <= pqTop.score) {
-                    if (totalHitsRelation == TotalHits.Relation.EQUAL_TO) {
-                        // we just reached totalHitsThreshold, we can start setting the min
-                        // competitive score now
-                        updateMinCompetitiveScore(scorer);
+                Map<Query, Float> subScoresByQuery = compoundQueryScorer.compoundScores();
+                // iterate over results for each query
+                for (Map.Entry<Query, Float> queryScore : subScoresByQuery.entrySet()) {
+                    Query query = queryScore.getKey();
+                    float score = queryScore.getValue();
+                    if (score == 0) {
+                        continue;
                     }
-                    // Since docs are returned in-order (i.e., increasing doc Id), a document
-                    // with equal score to pqTop.score cannot compete since HitQueue favors
-                    // documents with lower doc Ids. Therefore reject those docs too.
-                    return;
+                    totalHits.put(query, totalHits.getOrDefault(query, 0) + 1);
+                    compoundScores.putIfAbsent(query, new HitQueue(numOfHits, true));
+                    // update pq of top results for each query
+                    PriorityQueue<ScoreDoc> pq = compoundScores.get(query);
+                    ScoreDoc topDoc = pq.top();
+                    topDoc.doc = doc + docBase;
+                    topDoc.score = score;
+                    pq.updateTop();
                 }
-                pqTop.doc = doc + docBase;
-                pqTop.score = score;
-                pqTop = pq.updateTop();
-                updateMinCompetitiveScore(scorer);
             }
         };
     }
@@ -89,9 +100,13 @@ public class CompoundTopScoreDocCollector extends TopDocsCollector<ScoreDoc> {
         return hitsThresholdChecker.scoreMode();
     }
 
-    @Override
-    public void setWeight(Weight weight) {
-        super.setWeight(weight);
+    protected int topDocsSize(Query query) {
+        // In case pq was populated with sentinel values, there might be less
+        // results than pq.size(). Therefore return all results until either
+        // pq.size() or totalHits.
+        int totalHitsPerQuery = totalHits.get(query);
+        // return totalHits < pq.size() ? totalHits : pq.size();
+        return totalHitsPerQuery;
     }
 
     protected void updateMinCompetitiveScore(Scorable scorer) throws IOException {
@@ -129,6 +144,60 @@ public class CompoundTopScoreDocCollector extends TopDocsCollector<ScoreDoc> {
                 totalHitsRelation = TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO;
             }
         }
+    }
+
+    public Map<Query, TopDocs> topDocs() {
+        Map<Query, TopDocs> topDocs = new HashMap<>();
+        for (Query query : compoundScores.keySet()) {
+            int qTopSize = topDocsSize(query);
+            TopDocs topDocsPerQuery = topDocsPerQuery(0, qTopSize, compoundScores.get(query), qTopSize);
+            topDocs.put(query, topDocsPerQuery);
+        }
+        return topDocs;
+        // return topDocs(0, topDocsSize());
+    }
+
+    TopDocs topDocsPerQuery(int start, int howMany, PriorityQueue<ScoreDoc> pq, int totalHits) {
+        // int size = topDocsSize();
+        int size = howMany;
+
+        if (howMany < 0) {
+            throw new IllegalArgumentException("Number of hits requested must be greater than 0 but value was " + howMany);
+        }
+
+        if (start < 0) {
+            throw new IllegalArgumentException("Expected value of starting position is between 0 and " + size + ", got " + start);
+        }
+
+        if (start >= size || howMany == 0) {
+            return newTopDocs(null, start, totalHits);
+        }
+
+        howMany = Math.min(size - start, howMany);
+        ScoreDoc[] results = new ScoreDoc[howMany];
+        // pq's pop() returns the 'least' element in the queue, therefore need
+        // to discard the first ones, until we reach the requested range.
+        // Note that this loop will usually not be executed, since the common usage
+        // should be that the caller asks for the last howMany results. However it's
+        // needed here for completeness.
+        for (int i = pq.size() - start - howMany; i > 0; i--) {
+            pq.pop();
+        }
+
+        // Get the requested results from pq.
+        populateResults(results, howMany, pq);
+
+        return newTopDocs(results, start, totalHits);
+    }
+
+    protected void populateResults(ScoreDoc[] results, int howMany, PriorityQueue<ScoreDoc> pq) {
+        for (int i = howMany - 1; i >= 0; i--) {
+            results[i] = pq.pop();
+        }
+    }
+
+    protected TopDocs newTopDocs(ScoreDoc[] results, int start, int totalHits) {
+        return results == null ? EMPTY_TOPDOCS : new TopDocs(new TotalHits(totalHits, totalHitsRelation), results);
     }
 }
 
@@ -187,13 +256,6 @@ final class MaxScoreAccumulator {
         public int compareTo(MaxScoreAccumulator.DocAndScore o) {
             int cmp = Float.compare(score, o.score);
             if (cmp == 0) {
-                // tie-break on the minimum doc base
-                // For a given minimum competitive score, we want to know the first segment
-                // where this score occurred, hence the reverse order here.
-                // On segments with a lower docBase, any document whose score is greater
-                // than or equal to this score would be competitive, while on segments with a
-                // higher docBase, documents need to have a strictly greater score to be
-                // competitive since we tie break on doc ID.
                 return Integer.compare(o.docBase, docBase);
             }
             return cmp;

@@ -22,7 +22,6 @@ import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Matches;
 import org.apache.lucene.search.MatchesUtils;
-import org.apache.lucene.search.Multiset;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryVisitor;
 import org.apache.lucene.search.ScoreMode;
@@ -30,8 +29,8 @@ import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.Weight;
 
 public class CompoundQuery extends Query implements Iterable<Query> {
-
-    private final Multiset<Query> subQueries = new Multiset<>();
+    // it's of type Multiset in OS implementation, using list to keep original order
+    private final List<Query> subQueries = new ArrayList<>();
 
     public CompoundQuery(Collection<Query> subQueries) {
         Objects.requireNonNull(subQueries, "Collection of Querys must not be null");
@@ -161,12 +160,8 @@ public class CompoundQuery extends Query implements Iterable<Query> {
             if (scorers.isEmpty()) {
                 // no sub-scorers had any documents
                 return null;
-            } else if (scorers.size() == 1) {
-                // only one sub-scorer in this segment
-                return scorers.get(0);
-            } else {
-                return new CompoundQueryScorer(this, scorers, scoreMode);
             }
+            return new CompoundQueryScorer(this, scorers, scoreMode);
         }
 
         @Override
