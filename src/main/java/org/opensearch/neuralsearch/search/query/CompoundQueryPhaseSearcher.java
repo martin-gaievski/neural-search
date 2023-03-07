@@ -9,7 +9,6 @@ import static org.opensearch.search.query.TopDocsCollectorContext.createTopDocsC
 
 import java.io.IOException;
 import java.util.LinkedList;
-import java.util.Map;
 import java.util.function.Supplier;
 
 import org.apache.lucene.index.IndexReader;
@@ -35,7 +34,7 @@ public class CompoundQueryPhaseSearcher extends QueryPhase.DefaultQueryPhaseSear
 
     private CompoundTopScoreDocCollector collector;
     private Supplier<TotalHits> totalHitsSupplier;
-    private Supplier<Map<Query, TopDocs>> topDocsSupplier;
+    private Supplier<TopDocs[]> topDocsSupplier;
     private Supplier<Float> maxScoreSupplier;
     protected SortAndFormats sortAndFormats;
 
@@ -83,8 +82,7 @@ public class CompoundQueryPhaseSearcher extends QueryPhase.DefaultQueryPhaseSear
 
         // TODO Wrap collector into context
         // Problems:
-        // - incorrect score for multiple sub-queries for docs that match multiple sub-queries
-        // - for multiple shards failing with exception, need to implement reduce in collector
+        // - incorrect score for multiple shards
         collector = new CompoundTopScoreDocCollector(
             numDocs,
             HitsThresholdChecker.create(Math.max(numDocs, searchContext.trackTotalHitsUpTo())),
@@ -92,18 +90,29 @@ public class CompoundQueryPhaseSearcher extends QueryPhase.DefaultQueryPhaseSear
         );
         topDocsSupplier = new CachedSupplier<>(collector::topDocs);
         totalHitsSupplier = () -> {
-            Map<Query, TopDocs> topDocs = topDocsSupplier.get();
-            return topDocs.get(topDocs.keySet().iterator().next()).totalHits;
+            TopDocs[] topDocs = topDocsSupplier.get();
+            // for now we do max from each sub-query result
+            long numHits = 0;
+            for (TopDocs td : topDocs) {
+                numHits = Math.max(numHits, td.totalHits.value);
+            }
+            /*for(Map.Entry<Query, TopDocs> entry: topDocs.entrySet()) {
+                numHits = Math.max(numHits, entry.getValue().totalHits.value);
+            }*/
+            return new TotalHits(numHits, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+            // return topDocs.get(topDocs.keySet().iterator().next()).totalHits;
         };// topDocsSupplier.get().totalHits;
         maxScoreSupplier = () -> {
-            Map<Query, TopDocs> topDocs = topDocsSupplier.get();
+            TopDocs[] topDocs = topDocsSupplier.get();
             // TODO review later, need to came up with valid max score
-            /*if (topDocs.scoreDocs.length == 0) {
+            // if (topDocs.scoreDocs.length == 0) {
+            if (topDocs.length == 0) {
                 return Float.NaN;
             } else {
-                return topDocs.scoreDocs[0].score;
-            }*/
-            return topDocs.get(topDocs.keySet().iterator().next()).scoreDocs[0].score;
+                // return topDocs.scoreDocs[0].score;
+                TopDocs docs = topDocs[0];
+                return docs.scoreDocs.length == 0 ? Float.NaN : docs.scoreDocs[0].score;
+            }
         };
         sortAndFormats = searchContext.sort();
 
@@ -124,7 +133,7 @@ public class CompoundQueryPhaseSearcher extends QueryPhase.DefaultQueryPhaseSear
     }
 
     TopDocsAndMaxScore newTopDocs() {
-        Map<Query, TopDocs> in = topDocsSupplier.get();
+        TopDocs[] in = topDocsSupplier.get();
         float maxScore = maxScoreSupplier.get();
 
         /*if (in instanceof TopFieldDocs) {

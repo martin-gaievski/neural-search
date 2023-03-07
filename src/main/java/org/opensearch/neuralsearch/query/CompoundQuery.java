@@ -153,9 +153,9 @@ public class CompoundQuery extends Query implements Iterable<Query> {
             for (Weight w : weights) {
                 // we will advance() subscorers
                 Scorer subScorer = w.scorer(context);
-                if (subScorer != null) {
-                    scorers.add(subScorer);
-                }
+                // if (subScorer != null) {
+                scorers.add(subScorer);
+                // }
             }
             if (scorers.isEmpty()) {
                 // no sub-scorers had any documents

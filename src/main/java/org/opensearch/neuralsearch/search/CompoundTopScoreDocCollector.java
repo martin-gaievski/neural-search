@@ -6,8 +6,6 @@
 package org.opensearch.neuralsearch.search;
 
 import java.io.IOException;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.LongAccumulator;
 
@@ -17,7 +15,6 @@ import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.Collector;
 import org.apache.lucene.search.HitQueue;
 import org.apache.lucene.search.LeafCollector;
-import org.apache.lucene.search.Query;
 import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
@@ -34,18 +31,18 @@ public class CompoundTopScoreDocCollector<T extends ScoreDoc> implements Collect
     final MaxScoreAccumulator minScoreAcc;
     ScoreDoc pqTop;
     protected TotalHits.Relation totalHitsRelation = TotalHits.Relation.EQUAL_TO;
-    protected Map<Query, Integer> totalHits;
+    protected int[] totalHits;
     public static final TopDocs EMPTY_TOPDOCS = new TopDocs(new TotalHits(0, TotalHits.Relation.EQUAL_TO), new ScoreDoc[0]);
     // protected final PriorityQueue<ScoreDoc> pq;
     int numOfHits;
 
     @Getter
-    Map<Query, PriorityQueue<ScoreDoc>> compoundScores = new HashMap<>();
+    PriorityQueue<ScoreDoc>[] compoundScores;
 
     public CompoundTopScoreDocCollector(int numHits, HitsThresholdChecker hitsThresholdChecker, MaxScoreAccumulator minScoreAcc) {
         // this.pq = new HitQueue(numHits, true);
         numOfHits = numHits;
-        totalHits = new HashMap<>();
+        // totalHits = new HashMap<>();
         this.hitsThresholdChecker = hitsThresholdChecker;
         this.minScoreAcc = minScoreAcc;
         // pqTop = pq.top();
@@ -56,7 +53,7 @@ public class CompoundTopScoreDocCollector<T extends ScoreDoc> implements Collect
         // reset the minimum competitive score
         docBase = context.docBase;
         minCompetitiveScore = 0f;
-        compoundScores.clear();
+        // compoundScores.clear();
 
         return new TopScoreDocCollector.ScorerLeafCollector() {
             CompoundQueryScorer compoundQueryScorer;
@@ -74,9 +71,29 @@ public class CompoundTopScoreDocCollector<T extends ScoreDoc> implements Collect
 
             @Override
             public void collect(int doc) throws IOException {
-                Map<Query, Float> subScoresByQuery = compoundQueryScorer.compoundScores();
+                // Map<Query, Float> subScoresByQuery = compoundQueryScorer.compoundScores();
+                float[] subScoresByQuery = compoundQueryScorer.compoundScores();
                 // iterate over results for each query
-                for (Map.Entry<Query, Float> queryScore : subScoresByQuery.entrySet()) {
+                if (compoundScores == null) {
+                    compoundScores = new PriorityQueue[subScoresByQuery.length];
+                    for (int i = 0; i < compoundScores.length; i++) {
+                        compoundScores[i] = new HitQueue(numOfHits, true);
+                    }
+                    totalHits = new int[subScoresByQuery.length];
+                }
+                for (int i = 0; i < subScoresByQuery.length; i++) {
+                    float score = subScoresByQuery[i];
+                    if (score == 0) {
+                        continue;
+                    }
+                    totalHits[i]++;
+                    PriorityQueue<ScoreDoc> pq = compoundScores[i];
+                    ScoreDoc topDoc = pq.top();
+                    topDoc.doc = doc + docBase;
+                    topDoc.score = score;
+                    pq.updateTop();
+                }
+                /*for (Map.Entry<Query, Float> queryScore : subScoresByQuery.entrySet()) {
                     Query query = queryScore.getKey();
                     float score = queryScore.getValue();
                     if (score == 0) {
@@ -90,7 +107,7 @@ public class CompoundTopScoreDocCollector<T extends ScoreDoc> implements Collect
                     topDoc.doc = doc + docBase;
                     topDoc.score = score;
                     pq.updateTop();
-                }
+                }*/
             }
         };
     }
@@ -100,14 +117,14 @@ public class CompoundTopScoreDocCollector<T extends ScoreDoc> implements Collect
         return hitsThresholdChecker.scoreMode();
     }
 
-    protected int topDocsSize(Query query) {
+    /*protected int topDocsSize(Query query) {
         // In case pq was populated with sentinel values, there might be less
         // results than pq.size(). Therefore return all results until either
         // pq.size() or totalHits.
         int totalHitsPerQuery = totalHits.get(query);
         // return totalHits < pq.size() ? totalHits : pq.size();
         return totalHitsPerQuery;
-    }
+    }*/
 
     protected void updateMinCompetitiveScore(Scorable scorer) throws IOException {
         if (hitsThresholdChecker.isThresholdReached() && pqTop != null && pqTop.score != Float.NEGATIVE_INFINITY) { // -Infinity is the
@@ -146,13 +163,19 @@ public class CompoundTopScoreDocCollector<T extends ScoreDoc> implements Collect
         }
     }
 
-    public Map<Query, TopDocs> topDocs() {
-        Map<Query, TopDocs> topDocs = new HashMap<>();
-        for (Query query : compoundScores.keySet()) {
+    public TopDocs[] topDocs() {
+        // Map<Query, TopDocs> topDocs = new HashMap<>();
+        TopDocs[] topDocs = new TopDocs[compoundScores.length];
+        for (int i = 0; i < compoundScores.length; i++) {
+            int qTopSize = totalHits[i];
+            TopDocs topDocsPerQuery = topDocsPerQuery(0, qTopSize, compoundScores[i], qTopSize);
+            topDocs[i] = topDocsPerQuery;
+        }
+        /*for (Query query : compoundScores.keySet()) {
             int qTopSize = topDocsSize(query);
             TopDocs topDocsPerQuery = topDocsPerQuery(0, qTopSize, compoundScores.get(query), qTopSize);
             topDocs.put(query, topDocsPerQuery);
-        }
+        }*/
         return topDocs;
         // return topDocs(0, topDocsSize());
     }

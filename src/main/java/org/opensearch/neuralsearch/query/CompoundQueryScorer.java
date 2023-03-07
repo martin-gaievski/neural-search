@@ -6,8 +6,6 @@
 package org.opensearch.neuralsearch.query;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -32,36 +30,47 @@ public class CompoundQueryScorer extends Scorer {
 
     private final DocIdSetIterator approximation;
 
-    List<Float> subScores;
+    // List<Float> subScores;
+    float[] subScores;
+
+    Map<Query, Integer> queryToIndex;
 
     CompoundQueryScorer(Weight weight, List<Scorer> subScorers, ScoreMode scoreMode) throws IOException {
         super(weight);
         this.subScorers = subScorers;
         this.subScorersPQ = new DisiPriorityQueue(subScorers.size());
+        queryToIndex = new HashMap<>();
+        subScores = new float[subScorers.size()];
+        int idx = 0;
         for (Scorer scorer : subScorers) {
+            if (scorer == null) {
+                idx++;
+                continue;
+            }
             final DisiWrapper w = new DisiWrapper(scorer);
             this.subScorersPQ.add(w);
+            queryToIndex.put(scorer.getWeight().getQuery(), idx);
+            idx++;
         }
         this.approximation = new DisjunctionDISIApproximation(this.subScorersPQ);
-        subScores = new ArrayList<>();
     }
 
     public float score() throws IOException {
         // DisiWrapper topList = subScorersPQ.topList();
         float scoreMax = 0;
         double otherScoreSum = 0;
-        subScores.clear();
+        subScores = new float[subScores.length];
         // for (DisiWrapper w = topList; w != null; w = w.next) {
         Iterator<DisiWrapper> disiWrapperIterator = subScorersPQ.iterator();
         while (disiWrapperIterator.hasNext()) {
             DisiWrapper w = disiWrapperIterator.next();
             // check if this doc has match in the subQuery. If not, add score as 0.0 and continue
             if (w.scorer.docID() == DocIdSetIterator.NO_MORE_DOCS) {
-                subScores.add(0.0f);
+                // subScores.add(0.0f);
                 continue;
             }
             float subScore = w.scorer.score();
-            subScores.add(subScore);
+            subScores[queryToIndex.get(w.scorer.getWeight().getQuery())] = subScore;
             if (subScore >= scoreMax) {
                 otherScoreSum += scoreMax;
                 scoreMax = subScore;
@@ -72,23 +81,24 @@ public class CompoundQueryScorer extends Scorer {
         return (float) (scoreMax + otherScoreSum);
     }
 
-    public Map<Query, Float> compoundScores() throws IOException {
-        Map<Query, Float> scores = new HashMap<>();
+    public float[] compoundScores() throws IOException {
+        // Map<Query, Float> scores = new HashMap<>();
+        float[] scores = new float[subScores.length];
         for (DisiWrapper disiWrapper : subScorersPQ) {
             // check if this doc has match in the subQuery. If not, add score as 0.0 and continue
             if (disiWrapper.scorer.docID() == DocIdSetIterator.NO_MORE_DOCS) {
-                scores.put(disiWrapper.scorer.getWeight().getQuery(), 0.0f);
+                // scores.put(disiWrapper.scorer.getWeight().getQuery(), 0.0f);
                 continue;
             }
             float subScore = disiWrapper.scorer.score();
-            scores.put(disiWrapper.scorer.getWeight().getQuery(), subScore);
+            scores[queryToIndex.get(disiWrapper.scorer.getWeight().getQuery())] = subScore;
         }
         return scores;
     }
 
-    public List<Float> getSubScores() {
+    /*public List<Float> getSubScores() {
         return Collections.unmodifiableList(subScores);
-    }
+    }*/
 
     DisiWrapper getSubMatches() throws IOException {
         return subScorersPQ.topList();
