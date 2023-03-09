@@ -8,7 +8,6 @@ package org.opensearch.neuralsearch.query;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Iterator;
-import java.util.List;
 import java.util.Map;
 
 import lombok.Getter;
@@ -24,7 +23,8 @@ import org.apache.lucene.search.Weight;
 
 public class CompoundQueryScorer extends Scorer {
     @Getter
-    private final List<Scorer> subScorers;
+    // private final List<Scorer> subScorers;
+    private final Scorer[] subScorers;
 
     private final DisiPriorityQueue subScorersPQ;
 
@@ -35,22 +35,30 @@ public class CompoundQueryScorer extends Scorer {
 
     Map<Query, Integer> queryToIndex;
 
-    CompoundQueryScorer(Weight weight, List<Scorer> subScorers, ScoreMode scoreMode) throws IOException {
+    // CompoundQueryScorer(Weight weight, List<Scorer> subScorers, ScoreMode scoreMode) throws IOException {
+    CompoundQueryScorer(Weight weight, Scorer[] subScorers, ScoreMode scoreMode) throws IOException {
         super(weight);
         this.subScorers = subScorers;
-        this.subScorersPQ = new DisiPriorityQueue(subScorers.size());
         queryToIndex = new HashMap<>();
-        subScores = new float[subScorers.size()];
+        subScores = new float[subScorers.length];
         int idx = 0;
+        int size = 0;
         for (Scorer scorer : subScorers) {
             if (scorer == null) {
                 idx++;
                 continue;
             }
-            final DisiWrapper w = new DisiWrapper(scorer);
-            this.subScorersPQ.add(w);
             queryToIndex.put(scorer.getWeight().getQuery(), idx);
             idx++;
+            size++;
+        }
+        this.subScorersPQ = new DisiPriorityQueue(size);
+        for (Scorer scorer : subScorers) {
+            if (scorer == null) {
+                continue;
+            }
+            final DisiWrapper w = new DisiWrapper(scorer);
+            this.subScorersPQ.add(w);
         }
         this.approximation = new DisjunctionDISIApproximation(this.subScorersPQ);
     }
@@ -84,7 +92,9 @@ public class CompoundQueryScorer extends Scorer {
     public float[] compoundScores() throws IOException {
         // Map<Query, Float> scores = new HashMap<>();
         float[] scores = new float[subScores.length];
-        for (DisiWrapper disiWrapper : subScorersPQ) {
+        // for (DisiWrapper disiWrapper : subScorersPQ) {
+        DisiWrapper topList = subScorersPQ.topList();
+        for (DisiWrapper disiWrapper = topList; disiWrapper != null; disiWrapper = disiWrapper.next) {
             // check if this doc has match in the subQuery. If not, add score as 0.0 and continue
             if (disiWrapper.scorer.docID() == DocIdSetIterator.NO_MORE_DOCS) {
                 // scores.put(disiWrapper.scorer.getWeight().getQuery(), 0.0f);

@@ -80,5 +80,6 @@ public class NeuralSearch extends Plugin implements ActionPlugin, SearchPlugin, 
     @Override
     public Optional<QueryPhaseSearcher> getQueryPhaseSearcher() {
         return Optional.of(new CompoundQueryPhaseSearcher());
+        // return Optional.empty();
     }
 }

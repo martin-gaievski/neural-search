@@ -9,14 +9,16 @@ import static org.opensearch.search.query.TopDocsCollectorContext.createTopDocsC
 
 import java.io.IOException;
 import java.util.LinkedList;
+import java.util.function.Function;
 import java.util.function.Supplier;
+
+import lombok.extern.log4j.Log4j2;
 
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
-import org.opensearch.common.util.CachedSupplier;
 import org.opensearch.neuralsearch.query.CompoundQuery;
 import org.opensearch.neuralsearch.search.CompoundTopScoreDocCollector;
 import org.opensearch.neuralsearch.search.HitsThresholdChecker;
@@ -30,12 +32,13 @@ import org.opensearch.search.query.TopDocsCollectorContext;
 import org.opensearch.search.rescore.RescoreContext;
 import org.opensearch.search.sort.SortAndFormats;
 
+@Log4j2
 public class CompoundQueryPhaseSearcher extends QueryPhase.DefaultQueryPhaseSearcher {
 
-    private CompoundTopScoreDocCollector collector;
-    private Supplier<TotalHits> totalHitsSupplier;
+    private Function<TopDocs[], TotalHits> totalHitsSupplier;
     private Supplier<TopDocs[]> topDocsSupplier;
-    private Supplier<Float> maxScoreSupplier;
+    // private Supplier<Float> maxScoreSupplier;
+    private Function<TopDocs[], Float> maxScoreSupplier;
     protected SortAndFormats sortAndFormats;
 
     public boolean searchWith(
@@ -60,6 +63,7 @@ public class CompoundQueryPhaseSearcher extends QueryPhase.DefaultQueryPhaseSear
         boolean hasFilterCollector,
         boolean hasTimeout
     ) throws IOException {
+        log.info("searchWithCollector, shard " + searchContext.shardTarget().getShardId());
 
         final TopDocsCollectorContext topDocsFactory = createTopDocsCollectorContext(searchContext, hasFilterCollector);
         collectors.addFirst(topDocsFactory);
@@ -81,31 +85,26 @@ public class CompoundQueryPhaseSearcher extends QueryPhase.DefaultQueryPhaseSear
         QuerySearchResult queryResult = searchContext.queryResult();
 
         // TODO Wrap collector into context
-        // Problems:
-        // - incorrect score for multiple shards
-        collector = new CompoundTopScoreDocCollector(
+        CompoundTopScoreDocCollector collector = new CompoundTopScoreDocCollector(
             numDocs,
             HitsThresholdChecker.create(Math.max(numDocs, searchContext.trackTotalHitsUpTo())),
             null
         );
-        topDocsSupplier = new CachedSupplier<>(collector::topDocs);
-        totalHitsSupplier = () -> {
-            TopDocs[] topDocs = topDocsSupplier.get();
+        topDocsSupplier = collector::topDocs;
+        totalHitsSupplier = topDocs -> {
+            // TopDocs[] topDocs = topDocsSupplier.get();
             // for now we do max from each sub-query result
-            long numHits = 0;
+            /*long numHits = 0;
             for (TopDocs td : topDocs) {
                 numHits = Math.max(numHits, td.totalHits.value);
             }
-            /*for(Map.Entry<Query, TopDocs> entry: topDocs.entrySet()) {
-                numHits = Math.max(numHits, entry.getValue().totalHits.value);
-            }*/
-            return new TotalHits(numHits, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+            return new TotalHits(numHits, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);*/
+            return topDocs[0].totalHits;
             // return topDocs.get(topDocs.keySet().iterator().next()).totalHits;
         };// topDocsSupplier.get().totalHits;
-        maxScoreSupplier = () -> {
-            TopDocs[] topDocs = topDocsSupplier.get();
+        maxScoreSupplier = topDocs -> {
+            // TopDocs[] topDocs = topDocsSupplier.get();
             // TODO review later, need to came up with valid max score
-            // if (topDocs.scoreDocs.length == 0) {
             if (topDocs.length == 0) {
                 return Float.NaN;
             } else {
@@ -124,25 +123,38 @@ public class CompoundQueryPhaseSearcher extends QueryPhase.DefaultQueryPhaseSear
 
         postProcess(queryResult, collector);
 
+        printQueryResults(searchContext, queryResult);
+
         return rescore;
     }
 
+    private static void printQueryResults(SearchContext searchContext, QuerySearchResult queryResult) {
+        StringBuilder sb = new StringBuilder();
+        TopDocsAndMaxScore topDocsAndMaxScore = queryResult.topDocs();
+        MultiQueryTopDocs multiQueryTopDocs = (MultiQueryTopDocs) topDocsAndMaxScore.topDocs;
+
+        sb.append("Query result for shard ").append(searchContext.shardTarget().getShardId());
+        sb.append("\n").append(multiQueryTopDocs.toString());
+
+        log.info(sb.toString());
+    }
+
     void postProcess(QuerySearchResult queryResult, CompoundTopScoreDocCollector collector) {
-        final TopDocsAndMaxScore topDocs = newTopDocs();
+        final TopDocsAndMaxScore topDocs = newTopDocs(collector);
         queryResult.topDocs(topDocs, sortAndFormats == null ? null : sortAndFormats.formats);
     }
 
-    TopDocsAndMaxScore newTopDocs() {
-        TopDocs[] in = topDocsSupplier.get();
-        float maxScore = maxScoreSupplier.get();
-
+    TopDocsAndMaxScore newTopDocs(CompoundTopScoreDocCollector collector) {
+        // TopDocs[] in = topDocsSupplier.get();
+        TopDocs[] topDocs = collector.topDocs();
+        float maxScore = maxScoreSupplier.apply(topDocs);
         /*if (in instanceof TopFieldDocs) {
             TopFieldDocs fieldDocs = (TopFieldDocs) in;
             newTopDocs = new TopFieldDocs(totalHitsSupplier.get(), fieldDocs.scoreDocs, fieldDocs.fields);
         } else {
             newTopDocs = new TopDocs(totalHitsSupplier.get(), in.scoreDocs);
         }*/
-        final TopDocs newTopDocs = new MultiQueryTopDocs(totalHitsSupplier.get(), in);
+        final TopDocs newTopDocs = new MultiQueryTopDocs(totalHitsSupplier.apply(topDocs), topDocs);
         return new TopDocsAndMaxScore(newTopDocs, maxScore);
     }
 }

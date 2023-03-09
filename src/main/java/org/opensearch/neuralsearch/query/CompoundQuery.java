@@ -149,17 +149,14 @@ public class CompoundQuery extends Query implements Iterable<Query> {
         /** Create the scorer used to score our associated Query */
         @Override
         public Scorer scorer(LeafReaderContext context) throws IOException {
-            List<Scorer> scorers = new ArrayList<>();
-            for (Weight w : weights) {
+            Scorer[] scorers = new Scorer[weights.size()];
+            for (int i = 0; i < weights.size(); i++) {
+                Weight w = weights.get(i);
                 // we will advance() subscorers
                 Scorer subScorer = w.scorer(context);
-                // if (subScorer != null) {
-                scorers.add(subScorer);
-                // }
-            }
-            if (scorers.isEmpty()) {
-                // no sub-scorers had any documents
-                return null;
+                if (subScorer != null) {
+                    scorers[i] = subScorer;
+                }
             }
             return new CompoundQueryScorer(this, scorers, scoreMode);
         }

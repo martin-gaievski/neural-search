@@ -10,6 +10,7 @@ import java.util.Objects;
 import java.util.concurrent.atomic.LongAccumulator;
 
 import lombok.Getter;
+import lombok.extern.log4j.Log4j2;
 
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.Collector;
@@ -24,6 +25,7 @@ import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.util.PriorityQueue;
 import org.opensearch.neuralsearch.query.CompoundQueryScorer;
 
+@Log4j2
 public class CompoundTopScoreDocCollector<T extends ScoreDoc> implements Collector {
     int docBase;
     float minCompetitiveScore;
@@ -33,7 +35,6 @@ public class CompoundTopScoreDocCollector<T extends ScoreDoc> implements Collect
     protected TotalHits.Relation totalHitsRelation = TotalHits.Relation.EQUAL_TO;
     protected int[] totalHits;
     public static final TopDocs EMPTY_TOPDOCS = new TopDocs(new TotalHits(0, TotalHits.Relation.EQUAL_TO), new ScoreDoc[0]);
-    // protected final PriorityQueue<ScoreDoc> pq;
     int numOfHits;
 
     @Getter
@@ -42,7 +43,6 @@ public class CompoundTopScoreDocCollector<T extends ScoreDoc> implements Collect
     public CompoundTopScoreDocCollector(int numHits, HitsThresholdChecker hitsThresholdChecker, MaxScoreAccumulator minScoreAcc) {
         // this.pq = new HitQueue(numHits, true);
         numOfHits = numHits;
-        // totalHits = new HashMap<>();
         this.hitsThresholdChecker = hitsThresholdChecker;
         this.minScoreAcc = minScoreAcc;
         // pqTop = pq.top();
@@ -71,12 +71,11 @@ public class CompoundTopScoreDocCollector<T extends ScoreDoc> implements Collect
 
             @Override
             public void collect(int doc) throws IOException {
-                // Map<Query, Float> subScoresByQuery = compoundQueryScorer.compoundScores();
                 float[] subScoresByQuery = compoundQueryScorer.compoundScores();
                 // iterate over results for each query
                 if (compoundScores == null) {
                     compoundScores = new PriorityQueue[subScoresByQuery.length];
-                    for (int i = 0; i < compoundScores.length; i++) {
+                    for (int i = 0; i < subScoresByQuery.length; i++) {
                         compoundScores[i] = new HitQueue(numOfHits, true);
                     }
                     totalHits = new int[subScoresByQuery.length];
@@ -93,21 +92,6 @@ public class CompoundTopScoreDocCollector<T extends ScoreDoc> implements Collect
                     topDoc.score = score;
                     pq.updateTop();
                 }
-                /*for (Map.Entry<Query, Float> queryScore : subScoresByQuery.entrySet()) {
-                    Query query = queryScore.getKey();
-                    float score = queryScore.getValue();
-                    if (score == 0) {
-                        continue;
-                    }
-                    totalHits.put(query, totalHits.getOrDefault(query, 0) + 1);
-                    compoundScores.putIfAbsent(query, new HitQueue(numOfHits, true));
-                    // update pq of top results for each query
-                    PriorityQueue<ScoreDoc> pq = compoundScores.get(query);
-                    ScoreDoc topDoc = pq.top();
-                    topDoc.doc = doc + docBase;
-                    topDoc.score = score;
-                    pq.updateTop();
-                }*/
             }
         };
     }
@@ -164,20 +148,13 @@ public class CompoundTopScoreDocCollector<T extends ScoreDoc> implements Collect
     }
 
     public TopDocs[] topDocs() {
-        // Map<Query, TopDocs> topDocs = new HashMap<>();
         TopDocs[] topDocs = new TopDocs[compoundScores.length];
         for (int i = 0; i < compoundScores.length; i++) {
             int qTopSize = totalHits[i];
             TopDocs topDocsPerQuery = topDocsPerQuery(0, qTopSize, compoundScores[i], qTopSize);
             topDocs[i] = topDocsPerQuery;
         }
-        /*for (Query query : compoundScores.keySet()) {
-            int qTopSize = topDocsSize(query);
-            TopDocs topDocsPerQuery = topDocsPerQuery(0, qTopSize, compoundScores.get(query), qTopSize);
-            topDocs.put(query, topDocsPerQuery);
-        }*/
         return topDocs;
-        // return topDocs(0, topDocsSize());
     }
 
     TopDocs topDocsPerQuery(int start, int howMany, PriorityQueue<ScoreDoc> pq, int totalHits) {
