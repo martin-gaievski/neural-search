@@ -18,11 +18,11 @@ import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
+import org.opensearch.common.lucene.search.CompoundQueryTopDocs;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
 import org.opensearch.neuralsearch.query.CompoundQuery;
 import org.opensearch.neuralsearch.search.CompoundTopScoreDocCollector;
 import org.opensearch.neuralsearch.search.HitsThresholdChecker;
-import org.opensearch.neuralsearch.search.MultiQueryTopDocs;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.query.QueryCollectorContext;
@@ -69,7 +69,9 @@ public class CompoundQueryPhaseSearcher extends QueryPhase.DefaultQueryPhaseSear
         collectors.addFirst(topDocsFactory);
 
         IndexReader reader = searchContext.searcher().getIndexReader();
-        int totalNumDocs = Math.max(1, reader.numDocs());
+        //TODO This doesn't work if shard has no hits at all, must be 0. Copied from core, need to deep dive
+        //int totalNumDocs = Math.max(1, reader.numDocs());
+        int totalNumDocs = Math.max(0, reader.numDocs());
         if (searchContext.size() == 0) {
             throw new UnsupportedOperationException("Need to create no hits collector");
         }
@@ -131,7 +133,7 @@ public class CompoundQueryPhaseSearcher extends QueryPhase.DefaultQueryPhaseSear
     private static void printQueryResults(SearchContext searchContext, QuerySearchResult queryResult) {
         StringBuilder sb = new StringBuilder();
         TopDocsAndMaxScore topDocsAndMaxScore = queryResult.topDocs();
-        MultiQueryTopDocs multiQueryTopDocs = (MultiQueryTopDocs) topDocsAndMaxScore.topDocs;
+        CompoundQueryTopDocs multiQueryTopDocs = (CompoundQueryTopDocs) topDocsAndMaxScore.topDocs;
 
         sb.append("Query result for shard ").append(searchContext.shardTarget().getShardId());
         sb.append("\n").append(multiQueryTopDocs.toString());
@@ -154,7 +156,7 @@ public class CompoundQueryPhaseSearcher extends QueryPhase.DefaultQueryPhaseSear
         } else {
             newTopDocs = new TopDocs(totalHitsSupplier.get(), in.scoreDocs);
         }*/
-        final TopDocs newTopDocs = new MultiQueryTopDocs(totalHitsSupplier.apply(topDocs), topDocs);
+        final TopDocs newTopDocs = new CompoundQueryTopDocs(totalHitsSupplier.apply(topDocs), topDocs);
         return new TopDocsAndMaxScore(newTopDocs, maxScore);
     }
 }

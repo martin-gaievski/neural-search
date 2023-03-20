@@ -151,7 +151,7 @@ public class CompoundTopScoreDocCollector<T extends ScoreDoc> implements Collect
         TopDocs[] topDocs = new TopDocs[compoundScores.length];
         for (int i = 0; i < compoundScores.length; i++) {
             int qTopSize = totalHits[i];
-            TopDocs topDocsPerQuery = topDocsPerQuery(0, qTopSize, compoundScores[i], qTopSize);
+            TopDocs topDocsPerQuery = topDocsPerQuery(0, Math.min(qTopSize, compoundScores[i].size()), compoundScores[i], qTopSize);
             topDocs[i] = topDocsPerQuery;
         }
         return topDocs;
