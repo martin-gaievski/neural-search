@@ -32,8 +32,8 @@ public class HybridQueryIT extends BaseNeuralSearchIT {
     private static final String TEST_BASIC_INDEX_NAME = "test-neural-basic-index";
     private static final String TEST_BASIC_VECTOR_DOC_FIELD_INDEX_NAME = "test-neural-vector-doc-field-index";
     private static final String TEST_MULTI_DOC_INDEX_NAME = "test-neural-multi-doc-index";
-    private static final String TEST_QUERY_TEXT = "Greetings";
-    private static final String TEST_QUERY_TEXT2 = "Salute";
+    private static final String TEST_QUERY_TEXT = "greetings";
+    private static final String TEST_QUERY_TEXT2 = "salute";
     private static final String TEST_QUERY_TEXT3 = "hello";
     private static final String TEST_QUERY_TEXT4 = "place";
     private static final String TEST_QUERY_TEXT5 = "welcome";
@@ -134,8 +134,8 @@ public class HybridQueryIT extends BaseNeuralSearchIT {
         for (Map<String, Object> oneHit : hitsNestedList) {
             scores.add((Double) oneHit.get("_score"));
         }
-
-        float expectedScore = computeExpectedScore(modelId.get(), testVector1, TEST_SPACE_TYPE, TEST_QUERY_TEXT) + EXPECTED_SCORE_BM25;
+        // expected score is from knn query because it has more hits and is the first in the list of sub-queries
+        float expectedScore = computeExpectedScore(modelId.get(), testVector1, TEST_SPACE_TYPE, TEST_QUERY_TEXT);
         assertEquals(expectedScore, objectToFloat(scores.get(0)), 0.001f);
     }
 

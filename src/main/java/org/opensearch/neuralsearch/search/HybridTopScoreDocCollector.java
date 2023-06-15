@@ -111,7 +111,11 @@ public class HybridTopScoreDocCollector implements Collector {
      * @return
      */
     public TopDocs[] topDocs() {
-        TopDocs[] topDocs = new TopDocs[compoundScores.length];
+        TopDocs[] topDocs;
+        if (compoundScores == null) {
+            return new TopDocs[0];
+        }
+        topDocs = new TopDocs[compoundScores.length];
         for (int i = 0; i < compoundScores.length; i++) {
             int qTopSize = totalHits[i];
             TopDocs topDocsPerQuery = topDocsPerQuery(0, Math.min(qTopSize, compoundScores[i].size()), compoundScores[i], qTopSize);

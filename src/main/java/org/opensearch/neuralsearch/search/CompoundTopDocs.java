@@ -37,7 +37,7 @@ public class CompoundTopDocs extends TopDocs {
         if (docs == null) {
             return null;
         }
-        ScoreDoc[] maxScoreDocs = null;
+        ScoreDoc[] maxScoreDocs = new ScoreDoc[0];
         int maxLength = -1;
         for (TopDocs topDoc : docs) {
             if (topDoc == null || topDoc.scoreDocs == null) {
@@ -47,9 +47,6 @@ public class CompoundTopDocs extends TopDocs {
                 maxLength = topDoc.scoreDocs.length;
                 maxScoreDocs = topDoc.scoreDocs;
             }
-        }
-        if (maxScoreDocs == null) {
-            return null;
         }
         // do deep copy
         return Arrays.stream(maxScoreDocs).map(doc -> new ScoreDoc(doc.doc, doc.score, doc.shardIndex)).toArray(ScoreDoc[]::new);
