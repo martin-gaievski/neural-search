@@ -41,7 +41,7 @@ public class GeometricMeanScoreCombinationTechnique implements ScoreCombinationT
     @Override
     public float combine(final float[] scores) {
         scoreCombinationUtil.validateIfWeightsMatchScores(scores, weights);
-        float weightedLnSum = 0;
+        /*float weightedLnSum = 0;
         float sumOfWeights = 0;
         for (int indexOfSubQuery = 0; indexOfSubQuery < scores.length; indexOfSubQuery++) {
             float score = scores[indexOfSubQuery];
@@ -53,6 +53,17 @@ public class GeometricMeanScoreCombinationTechnique implements ScoreCombinationT
             sumOfWeights += weight;
             weightedLnSum += weight * Math.log(score);
         }
-        return sumOfWeights == 0 ? ZERO_SCORE : (float) Math.exp(weightedLnSum / sumOfWeights);
+        return sumOfWeights == 0 ? ZERO_SCORE : (float) Math.exp(weightedLnSum / sumOfWeights);*/
+        double proiz = 1.0;
+        int count = 0;
+        for (float score : scores) {
+            if (score <= 0) {
+                // scores 0.0 need to be skipped, ln() of 0 is not defined
+                continue;
+            }
+            count++;
+            proiz *= score;
+        }
+        return proiz == 0 ? ZERO_SCORE : (float) Math.pow(proiz, 1.0 / count);
     }
 }
