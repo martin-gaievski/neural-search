@@ -79,11 +79,10 @@ public final class HybridQueryScorer extends Scorer {
      * Return the maximum score that documents between the last target that this iterator was shallow-advanced to included and upTo included.
      * @param upTo upper limit for document id
      * @return max score
-     * @throws IOException
      */
     @Override
-    public float getMaxScore(int upTo) throws IOException {
-        return subScorers.stream().filter(scorer -> scorer.docID() <= upTo).map(scorer -> {
+    public float getMaxScore(int upTo) {
+        return subScorers.stream().filter(Objects::nonNull).filter(scorer -> scorer.docID() <= upTo).map(scorer -> {
             try {
                 return scorer.getMaxScore(upTo);
             } catch (IOException e) {
