@@ -48,6 +48,8 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
 import org.opensearch.neuralsearch.util.TokenWeightUtil;
+
+import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.test.ClusterServiceUtils;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
@@ -413,6 +415,18 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
         final int resultSize,
         final Map<String, String> requestParams
     ) {
+        return search(index, queryBuilder, rescorer, resultSize, requestParams, null);
+    }
+
+    @SneakyThrows
+    protected Map<String, Object> search(
+        String index,
+        QueryBuilder queryBuilder,
+        QueryBuilder rescorer,
+        int resultSize,
+        Map<String, String> requestParams,
+        AggregationBuilder aggsBuilder
+    ) {
         XContentBuilder builder = XContentFactory.jsonBuilder().startObject().field("query");
         queryBuilder.toXContent(builder, ToXContent.EMPTY_PARAMS);
 
@@ -420,6 +434,9 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
             builder.startObject("rescore").startObject("query").field("query_weight", 0.0f).field("rescore_query");
             rescorer.toXContent(builder, ToXContent.EMPTY_PARAMS);
             builder.endObject().endObject();
+        }
+        if (Objects.nonNull(aggsBuilder)) {
+            builder.startObject("aggs").value(aggsBuilder).endObject();
         }
 
         builder.endObject();
@@ -463,6 +480,31 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
         addKnnDoc(index, docId, vectorFieldNames, vectors, textFieldNames, texts, Collections.emptyList(), Collections.emptyList());
     }
 
+    @SneakyThrows
+    protected void addKnnDoc(
+        String index,
+        String docId,
+        List<String> vectorFieldNames,
+        List<Object[]> vectors,
+        List<String> textFieldNames,
+        List<String> texts,
+        List<String> nestedFieldNames,
+        List<Map<String, String>> nestedFields
+    ) {
+        addKnnDoc(
+            index,
+            docId,
+            vectorFieldNames,
+            vectors,
+            textFieldNames,
+            texts,
+            nestedFieldNames,
+            nestedFields,
+            Collections.emptyList(),
+            Collections.emptyList()
+        );
+    }
+
     /**
      * Add a set of knn vectors and text to an index
      *
@@ -477,14 +519,16 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
      */
     @SneakyThrows
     protected void addKnnDoc(
-        final String index,
-        final String docId,
-        final List<String> vectorFieldNames,
-        final List<Object[]> vectors,
-        final List<String> textFieldNames,
-        final List<String> texts,
-        final List<String> nestedFieldNames,
-        final List<Map<String, String>> nestedFields
+        String index,
+        String docId,
+        List<String> vectorFieldNames,
+        List<Object[]> vectors,
+        List<String> textFieldNames,
+        List<String> texts,
+        List<String> nestedFieldNames,
+        List<Map<String, String>> nestedFields,
+        List<String> integerFieldNames,
+        List<Integer> integerFieldValues
     ) {
         Request request = new Request("POST", "/" + index + "/_doc/" + docId + "?refresh=true");
         XContentBuilder builder = XContentFactory.jsonBuilder().startObject();
@@ -504,6 +548,10 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
                 builder.field(entry.getKey(), entry.getValue());
             }
             builder.endObject();
+        }
+
+        for (int i = 0; i < integerFieldNames.size(); i++) {
+            builder.field(integerFieldNames.get(i), integerFieldValues.get(i));
         }
         builder.endObject();
 
@@ -668,6 +716,16 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
         final List<String> nestedFields,
         final int numberOfShards
     ) {
+        return buildIndexConfiguration(knnFieldConfigs, nestedFields, Collections.emptyList(), numberOfShards);
+    }
+
+    @SneakyThrows
+    protected String buildIndexConfiguration(
+        final List<KNNFieldConfig> knnFieldConfigs,
+        final List<String> nestedFields,
+        final List<String> intFields,
+        final int numberOfShards
+    ) {
         XContentBuilder xContentBuilder = XContentFactory.jsonBuilder()
             .startObject()
             .startObject("settings")
@@ -691,6 +749,10 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
 
         for (String nestedField : nestedFields) {
             xContentBuilder.startObject(nestedField).field("type", "nested").endObject();
+        }
+
+        for (String intField : intFields) {
+            xContentBuilder.startObject(intField).field("type", "integer").endObject();
         }
 
         xContentBuilder.endObject().endObject().endObject();
