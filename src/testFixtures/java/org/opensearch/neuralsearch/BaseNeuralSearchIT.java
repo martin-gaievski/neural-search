@@ -48,8 +48,6 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
 import org.opensearch.neuralsearch.util.TokenWeightUtil;
-
-import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.test.ClusterServiceUtils;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
@@ -425,18 +423,43 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
         QueryBuilder rescorer,
         int resultSize,
         Map<String, String> requestParams,
-        AggregationBuilder aggsBuilder
+        List<Object> aggs
     ) {
-        XContentBuilder builder = XContentFactory.jsonBuilder().startObject().field("query");
-        queryBuilder.toXContent(builder, ToXContent.EMPTY_PARAMS);
+        return search(index, queryBuilder, rescorer, resultSize, requestParams, aggs, null);
+    }
+
+    @SneakyThrows
+    protected Map<String, Object> search(
+        String index,
+        QueryBuilder queryBuilder,
+        QueryBuilder rescorer,
+        int resultSize,
+        Map<String, String> requestParams,
+        List<Object> aggs,
+        QueryBuilder postFilterBuilder
+    ) {
+        XContentBuilder builder = XContentFactory.jsonBuilder().startObject();
+
+        if (queryBuilder != null) {
+            builder.field("query");
+            queryBuilder.toXContent(builder, ToXContent.EMPTY_PARAMS);
+        }
 
         if (rescorer != null) {
             builder.startObject("rescore").startObject("query").field("query_weight", 0.0f).field("rescore_query");
             rescorer.toXContent(builder, ToXContent.EMPTY_PARAMS);
             builder.endObject().endObject();
         }
-        if (Objects.nonNull(aggsBuilder)) {
-            builder.startObject("aggs").value(aggsBuilder).endObject();
+        if (Objects.nonNull(aggs)) {
+            builder.startObject("aggs");
+            for (Object agg : aggs) {
+                builder.value(agg);
+            }
+            builder.endObject();
+        }
+        if (Objects.nonNull(postFilterBuilder)) {
+            builder.field("post_filter");
+            postFilterBuilder.toXContent(builder, ToXContent.EMPTY_PARAMS);
         }
 
         builder.endObject();
@@ -501,6 +524,10 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
             nestedFieldNames,
             nestedFields,
             Collections.emptyList(),
+            Collections.emptyList(),
+            Collections.emptyList(),
+            Collections.emptyList(),
+            Collections.emptyList(),
             Collections.emptyList()
         );
     }
@@ -528,7 +555,11 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
         List<String> nestedFieldNames,
         List<Map<String, String>> nestedFields,
         List<String> integerFieldNames,
-        List<Integer> integerFieldValues
+        List<Integer> integerFieldValues,
+        List<String> keywordFieldNames,
+        List<String> keywordFieldValues,
+        List<String> dateFieldNames,
+        List<String> dateFieldValues
     ) {
         Request request = new Request("POST", "/" + index + "/_doc/" + docId + "?refresh=true");
         XContentBuilder builder = XContentFactory.jsonBuilder().startObject();
@@ -552,6 +583,14 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
 
         for (int i = 0; i < integerFieldNames.size(); i++) {
             builder.field(integerFieldNames.get(i), integerFieldValues.get(i));
+        }
+
+        for (int i = 0; i < keywordFieldNames.size(); i++) {
+            builder.field(keywordFieldNames.get(i), keywordFieldValues.get(i));
+        }
+
+        for (int i = 0; i < dateFieldNames.size(); i++) {
+            builder.field(dateFieldNames.get(i), dateFieldValues.get(i));
         }
         builder.endObject();
 
@@ -716,7 +755,14 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
         final List<String> nestedFields,
         final int numberOfShards
     ) {
-        return buildIndexConfiguration(knnFieldConfigs, nestedFields, Collections.emptyList(), numberOfShards);
+        return buildIndexConfiguration(
+            knnFieldConfigs,
+            nestedFields,
+            Collections.emptyList(),
+            Collections.emptyList(),
+            Collections.emptyList(),
+            numberOfShards
+        );
     }
 
     @SneakyThrows
@@ -724,6 +770,8 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
         final List<KNNFieldConfig> knnFieldConfigs,
         final List<String> nestedFields,
         final List<String> intFields,
+        final List<String> keywordFields,
+        final List<String> dateFields,
         final int numberOfShards
     ) {
         XContentBuilder xContentBuilder = XContentFactory.jsonBuilder()
@@ -746,13 +794,31 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
                 .endObject()
                 .endObject();
         }
-
-        for (String nestedField : nestedFields) {
-            xContentBuilder.startObject(nestedField).field("type", "nested").endObject();
+        // treat the list in a manner that first element is always the type name and all others are keywords
+        if (!nestedFields.isEmpty()) {
+            String nestedFieldName = nestedFields.get(0);
+            xContentBuilder.startObject(nestedFieldName).field("type", "nested");
+            if (nestedFields.size() > 1) {
+                xContentBuilder.startObject("properties");
+                for (int i = 1; i < nestedFields.size(); i++) {
+                    String innerNestedTypeField = nestedFields.get(i);
+                    xContentBuilder.startObject(innerNestedTypeField).field("type", "keyword").endObject();
+                }
+                xContentBuilder.endObject();
+            }
+            xContentBuilder.endObject();
         }
 
         for (String intField : intFields) {
             xContentBuilder.startObject(intField).field("type", "integer").endObject();
+        }
+
+        for (String keywordField : keywordFields) {
+            xContentBuilder.startObject(keywordField).field("type", "keyword").endObject();
+        }
+
+        for (String dateField : dateFields) {
+            xContentBuilder.startObject(dateField).field("type", "date").field("format", "MM/dd/yyyy").endObject();
         }
 
         xContentBuilder.endObject().endObject().endObject();

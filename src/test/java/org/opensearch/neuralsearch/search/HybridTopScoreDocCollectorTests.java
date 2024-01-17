@@ -80,7 +80,7 @@ public class HybridTopScoreDocCollectorTests extends OpenSearchQueryTestCase {
 
         LeafReaderContext leafReaderContext = reader.getContext().leaves().get(0);
 
-        HybridTopScoreDocCollector hybridTopScoreDocCollector = new HybridTopScoreDocCollector(
+        HybridTopScoreDocCollector<?> hybridTopScoreDocCollector = new HybridTopScoreDocCollector(
             NUM_DOCS,
             new HitsThresholdChecker(TOTAL_HITS_UP_TO)
         );
@@ -115,7 +115,7 @@ public class HybridTopScoreDocCollectorTests extends OpenSearchQueryTestCase {
 
         LeafReaderContext leafReaderContext = reader.getContext().leaves().get(0);
 
-        HybridTopScoreDocCollector hybridTopScoreDocCollector = new HybridTopScoreDocCollector(
+        HybridTopScoreDocCollector<?> hybridTopScoreDocCollector = new HybridTopScoreDocCollector<>(
             NUM_DOCS,
             new HitsThresholdChecker(TOTAL_HITS_UP_TO)
         );
@@ -166,7 +166,7 @@ public class HybridTopScoreDocCollectorTests extends OpenSearchQueryTestCase {
 
         LeafReaderContext leafReaderContext = reader.getContext().leaves().get(0);
 
-        HybridTopScoreDocCollector hybridTopScoreDocCollector = new HybridTopScoreDocCollector(
+        HybridTopScoreDocCollector<?> hybridTopScoreDocCollector = new HybridTopScoreDocCollector<>(
             NUM_DOCS,
             new HitsThresholdChecker(TOTAL_HITS_UP_TO)
         );
@@ -248,7 +248,7 @@ public class HybridTopScoreDocCollectorTests extends OpenSearchQueryTestCase {
 
         LeafReaderContext leafReaderContext = reader.getContext().leaves().get(0);
 
-        HybridTopScoreDocCollector hybridTopScoreDocCollector = new HybridTopScoreDocCollector(
+        HybridTopScoreDocCollector<?> hybridTopScoreDocCollector = new HybridTopScoreDocCollector<>(
             NUM_DOCS,
             new HitsThresholdChecker(TOTAL_HITS_UP_TO)
         );
@@ -371,7 +371,7 @@ public class HybridTopScoreDocCollectorTests extends OpenSearchQueryTestCase {
 
         LeafReaderContext leafReaderContext = reader.getContext().leaves().get(0);
 
-        HybridTopScoreDocCollector hybridTopScoreDocCollector = new HybridTopScoreDocCollector(
+        HybridTopScoreDocCollector<?> hybridTopScoreDocCollector = new HybridTopScoreDocCollector<>(
             NUM_DOCS,
             new HitsThresholdChecker(Integer.MAX_VALUE)
         );

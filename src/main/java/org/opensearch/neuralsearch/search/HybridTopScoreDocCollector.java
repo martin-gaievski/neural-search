@@ -31,7 +31,7 @@ import lombok.extern.log4j.Log4j2;
  * Collects the TopDocs after executing hybrid query. Uses HybridQueryTopDocs as DTO to handle each sub query results
  */
 @Log4j2
-public class HybridTopScoreDocCollector implements Collector {
+public class HybridTopScoreDocCollector<T extends ScoreDoc> implements Collector {
     private static final TopDocs EMPTY_TOPDOCS = new TopDocs(new TotalHits(0, TotalHits.Relation.EQUAL_TO), new ScoreDoc[0]);
     private int docBase;
     private final HitsThresholdChecker hitsThresholdChecker;
