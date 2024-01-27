@@ -10,6 +10,7 @@ import org.junit.Before;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.neuralsearch.BaseNeuralSearchIT;
+import org.opensearch.script.Script;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregationBuilders;
 
@@ -27,10 +28,8 @@ import static org.opensearch.neuralsearch.TestUtils.TEST_DIMENSION;
 import static org.opensearch.neuralsearch.TestUtils.createRandomVector;
 
 public class AggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
-    private static final String TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_SINGLE_SHARD =
-        "test-neural-multi-doc-text-and-int-index-single-shard";
-    private static final String TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS =
-        "test-neural-multi-doc-text-and-int-index-multiple-shards";
+    private static final String TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_SINGLE_SHARD = "test-neural-aggs-multi-doc-index-single-shard";
+    private static final String TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS = "test-neural-aggs-multi-doc-index-multiple-shards";
     private static final String TEST_QUERY_TEXT = "greetings";
     private static final String TEST_QUERY_TEXT2 = "salute";
     private static final String TEST_QUERY_TEXT3 = "hello";
@@ -64,6 +63,7 @@ public class AggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     private static final String SEARCH_PIPELINE = "phase-results-hybrid-pipeline";
     private static final String MAX_AGGREGATION_NAME = "max_aggs";
     private static final String AVG_AGGREGATION_NAME = "avg_field";
+    private static final String GENERIC_AGGREGATION_NAME = "my_aggregation";
 
     @Before
     public void setUp() throws Exception {
@@ -119,7 +119,7 @@ public class AggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
      * }
      */
     @SneakyThrows
-    public void testAggregationsSingleShard_whenMetricAggregationsInQuery_thenSuccessful() {
+    public void testSingleShardAndMetric_whenMaxAggs_thenSuccessful() {
         initializeIndexIfNotExist(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_SINGLE_SHARD);
 
         TermQueryBuilder termQueryBuilder1 = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT3);
@@ -139,26 +139,7 @@ public class AggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
             aggsBuilder
         );
 
-        assertEquals(1, getHitCount(searchResponseAsMap1));
-
-        List<Map<String, Object>> hits1NestedList = getNestedHits(searchResponseAsMap1);
-        List<String> ids = new ArrayList<>();
-        List<Double> scores = new ArrayList<>();
-        for (Map<String, Object> oneHit : hits1NestedList) {
-            ids.add((String) oneHit.get("_id"));
-            scores.add((Double) oneHit.get("_score"));
-        }
-
-        // verify that scores are in desc order
-        assertTrue(IntStream.range(0, scores.size() - 1).noneMatch(idx -> scores.get(idx) < scores.get(idx + 1)));
-        // verify that all ids are unique
-        assertEquals(Set.copyOf(ids).size(), ids.size());
-
-        Map<String, Object> total = getTotalHits(searchResponseAsMap1);
-        assertNotNull(total.get("value"));
-        assertEquals(1, total.get("value"));
-        assertNotNull(total.get("relation"));
-        assertEquals(RELATION_EQUAL_TO, total.get("relation"));
+        assertHitResultsFromQuery(1, searchResponseAsMap1);
 
         Map<String, Object> aggregations = getAggregations(searchResponseAsMap1);
         assertNotNull(aggregations);
@@ -168,7 +149,141 @@ public class AggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     }
 
     @SneakyThrows
-    public void testAggregationsMultipleShards_whenMetricAggregationsInQuery_thenSuccessful() {
+    public void testMultipleShardsAndMetricAggs_whenAvgAggs_thenSuccessful() {
+        AggregationBuilder aggsBuilder = AggregationBuilders.avg(AVG_AGGREGATION_NAME).field(INTEGER_FIELD_1);
+        Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(aggsBuilder);
+
+        Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+        assertNotNull(aggregations);
+        assertTrue(aggregations.containsKey(AVG_AGGREGATION_NAME));
+        double maxAggsValue = getAggregationValue(aggregations, AVG_AGGREGATION_NAME);
+        assertEquals(maxAggsValue, 2345.0, DELTA_FOR_SCORE_ASSERTION);
+    }
+
+    @SneakyThrows
+    public void testMetricAggs_whenCardinalityAggs_thenSuccessful() {
+        AggregationBuilder aggsBuilder = AggregationBuilders.cardinality(GENERIC_AGGREGATION_NAME).field(INTEGER_FIELD_1);
+        Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(aggsBuilder);
+
+        Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+        assertNotNull(aggregations);
+        assertTrue(aggregations.containsKey(GENERIC_AGGREGATION_NAME));
+        int aggsValue = getAggregationValue(aggregations, GENERIC_AGGREGATION_NAME);
+        assertEquals(aggsValue, 3);
+    }
+
+    @SneakyThrows
+    public void testMetricAggs_whenExtendedStatsAggs_thenSuccessful() {
+        AggregationBuilder aggsBuilder = AggregationBuilders.extendedStats(GENERIC_AGGREGATION_NAME).field(INTEGER_FIELD_1);
+        Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(aggsBuilder);
+
+        Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+        assertNotNull(aggregations);
+        assertTrue(aggregations.containsKey(GENERIC_AGGREGATION_NAME));
+        Map<String, Object> extendedStatsValues = getAggregationValues(aggregations, GENERIC_AGGREGATION_NAME);
+        assertNotNull(extendedStatsValues);
+
+        assertEquals((double) extendedStatsValues.get("max"), 3456.0, DELTA_FOR_SCORE_ASSERTION);
+        assertEquals((int) extendedStatsValues.get("count"), 3);
+        assertEquals((double) extendedStatsValues.get("sum"), 7035.0, DELTA_FOR_SCORE_ASSERTION);
+        assertEquals((double) extendedStatsValues.get("avg"), 2345.0, DELTA_FOR_SCORE_ASSERTION);
+        assertEquals((double) extendedStatsValues.get("variance"), 822880.666, DELTA_FOR_SCORE_ASSERTION);
+        assertEquals((double) extendedStatsValues.get("std_deviation"), 907.127, DELTA_FOR_SCORE_ASSERTION);
+    }
+
+    @SneakyThrows
+    public void testMetricAggs_whenTopHitsAggs_thenSuccessful() {
+        AggregationBuilder aggsBuilder = AggregationBuilders.topHits(GENERIC_AGGREGATION_NAME).size(4);
+        Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(aggsBuilder);
+
+        Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+        assertNotNull(aggregations);
+        assertTrue(aggregations.containsKey(GENERIC_AGGREGATION_NAME));
+        Map<String, Object> aggsValues = getAggregationValues(aggregations, GENERIC_AGGREGATION_NAME);
+        assertNotNull(aggsValues);
+        assertHitResultsFromQuery(3, aggsValues);
+    }
+
+    @SneakyThrows
+    public void testMetricAggs_whenScriptedMetrics_thenSuccessful() {
+        // compute sum of all int fields that are not blank
+        AggregationBuilder aggsBuilder = AggregationBuilders.scriptedMetric(GENERIC_AGGREGATION_NAME)
+            .initScript(new Script("state.price = []"))
+            .mapScript(new Script("state.price.add(doc[\"" + INTEGER_FIELD_1 + "\"].size() == 0 ? 0 : doc." + INTEGER_FIELD_1 + ".value)"))
+            .combineScript(new Script("state.price.stream().mapToInt(Integer::intValue).sum()"))
+            .reduceScript(new Script("states.stream().mapToInt(Integer::intValue).sum()"));
+        Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(aggsBuilder);
+
+        Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+        assertNotNull(aggregations);
+        assertTrue(aggregations.containsKey(GENERIC_AGGREGATION_NAME));
+        int aggsValue = getAggregationValue(aggregations, GENERIC_AGGREGATION_NAME);
+        assertEquals(7035, aggsValue);
+    }
+
+    @SneakyThrows
+    public void testMetricAggs_whenPercentileRank_thenSuccessful() {
+        AggregationBuilder aggsBuilder = AggregationBuilders.percentileRanks(GENERIC_AGGREGATION_NAME, new double[] { 2000, 3000 })
+            .field(INTEGER_FIELD_1);
+        Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(aggsBuilder);
+
+        Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+        assertNotNull(aggregations);
+        assertTrue(aggregations.containsKey(GENERIC_AGGREGATION_NAME));
+        Map<String, Map<String, Double>> aggsValues = getAggregationValues(aggregations, GENERIC_AGGREGATION_NAME);
+        assertNotNull(aggsValues);
+        Map<String, Double> values = aggsValues.get("values");
+        assertNotNull(values);
+        assertEquals(33.333, values.get("2000.0"), DELTA_FOR_SCORE_ASSERTION);
+        assertEquals(66.666, values.get("3000.0"), DELTA_FOR_SCORE_ASSERTION);
+    }
+
+    @SneakyThrows
+    public void testBucketAndNestedAggs_whenAvgNestedIntoFilter_thenSuccessful() {
+        AggregationBuilder aggsBuilder = AggregationBuilders.filter(
+            GENERIC_AGGREGATION_NAME,
+            QueryBuilders.rangeQuery(INTEGER_FIELD_1).lte(3000)
+        ).subAggregation(AggregationBuilders.avg(AVG_AGGREGATION_NAME).field(INTEGER_FIELD_1));
+        Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(aggsBuilder);
+
+        Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+        assertNotNull(aggregations);
+        assertTrue(aggregations.containsKey(GENERIC_AGGREGATION_NAME));
+        double avgValue = getAggregationValue(getAggregationValues(aggregations, GENERIC_AGGREGATION_NAME), AVG_AGGREGATION_NAME);
+        assertEquals(1789.5, avgValue, DELTA_FOR_SCORE_ASSERTION);
+    }
+
+    @SneakyThrows
+    public void testBucketAndNestedAggs_whenAdjacencyMatrix_thenSuccessful() {
+        AggregationBuilder aggsBuilder = AggregationBuilders.adjacencyMatrix(
+            GENERIC_AGGREGATION_NAME,
+            Map.of(
+                "grpA",
+                QueryBuilders.matchQuery(KEYWORD_FIELD_1, KEYWORD_FIELD_1_VALUE),
+                "grpB",
+                QueryBuilders.matchQuery(KEYWORD_FIELD_1, KEYWORD_FIELD_2_VALUE),
+                "grpC",
+                QueryBuilders.matchQuery(KEYWORD_FIELD_1, KEYWORD_FIELD_3_VALUE)
+            )
+        );
+        Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(aggsBuilder);
+
+        Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+        assertNotNull(aggregations);
+        List<Map<String, Object>> buckets = ((Map<String, List>) getAggregationValues(aggregations, GENERIC_AGGREGATION_NAME)).get(
+            "buckets"
+        );
+        assertNotNull(buckets);
+        assertEquals(2, buckets.size());
+        Map<String, Object> grpA = buckets.get(0);
+        assertEquals(1, grpA.get("doc_count"));
+        assertEquals("grpA", grpA.get("key"));
+        Map<String, Object> grpC = buckets.get(1);
+        assertEquals(1, grpC.get("doc_count"));
+        assertEquals("grpC", grpC.get("key"));
+    }
+
+    private Map<String, Object> executeQueryAndGetAggsResults(final AggregationBuilder aggsBuilder) {
         initializeIndexIfNotExist(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS);
 
         TermQueryBuilder termQueryBuilder1 = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT3);
@@ -178,8 +293,7 @@ public class AggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
         hybridQueryBuilderNeuralThenTerm.add(termQueryBuilder1);
         hybridQueryBuilderNeuralThenTerm.add(termQueryBuilder2);
 
-        AggregationBuilder aggsBuilder = AggregationBuilders.avg(AVG_AGGREGATION_NAME).field(INTEGER_FIELD_1);
-        Map<String, Object> searchResponseAsMap1 = search(
+        Map<String, Object> searchResponseAsMap = search(
             TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS,
             hybridQueryBuilderNeuralThenTerm,
             null,
@@ -188,7 +302,12 @@ public class AggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
             aggsBuilder
         );
 
-        assertEquals(2, getHitCount(searchResponseAsMap1));
+        assertHitResultsFromQuery(2, searchResponseAsMap);
+        return searchResponseAsMap;
+    }
+
+    private void assertHitResultsFromQuery(int expected, Map<String, Object> searchResponseAsMap1) {
+        assertEquals(expected, getHitCount(searchResponseAsMap1));
 
         List<Map<String, Object>> hits1NestedList = getNestedHits(searchResponseAsMap1);
         List<String> ids = new ArrayList<>();
@@ -205,15 +324,9 @@ public class AggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
 
         Map<String, Object> total = getTotalHits(searchResponseAsMap1);
         assertNotNull(total.get("value"));
-        assertEquals(2, total.get("value"));
+        assertEquals(expected, total.get("value"));
         assertNotNull(total.get("relation"));
         assertEquals(RELATION_EQUAL_TO, total.get("relation"));
-
-        Map<String, Object> aggregations = getAggregations(searchResponseAsMap1);
-        assertNotNull(aggregations);
-        assertTrue(aggregations.containsKey(AVG_AGGREGATION_NAME));
-        double maxAggsValue = getAggregationValue(aggregations, AVG_AGGREGATION_NAME);
-        assertEquals(maxAggsValue, 2345.0, DELTA_FOR_SCORE_ASSERTION);
     }
 
     @SneakyThrows
@@ -362,5 +475,9 @@ public class AggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     private <T> T getAggregationValue(final Map<String, Object> aggsMap, final String aggName) {
         Map<String, Object> aggValues = (Map<String, Object>) aggsMap.get(aggName);
         return (T) aggValues.get("value");
+    }
+
+    private <T> T getAggregationValues(final Map<String, Object> aggsMap, final String aggName) {
+        return (T) aggsMap.get(aggName);
     }
 }
