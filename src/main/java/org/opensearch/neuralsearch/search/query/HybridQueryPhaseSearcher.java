@@ -50,9 +50,7 @@ public class HybridQueryPhaseSearcher extends QueryPhaseSearcherWrapper {
             validateQuery(searchContext, query);
             return super.searchWith(searchContext, searcher, query, collectors, hasFilterCollector, hasTimeout);
         } else {
-            Query hybridQuery = extractHybridQuery(searchContext, query);
-            return super.searchWith(searchContext, searcher, hybridQuery, collectors, hasFilterCollector, hasTimeout);
-        }
+        return super.searchWith(searchContext, searcher, query, collectors, hasFilterCollector, hasTimeout);
     }
 
     @VisibleForTesting

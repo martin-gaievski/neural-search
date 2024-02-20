@@ -25,7 +25,6 @@ import java.util.stream.IntStream;
 
 import static org.opensearch.neuralsearch.TestUtils.DELTA_FOR_SCORE_ASSERTION;
 import static org.opensearch.neuralsearch.TestUtils.RELATION_EQUAL_TO;
-import static org.opensearch.neuralsearch.util.AggregationsUtils.getAggregationBuckets;
 import static org.opensearch.neuralsearch.util.AggregationsUtils.getAggregationValue;
 import static org.opensearch.neuralsearch.util.AggregationsUtils.getAggregationValues;
 import static org.opensearch.neuralsearch.util.AggregationsUtils.getAggregations;
@@ -36,7 +35,7 @@ public class MetricAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     private static final String TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_SINGLE_SHARD = "test-neural-aggs-multi-doc-index-single-shard";
     private static final String TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS = "test-neural-aggs-multi-doc-index-multiple-shards";
     private static final String TEST_QUERY_TEXT3 = "hello";
-    private static final String TEST_QUERY_TEXT4 = "place";
+    private static final String TEST_QUERY_TEXT4 = "cost";
     private static final String TEST_QUERY_TEXT5 = "welcome";
     private static final String TEST_DOC_TEXT1 = "Hello world";
     private static final String TEST_DOC_TEXT2 = "Hi to this place";
@@ -193,18 +192,6 @@ public class MetricAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     }
 
     @SneakyThrows
-    public void testMetricAggs_whenScriptedMetrics_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", false);
-        testScriptedMetricsAggs();
-    }
-
-    @SneakyThrows
-    public void testWithConcurrentSegmentSearch_whenScriptedMetrics_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", true);
-        testScriptedMetricsAggs();
-    }
-
-    @SneakyThrows
     public void testMetricAggs_whenPercentileRank_thenSuccessful() {
         updateClusterSettings("search.concurrent_segment_search.enabled", false);
         testPercentileRankAggs();
@@ -229,6 +216,30 @@ public class MetricAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     }
 
     @SneakyThrows
+    public void testMetricAggs_whenScriptedMetrics_thenSuccessful() {
+        updateClusterSettings("search.concurrent_segment_search.enabled", false);
+        testScriptedMetricsAggs();
+    }
+
+    @SneakyThrows
+    public void testWithConcurrentSegmentSearch_whenScriptedMetrics_thenSuccessful() {
+        updateClusterSettings("search.concurrent_segment_search.enabled", true);
+        testScriptedMetricsAggs();
+    }
+
+    @SneakyThrows
+    public void testMetricAggs_whenSumAgg_thenSuccessful() {
+        updateClusterSettings("search.concurrent_segment_search.enabled", false);
+        testSumAggs();
+    }
+
+    @SneakyThrows
+    public void testWithConcurrentSegmentSearch_whenSumAgg_thenSuccessful() {
+        updateClusterSettings("search.concurrent_segment_search.enabled", true);
+        testSumAggs();
+    }
+
+    @SneakyThrows
     public void testMetricAggs_whenValueCount_thenSuccessful() {
         updateClusterSettings("search.concurrent_segment_search.enabled", false);
         testValueCountAggs();
@@ -238,6 +249,18 @@ public class MetricAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     public void testWithConcurrentSegmentSearch_whenValueCount_thenSuccessful() {
         updateClusterSettings("search.concurrent_segment_search.enabled", true);
         testValueCountAggs();
+    }
+
+    @SneakyThrows
+    public void testAggWithPostFilter_whenSumAggAndRangeFilter_thenSuccessful() {
+        updateClusterSettings("search.concurrent_segment_search.enabled", false);
+        testSumAggsAndRangePostFilter();
+    }
+
+    @SneakyThrows
+    public void testWithConcurrentSegmentSearch_whenSumAggAndRangeFilter_thenSuccessful() {
+        updateClusterSettings("search.concurrent_segment_search.enabled", true);
+        testSumAggsAndRangePostFilter();
     }
 
     private void testMaxAggsOnSingleShardCluster() throws Exception {
@@ -442,47 +465,24 @@ public class MetricAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
         }
     }
 
-    private void assertResultsOfPipelineSumtoDateHistogramAggs(Map<String, Object> searchResponseAsMap) {
-        Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
-        assertNotNull(aggregations);
+    private void testSumAggs() throws IOException {
+        try {
+            prepareResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, SEARCH_PIPELINE);
 
-        double aggValue = getAggregationValue(aggregations, BUCKETS_AGGREGATION_NAME_1);
-        assertEquals(3517.5, aggValue, DELTA_FOR_SCORE_ASSERTION);
+            AggregationBuilder aggsBuilder = AggregationBuilders.sum(SUM_AGGREGATION_NAME).field(INTEGER_FIELD_1);
+            Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(
+                aggsBuilder,
+                TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS
+            );
 
-        double sumValue = getAggregationValue(aggregations, BUCKETS_AGGREGATION_NAME_2);
-        assertEquals(7035.0, sumValue, DELTA_FOR_SCORE_ASSERTION);
-
-        double minValue = getAggregationValue(aggregations, BUCKETS_AGGREGATION_NAME_3);
-        assertEquals(1234.0, minValue, DELTA_FOR_SCORE_ASSERTION);
-
-        double maxValue = getAggregationValue(aggregations, BUCKETS_AGGREGATION_NAME_4);
-        assertEquals(5801.0, maxValue, DELTA_FOR_SCORE_ASSERTION);
-
-        List<Map<String, Object>> buckets = getAggregationBuckets(aggregations, GENERIC_AGGREGATION_NAME);
-        assertNotNull(buckets);
-        assertEquals(21, buckets.size());
-
-        // check content of few buckets
-        Map<String, Object> firstBucket = buckets.get(0);
-        assertEquals(4, firstBucket.size());
-        assertEquals("01/01/1995", firstBucket.get(BUCKET_AGG_KEY_AS_STRING));
-        assertEquals(1, firstBucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
-        assertEquals(1234.0, getAggregationValue(firstBucket, SUM_AGGREGATION_NAME), DELTA_FOR_SCORE_ASSERTION);
-        assertTrue(firstBucket.containsKey(KEY));
-
-        Map<String, Object> secondBucket = buckets.get(1);
-        assertEquals(4, secondBucket.size());
-        assertEquals("01/01/1996", secondBucket.get(BUCKET_AGG_KEY_AS_STRING));
-        assertEquals(0, secondBucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
-        assertEquals(0.0, getAggregationValue(secondBucket, SUM_AGGREGATION_NAME), DELTA_FOR_SCORE_ASSERTION);
-        assertTrue(secondBucket.containsKey(KEY));
-
-        Map<String, Object> lastBucket = buckets.get(buckets.size() - 1);
-        assertEquals(4, lastBucket.size());
-        assertEquals("01/01/2015", lastBucket.get(BUCKET_AGG_KEY_AS_STRING));
-        assertEquals(2, lastBucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
-        assertEquals(5801.0, getAggregationValue(lastBucket, SUM_AGGREGATION_NAME), DELTA_FOR_SCORE_ASSERTION);
-        assertTrue(lastBucket.containsKey(KEY));
+            Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+            assertNotNull(aggregations);
+            assertTrue(aggregations.containsKey(SUM_AGGREGATION_NAME));
+            double maxAggsValue = getAggregationValue(aggregations, SUM_AGGREGATION_NAME);
+            assertEquals(7035.0, maxAggsValue, DELTA_FOR_SCORE_ASSERTION);
+        } finally {
+            wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
+        }
     }
 
     private void testValueCountAggs() throws IOException {
@@ -501,6 +501,57 @@ public class MetricAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
 
             assertTrue(aggregations.containsKey(GENERIC_AGGREGATION_NAME));
             assertEquals(3, (int) getAggregationValue(aggregations, GENERIC_AGGREGATION_NAME));
+        } finally {
+            wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
+        }
+    }
+
+    private void testSumAggsAndRangePostFilter() throws IOException {
+        try {
+            prepareResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, SEARCH_PIPELINE);
+
+            AggregationBuilder aggsBuilder = AggregationBuilders.sum(SUM_AGGREGATION_NAME).field(INTEGER_FIELD_1);
+
+            TermQueryBuilder termQueryBuilder1 = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT3);
+            TermQueryBuilder termQueryBuilder2 = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT4);
+            TermQueryBuilder termQueryBuilder3 = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT5);
+
+            HybridQueryBuilder hybridQueryBuilderNeuralThenTerm = new HybridQueryBuilder();
+            hybridQueryBuilderNeuralThenTerm.add(termQueryBuilder1);
+            hybridQueryBuilderNeuralThenTerm.add(termQueryBuilder2);
+            hybridQueryBuilderNeuralThenTerm.add(termQueryBuilder3);
+
+            QueryBuilder rangeFilterQuery = QueryBuilders.rangeQuery(INTEGER_FIELD_1).gte(3000).lte(5000);
+
+            Map<String, Object> searchResponseAsMap = search(
+                TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS,
+                hybridQueryBuilderNeuralThenTerm,
+                null,
+                10,
+                Map.of("search_pipeline", SEARCH_PIPELINE),
+                List.of(aggsBuilder),
+                rangeFilterQuery
+            );
+
+            Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+            assertNotNull(aggregations);
+            assertTrue(aggregations.containsKey(SUM_AGGREGATION_NAME));
+            double maxAggsValue = getAggregationValue(aggregations, SUM_AGGREGATION_NAME);
+            assertEquals(11602.0, maxAggsValue, DELTA_FOR_SCORE_ASSERTION);
+
+            assertHitResultsFromQuery(2, searchResponseAsMap);
+
+            // assert post-filter
+            List<Map<String, Object>> hitsNestedList = getNestedHits(searchResponseAsMap);
+
+            List<Integer> docIndexes = new ArrayList<>();
+            for (Map<String, Object> oneHit : hitsNestedList) {
+                assertNotNull(oneHit.get("_source"));
+                Map<String, Object> source = (Map<String, Object>) oneHit.get("_source");
+                int docIndex = (int) source.get(INTEGER_FIELD_1);
+                docIndexes.add(docIndex);
+            }
+            assertEquals(0, docIndexes.stream().filter(docIndex -> docIndex < 3000 || docIndex > 5000).count());
         } finally {
             wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
         }

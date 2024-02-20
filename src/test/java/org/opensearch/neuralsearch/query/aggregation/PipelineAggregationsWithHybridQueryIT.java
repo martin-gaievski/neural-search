@@ -147,18 +147,6 @@ public class PipelineAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     }
 
     @SneakyThrows
-    public void testWithConcurrentSegmentSearch_whenDateBucketedSumsPipelinedToBucketScriptAggs_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", true);
-        testDateBucketedSumsPipelinedToBucketStatsAggs();
-    }
-
-    @SneakyThrows
-    public void testPipelineSiblingAggs_whenDateBucketedSumsPipelinedToBucketScriptAggs_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", false);
-        testDateBucketedSumsPipelinedToBucketStatsAggs();
-    }
-
-    @SneakyThrows
     public void testWithConcurrentSegmentSearch_whenDateBucketedSumsPipelinedToBucketScriptedAggs_thenSuccessful() {
         updateClusterSettings("search.concurrent_segment_search.enabled", true);
         testDateBucketedSumsPipelinedToBucketScriptedAggs();

@@ -6,6 +6,7 @@ package org.opensearch.neuralsearch.query.aggregation;
 
 import lombok.SneakyThrows;
 import org.junit.Before;
+import org.opensearch.client.ResponseException;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.TermQueryBuilder;
@@ -59,8 +60,16 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     private static final String TEST_NESTED_TYPE_FIELD_NAME_1 = "user";
     private static final String NESTED_FIELD_1 = "firstname";
     private static final String NESTED_FIELD_2 = "lastname";
-    private static final String NESTED_FIELD_1_VALUE = "john";
-    private static final String NESTED_FIELD_2_VALUE = "black";
+    private static final String NESTED_FIELD_1_VALUE_1 = "john";
+    private static final String NESTED_FIELD_2_VALUE_1 = "black";
+    private static final String NESTED_FIELD_1_VALUE_2 = "frodo";
+    private static final String NESTED_FIELD_2_VALUE_2 = "baggins";
+    private static final String NESTED_FIELD_1_VALUE_3 = "mohammed";
+    private static final String NESTED_FIELD_2_VALUE_3 = "ezab";
+    private static final String NESTED_FIELD_1_VALUE_4 = "sun";
+    private static final String NESTED_FIELD_2_VALUE_4 = "wukong";
+    private static final String NESTED_FIELD_1_VALUE_5 = "vasilisa";
+    private static final String NESTED_FIELD_2_VALUE_5 = "the wise";
     private static final String INTEGER_FIELD_1 = "doc_index";
     private static final int INTEGER_FIELD_1_VALUE = 1234;
     private static final int INTEGER_FIELD_2_VALUE = 2345;
@@ -97,6 +106,7 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     private static final String BUCKETS_AGGREGATION_NAME_2 = "date_buckets_2";
     private static final String BUCKETS_AGGREGATION_NAME_3 = "date_buckets_3";
     private static final String BUCKETS_AGGREGATION_NAME_4 = "date_buckets_4";
+    private static final String CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH = "search.concurrent_segment_search.enabled";
 
     @Before
     public void setUp() throws Exception {
@@ -124,105 +134,187 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
 
     @SneakyThrows
     public void testBucketAndNestedAggs_whenAdjacencyMatrix_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", false);
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
         testAdjacencyMatrixAggs();
     }
 
     @SneakyThrows
     public void testWithConcurrentSegmentSearch_whenAdjacencyMatrix_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", true);
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
         testAdjacencyMatrixAggs();
     }
 
     @SneakyThrows
     public void testBucketAndNestedAggs_whenDateRange_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", false);
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
         testDateRange();
     }
 
     @SneakyThrows
     public void testWithConcurrentSegmentSearch_whenDateRange_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", true);
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
         testDateRange();
     }
 
     @SneakyThrows
     public void testBucketAndNestedAggs_whenDiversifiedSampler_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", false);
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
         testDiversifiedSampler();
     }
 
-    // Need to review, failing with illegal state!!!!
     @SneakyThrows
-    public void testWithConcurrentSegmentSearch_whenDiversifiedSampler_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", true);
+    public void testWithConcurrentSegmentSearch_whenDiversifiedSampler_thenFail() {
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
+
+        /*AggregationBuilder aggsBuilder = AggregationBuilders.diversifiedSampler(GENERIC_AGGREGATION_NAME)
+            .field(KEYWORD_FIELD_1)
+            .shardSize(2)
+            .subAggregation(AggregationBuilders.terms(BUCKETS_AGGREGATION_NAME_1).field(KEYWORD_FIELD_1));
+        testAggregationWithExpectedFailure(aggsBuilder);*/
         testDiversifiedSampler();
     }
 
     @SneakyThrows
     public void testBucketAndNestedAggs_whenAvgNestedIntoFilter_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", false);
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
         testAvgNestedIntoFilter();
     }
 
     @SneakyThrows
     public void testWithConcurrentSegmentSearch_whenAvgNestedIntoFilter_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", true);
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
         testAvgNestedIntoFilter();
     }
 
     @SneakyThrows
+    public void testBucketAndNestedAggs_whenSumNestedIntoFilters_thenSuccessful() {
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
+        testSumNestedIntoFilters();
+    }
+
+    @SneakyThrows
+    public void testWithConcurrentSegmentSearch_whenSumNestedIntoFilters_thenSuccessful() {
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
+        testSumNestedIntoFilters();
+    }
+
+    @SneakyThrows
+    public void testBucketAggs_whenGlobalAggUsedWithQuery_thenSuccessful() {
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
+        testGlobalAggs();
+    }
+
+    @SneakyThrows
+    public void testWithConcurrentSegmentSearch_whenGlobalAggUsedWithQuery_thenSuccessful() {
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
+        testGlobalAggs();
+    }
+
+    @SneakyThrows
+    public void testBucketAggs_whenHistogramAgg_thenSuccessful() {
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
+        testHistogramAggs();
+    }
+
+    @SneakyThrows
+    public void testWithConcurrentSegmentSearch_whenHistogramAgg_thenSuccessful() {
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
+        testHistogramAggs();
+    }
+
+    @SneakyThrows
+    public void testBucketAggs_whenNestedAgg_thenSuccessful() {
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
+        testNestedAggs();
+    }
+
+    @SneakyThrows
+    public void testWithConcurrentSegmentSearch_whenNestedAgg_thenSuccessful() {
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
+        testNestedAggs();
+    }
+
+    @SneakyThrows
+    public void testBucketAggs_whenSamplerAgg_thenSuccessful() {
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
+        testSampler();
+    }
+
+    @SneakyThrows
+    public void testWithConcurrentSegmentSearch_whenSamplerAgg_thenFail() {
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
+
+        /*AggregationBuilder aggsBuilder = AggregationBuilders.sampler(GENERIC_AGGREGATION_NAME)
+            .shardSize(1)
+            .subAggregation(AggregationBuilders.terms(BUCKETS_AGGREGATION_NAME_1).field(KEYWORD_FIELD_1));
+        testAggregationWithExpectedFailure(aggsBuilder);*/
+        testSampler();
+    }
+
+    @SneakyThrows
     public void testPipelineSiblingAggs_whenDateBucketedSumsPipelinedToBucketMinMaxSumAvgAggs_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", false);
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
         testDateBucketedSumsPipelinedToBucketMinMaxSumAvgAggs();
     }
 
     @SneakyThrows
     public void testWithConcurrentSegmentSearch_whenDateBucketedSumsPipelinedToBucketMinMaxSumAvgAggs_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", true);
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
         testDateBucketedSumsPipelinedToBucketMinMaxSumAvgAggs();
     }
 
     @SneakyThrows
     public void testPipelineSiblingAggs_whenDateBucketedSumsPipelinedToBucketStatsAggs_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", false);
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
         testDateBucketedSumsPipelinedToBucketStatsAggs();
     }
 
     @SneakyThrows
     public void testWithConcurrentSegmentSearch_whenDateBucketedSumsPipelinedToBucketStatsAggs_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", true);
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
         testDateBucketedSumsPipelinedToBucketStatsAggs();
     }
 
     @SneakyThrows
     public void testPipelineSiblingAggs_whenDateBucketedSumsPipelinedToBucketScriptAggs_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", false);
-        testDateBucketedSumsPipelinedToBucketStatsAggs();
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
+        testDateBucketedSumsPipelinedToBucketScriptedAggs();
     }
 
     @SneakyThrows
     public void testWithConcurrentSegmentSearch_whenDateBucketedSumsPipelinedToBucketScriptedAggs_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", true);
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
         testDateBucketedSumsPipelinedToBucketScriptedAggs();
     }
 
     @SneakyThrows
     public void testPipelineParentAggs_whenDateBucketedSumsPipelinedToBucketScriptedAggs_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", false);
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
         testDateBucketedSumsPipelinedToBucketScriptedAggs();
     }
 
     @SneakyThrows
-    public void testWithConcurrentSegmentSearch_whenTermsAggs_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", true);
+    public void testMetricAggs_whenTermsAggs_thenSuccessful() {
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
         testTermsAggs();
     }
 
     @SneakyThrows
-    public void testMetricAggs_whenTermsAggs_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", false);
+    public void testWithConcurrentSegmentSearch_whenTermsAggs_thenSuccessful() {
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
         testTermsAggs();
+    }
+
+    @SneakyThrows
+    public void testMetricAggs_whenSignificantTermsAggs_thenSuccessful() {
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
+        testSignificantTermsAggs();
+    }
+
+    @SneakyThrows
+    public void testWithConcurrentSegmentSearch_whenSignificantTermsAggs_thenSuccessful() {
+        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
+        testSignificantTermsAggs();
     }
 
     private void testAvgNestedIntoFilter() throws IOException {
@@ -243,6 +335,156 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
             assertTrue(aggregations.containsKey(GENERIC_AGGREGATION_NAME));
             double avgValue = getAggregationValue(getAggregationValues(aggregations, GENERIC_AGGREGATION_NAME), AVG_AGGREGATION_NAME);
             assertEquals(1789.5, avgValue, DELTA_FOR_SCORE_ASSERTION);
+        } finally {
+            wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
+        }
+    }
+
+    private void testSumNestedIntoFilters() throws IOException {
+        try {
+            prepareResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, SEARCH_PIPELINE);
+
+            AggregationBuilder aggsBuilder = AggregationBuilders.filters(
+                GENERIC_AGGREGATION_NAME,
+                QueryBuilders.rangeQuery(INTEGER_FIELD_1).lte(3000),
+                QueryBuilders.termQuery(KEYWORD_FIELD_1, KEYWORD_FIELD_1_VALUE)
+            ).otherBucket(true).subAggregation(AggregationBuilders.sum(SUM_AGGREGATION_NAME).field(INTEGER_FIELD_1));
+            Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(
+                aggsBuilder,
+                TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS
+            );
+
+            Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+            assertNotNull(aggregations);
+
+            List<Map<String, Object>> buckets = getAggregationBuckets(aggregations, GENERIC_AGGREGATION_NAME);
+            assertNotNull(buckets);
+            assertEquals(3, buckets.size());
+
+            Map<String, Object> firstBucket = buckets.get(0);
+            assertEquals(2, firstBucket.size());
+            assertEquals(2, firstBucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
+            assertEquals(3579.0, getAggregationValue(firstBucket, SUM_AGGREGATION_NAME), DELTA_FOR_SCORE_ASSERTION);
+
+            Map<String, Object> secondBucket = buckets.get(1);
+            assertEquals(2, secondBucket.size());
+            assertEquals(1, secondBucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
+            assertEquals(1234.0, getAggregationValue(secondBucket, SUM_AGGREGATION_NAME), DELTA_FOR_SCORE_ASSERTION);
+
+            Map<String, Object> thirdBucket = buckets.get(2);
+            assertEquals(2, thirdBucket.size());
+            assertEquals(1, thirdBucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
+            assertEquals(3456.0, getAggregationValue(thirdBucket, SUM_AGGREGATION_NAME), DELTA_FOR_SCORE_ASSERTION);
+        } finally {
+            wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
+        }
+    }
+
+    private void testGlobalAggs() throws IOException {
+        try {
+            prepareResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, SEARCH_PIPELINE);
+
+            TermQueryBuilder termQueryBuilder1 = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT3);
+            TermQueryBuilder termQueryBuilder2 = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT5);
+
+            HybridQueryBuilder hybridQueryBuilderNeuralThenTerm = new HybridQueryBuilder();
+            hybridQueryBuilderNeuralThenTerm.add(termQueryBuilder1);
+            hybridQueryBuilderNeuralThenTerm.add(termQueryBuilder2);
+
+            AggregationBuilder aggsBuilder = AggregationBuilders.global(GENERIC_AGGREGATION_NAME)
+                .subAggregation(AggregationBuilders.sum(AVG_AGGREGATION_NAME).field(INTEGER_FIELD_1));
+
+            Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(
+                List.of(aggsBuilder),
+                hybridQueryBuilderNeuralThenTerm,
+                TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS
+            );
+
+            Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+            assertNotNull(aggregations);
+            assertTrue(aggregations.containsKey(GENERIC_AGGREGATION_NAME));
+            double avgValue = getAggregationValue(getAggregationValues(aggregations, GENERIC_AGGREGATION_NAME), AVG_AGGREGATION_NAME);
+            assertEquals(15058.0, avgValue, DELTA_FOR_SCORE_ASSERTION);
+        } finally {
+            wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
+        }
+    }
+
+    private void testHistogramAggs() throws IOException {
+        try {
+            prepareResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, SEARCH_PIPELINE);
+
+            AggregationBuilder aggsBuilder = AggregationBuilders.histogram(GENERIC_AGGREGATION_NAME)
+                .field(INTEGER_FIELD_PRICE)
+                .interval(100);
+
+            Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(
+                aggsBuilder,
+                TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS
+            );
+
+            Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+            assertNotNull(aggregations);
+
+            List<Map<String, Object>> buckets = getAggregationBuckets(aggregations, GENERIC_AGGREGATION_NAME);
+            assertNotNull(buckets);
+            assertEquals(2, buckets.size());
+
+            Map<String, Object> firstBucket = buckets.get(0);
+            assertEquals(2, firstBucket.size());
+            assertEquals(1, firstBucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
+            assertEquals(0.0, (Double) firstBucket.get(KEY), DELTA_FOR_SCORE_ASSERTION);
+
+            Map<String, Object> secondBucket = buckets.get(1);
+            assertEquals(2, secondBucket.size());
+            assertEquals(2, secondBucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
+            assertEquals(100.0, (Double) secondBucket.get(KEY), DELTA_FOR_SCORE_ASSERTION);
+        } finally {
+            wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
+        }
+    }
+
+    private void testNestedAggs() throws IOException {
+        try {
+            prepareResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, SEARCH_PIPELINE);
+
+            AggregationBuilder aggsBuilder = AggregationBuilders.nested(GENERIC_AGGREGATION_NAME, TEST_NESTED_TYPE_FIELD_NAME_1)
+                .subAggregation(
+                    AggregationBuilders.terms(BUCKETS_AGGREGATION_NAME_1)
+                        .field(String.join(".", TEST_NESTED_TYPE_FIELD_NAME_1, NESTED_FIELD_1))
+                );
+
+            Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(
+                aggsBuilder,
+                TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS
+            );
+
+            Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+            assertNotNull(aggregations);
+
+            Map<String, Object> nestedAgg = getAggregationValues(aggregations, GENERIC_AGGREGATION_NAME);
+            assertNotNull(nestedAgg);
+
+            assertEquals(3, nestedAgg.get(BUCKET_AGG_DOC_COUNT_FIELD));
+            List<Map<String, Object>> buckets = getAggregationBuckets(nestedAgg, BUCKETS_AGGREGATION_NAME_1);
+
+            assertNotNull(buckets);
+            assertEquals(3, buckets.size());
+
+            Map<String, Object> firstBucket = buckets.get(0);
+            assertEquals(2, firstBucket.size());
+            assertEquals(1, firstBucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
+            assertEquals(NESTED_FIELD_1_VALUE_2, firstBucket.get(KEY));
+
+            Map<String, Object> secondBucket = buckets.get(1);
+            assertEquals(2, secondBucket.size());
+            assertEquals(1, secondBucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
+            assertEquals(NESTED_FIELD_1_VALUE_1, secondBucket.get(KEY));
+
+            Map<String, Object> thirdBucket = buckets.get(2);
+            assertEquals(2, thirdBucket.size());
+            assertEquals(1, thirdBucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
+            assertEquals(NESTED_FIELD_1_VALUE_4, thirdBucket.get(KEY));
         } finally {
             wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
         }
@@ -289,6 +531,7 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
                 .field(KEYWORD_FIELD_1)
                 .shardSize(2)
                 .subAggregation(AggregationBuilders.terms(BUCKETS_AGGREGATION_NAME_1).field(KEYWORD_FIELD_1));
+
             Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(
                 aggsBuilder,
                 TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS
@@ -555,6 +798,43 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
         }
     }
 
+    private void testSampler() throws IOException {
+        try {
+            prepareResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, SEARCH_PIPELINE);
+
+            AggregationBuilder aggsBuilder = AggregationBuilders.sampler(GENERIC_AGGREGATION_NAME)
+                .shardSize(2)
+                .subAggregation(AggregationBuilders.terms(BUCKETS_AGGREGATION_NAME_1).field(KEYWORD_FIELD_1));
+
+            Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(
+                aggsBuilder,
+                TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS
+            );
+
+            Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+            assertNotNull(aggregations);
+
+            Map<String, Object> aggValue = getAggregationValues(aggregations, GENERIC_AGGREGATION_NAME);
+            assertEquals(2, aggValue.size());
+            assertEquals(3, aggValue.get(BUCKET_AGG_DOC_COUNT_FIELD));
+            Map<String, Object> nestedAggs = getAggregationValues(aggValue, BUCKETS_AGGREGATION_NAME_1);
+            assertNotNull(nestedAggs);
+            assertEquals(0, nestedAggs.get("doc_count_error_upper_bound"));
+            List<Map<String, Object>> buckets = getAggregationBuckets(aggValue, BUCKETS_AGGREGATION_NAME_1);
+            assertEquals(2, buckets.size());
+
+            Map<String, Object> firstBucket = buckets.get(0);
+            assertEquals(1, firstBucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
+            assertEquals("likeable", firstBucket.get(KEY));
+
+            Map<String, Object> secondBucket = buckets.get(1);
+            assertEquals(1, secondBucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
+            assertEquals("workable", secondBucket.get(KEY));
+        } finally {
+            wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
+        }
+    }
+
     private void testTermsAggs() throws IOException {
         try {
             prepareResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, SEARCH_PIPELINE);
@@ -578,6 +858,58 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
             Map<String, Object> secondBucket = buckets.get(1);
             assertEquals(1, secondBucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
             assertEquals(KEYWORD_FIELD_1_VALUE, secondBucket.get(KEY));
+        } finally {
+            wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
+        }
+    }
+
+    private void testSignificantTermsAggs() throws IOException {
+        try {
+            prepareResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, SEARCH_PIPELINE);
+
+            AggregationBuilder aggsBuilder = AggregationBuilders.significantTerms(GENERIC_AGGREGATION_NAME).field(KEYWORD_FIELD_1);
+            Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(
+                aggsBuilder,
+                TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS
+            );
+
+            Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
+            assertNotNull(aggregations);
+            List<Map<String, Object>> buckets = getAggregationBuckets(aggregations, GENERIC_AGGREGATION_NAME);
+            assertNotNull(buckets);
+
+            Map<String, Object> significantTermsAggregations = getAggregationValues(aggregations, GENERIC_AGGREGATION_NAME);
+
+            assertNotNull(significantTermsAggregations);
+            assertEquals(3, (int) getAggregationValues(significantTermsAggregations, BUCKET_AGG_DOC_COUNT_FIELD));
+            assertEquals(11, (int) getAggregationValues(significantTermsAggregations, "bg_count"));
+        } finally {
+            wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
+        }
+    }
+
+    private void testAggregationWithExpectedFailure(final AggregationBuilder aggsBuilder) throws IOException {
+        try {
+            prepareResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, SEARCH_PIPELINE);
+
+            TermQueryBuilder termQueryBuilder1 = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT3);
+            TermQueryBuilder termQueryBuilder2 = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT5);
+
+            HybridQueryBuilder hybridQueryBuilderNeuralThenTerm = new HybridQueryBuilder();
+            hybridQueryBuilderNeuralThenTerm.add(termQueryBuilder1);
+            hybridQueryBuilderNeuralThenTerm.add(termQueryBuilder2);
+
+            ResponseException responseException = expectThrows(
+                ResponseException.class,
+                () -> search(
+                    TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS,
+                    hybridQueryBuilderNeuralThenTerm,
+                    null,
+                    10,
+                    Map.of("search_pipeline", SEARCH_PIPELINE),
+                    List.of(aggsBuilder)
+                )
+            );
         } finally {
             wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
         }
@@ -656,7 +988,14 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
         if (!indexExists(indexName)) {
             createIndexWithConfiguration(
                 indexName,
-                buildIndexConfiguration(List.of(), List.of(), List.of(INTEGER_FIELD_1), List.of(KEYWORD_FIELD_1), List.of(DATE_FIELD_1), 3),
+                buildIndexConfiguration(
+                    List.of(),
+                    List.of(TEST_NESTED_TYPE_FIELD_NAME_1, NESTED_FIELD_1, NESTED_FIELD_2),
+                    List.of(INTEGER_FIELD_1),
+                    List.of(KEYWORD_FIELD_1),
+                    List.of(DATE_FIELD_1),
+                    3
+                ),
                 ""
             );
 
@@ -665,10 +1004,10 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
                 "1",
                 List.of(),
                 List.of(),
-                Collections.singletonList(TEST_TEXT_FIELD_NAME_1),
-                Collections.singletonList(TEST_DOC_TEXT1),
-                List.of(),
-                List.of(),
+                List.of(TEST_TEXT_FIELD_NAME_1),
+                List.of(TEST_DOC_TEXT1),
+                List.of(TEST_NESTED_TYPE_FIELD_NAME_1),
+                List.of(Map.of(NESTED_FIELD_1, NESTED_FIELD_1_VALUE_1, NESTED_FIELD_2, NESTED_FIELD_2_VALUE_1)),
                 List.of(INTEGER_FIELD_1, INTEGER_FIELD_PRICE),
                 List.of(INTEGER_FIELD_1_VALUE, INTEGER_FIELD_PRICE_1_VALUE),
                 List.of(KEYWORD_FIELD_1),
@@ -683,8 +1022,8 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
                 List.of(),
                 Collections.singletonList(TEST_TEXT_FIELD_NAME_1),
                 Collections.singletonList(TEST_DOC_TEXT3),
-                List.of(),
-                List.of(),
+                List.of(TEST_NESTED_TYPE_FIELD_NAME_1),
+                List.of(Map.of(NESTED_FIELD_1, NESTED_FIELD_1_VALUE_2, NESTED_FIELD_2, NESTED_FIELD_2_VALUE_2)),
                 List.of(INTEGER_FIELD_1, INTEGER_FIELD_PRICE),
                 List.of(INTEGER_FIELD_2_VALUE, INTEGER_FIELD_PRICE_2_VALUE),
                 List.of(),
@@ -699,8 +1038,8 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
                 List.of(),
                 Collections.singletonList(TEST_TEXT_FIELD_NAME_1),
                 Collections.singletonList(TEST_DOC_TEXT2),
-                List.of(),
-                List.of(),
+                List.of(TEST_NESTED_TYPE_FIELD_NAME_1),
+                List.of(Map.of(NESTED_FIELD_1, NESTED_FIELD_1_VALUE_3, NESTED_FIELD_2, NESTED_FIELD_2_VALUE_3)),
                 List.of(INTEGER_FIELD_PRICE),
                 List.of(INTEGER_FIELD_PRICE_3_VALUE),
                 List.of(KEYWORD_FIELD_1),
@@ -715,8 +1054,8 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
                 List.of(),
                 Collections.singletonList(TEST_TEXT_FIELD_NAME_1),
                 Collections.singletonList(TEST_DOC_TEXT4),
-                List.of(),
-                List.of(),
+                List.of(TEST_NESTED_TYPE_FIELD_NAME_1),
+                List.of(Map.of(NESTED_FIELD_1, NESTED_FIELD_1_VALUE_4, NESTED_FIELD_2, NESTED_FIELD_2_VALUE_4)),
                 List.of(INTEGER_FIELD_1, INTEGER_FIELD_PRICE),
                 List.of(INTEGER_FIELD_3_VALUE, INTEGER_FIELD_PRICE_4_VALUE),
                 List.of(KEYWORD_FIELD_1),
@@ -747,8 +1086,8 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
                 List.of(),
                 Collections.singletonList(TEST_TEXT_FIELD_NAME_1),
                 Collections.singletonList(TEST_DOC_TEXT6),
-                List.of(),
-                List.of(),
+                List.of(TEST_NESTED_TYPE_FIELD_NAME_1),
+                List.of(Map.of(NESTED_FIELD_1, NESTED_FIELD_1_VALUE_5, NESTED_FIELD_2, NESTED_FIELD_2_VALUE_5)),
                 List.of(INTEGER_FIELD_1, INTEGER_FIELD_PRICE),
                 List.of(INTEGER_FIELD_4_VALUE, INTEGER_FIELD_PRICE_6_VALUE),
                 List.of(KEYWORD_FIELD_1),

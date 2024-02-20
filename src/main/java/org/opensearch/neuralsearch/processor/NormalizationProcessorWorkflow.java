@@ -138,6 +138,14 @@ public class NormalizationProcessorWorkflow {
         // 3. update original scores to normalized and combined values
         // 4. order scores based on normalized and combined values
         FetchSearchResult fetchSearchResult = fetchSearchResultOptional.get();
+        // checking case when results are cached
+        // boolean requestCache = Objects.isNull(querySearchResults.get(0).getShardSearchRequest())
+        // || querySearchResults.get(0).getShardSearchRequest().requestCache();
+        SearchHits searchHits = fetchSearchResult.hits();
+        // if (requestCache && (searchHits.getHits().length != docIds.size())) {
+        // return;
+        // }
+
         SearchHit[] searchHitArray = getSearchHits(docIds, fetchSearchResult);
 
         // create map of docId to index of search hits. This solves (2), duplicates are from

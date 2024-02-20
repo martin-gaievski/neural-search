@@ -822,9 +822,12 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
 
         for (String dateField : dateFields) {
             xContentBuilder.startObject(dateField).field("type", "date").field("format", "MM/dd/yyyy").endObject();
+<<<<<<< HEAD
 
         for (String keywordField : dateFields) {
             xContentBuilder.startObject(keywordField).field("type", "date").field("format", "MM/dd/yyyy").endObject();
+=======
+>>>>>>> b37fc4a (Testing apporach with aggregationProcessor pre and post phases)
         }
 
         xContentBuilder.endObject().endObject().endObject();
