@@ -115,9 +115,6 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
         // default threshold for native circuit breaker is 90, it may be not enough on test runner machine
         updateClusterSettings("plugins.ml_commons.native_memory_threshold", 100);
         updateClusterSettings("plugins.ml_commons.allow_registering_model_via_url", true);
-        // this way segment search will be disabled by default, we need to enable it via feature flag first as otherwise it's not possible
-        // to turn it on/off via cluster setting
-        updateClusterSettings("search.concurrent_segment_search.enabled", false);
     }
 
     @SneakyThrows
