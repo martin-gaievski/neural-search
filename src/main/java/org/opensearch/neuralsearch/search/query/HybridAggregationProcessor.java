@@ -6,6 +6,7 @@ package org.opensearch.neuralsearch.search.query;
 
 import lombok.AllArgsConstructor;
 import org.apache.lucene.search.CollectorManager;
+import org.opensearch.neuralsearch.util.HybridQueryUtil;
 import org.opensearch.search.aggregations.AggregationInitializationException;
 import org.opensearch.search.aggregations.AggregationProcessor;
 import org.opensearch.search.internal.SearchContext;
@@ -14,6 +15,7 @@ import org.opensearch.search.query.QuerySearchResult;
 import org.opensearch.search.query.ReduceableSearchResult;
 
 import java.io.IOException;
+import java.util.Collection;
 import java.util.List;
 
 import static org.opensearch.neuralsearch.search.query.HybridQueryPhaseSearcher.isHybridQuery;
@@ -31,7 +33,8 @@ public class HybridAggregationProcessor implements AggregationProcessor {
     public void preProcess(SearchContext context) {
         delegateAggsProcessor.preProcess(context);
 
-        if (isHybridQuery(context.query(), context)) {
+
+        if (HybridQueryUtil.isHybridQuery(context.query(), context)) {
             // adding collector manager for hybrid query
             CollectorManager collectorManager;
             try {
@@ -45,7 +48,7 @@ public class HybridAggregationProcessor implements AggregationProcessor {
 
     @Override
     public void postProcess(SearchContext context) {
-        if (isHybridQuery(context.query(), context)) {
+        if ((HybridQueryUtil.isHybridQuery(context.query(), context)) {
             // for case when concurrent search is not enabled (default as of 2.12 release) reduce for collector
             // managers is not called
             // (https://github.com/opensearch-project/OpenSearch/blob/2.12/server/src/main/java/org/opensearch/search/query/QueryPhase.java#L333-L373)

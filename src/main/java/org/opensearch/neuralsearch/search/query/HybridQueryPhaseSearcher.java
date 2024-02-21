@@ -18,6 +18,7 @@ import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.index.search.NestedHelper;
 import org.opensearch.neuralsearch.query.HybridQuery;
+import org.opensearch.neuralsearch.util.HybridQueryUtil;
 import org.opensearch.search.aggregations.AggregationProcessor;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
@@ -46,11 +47,13 @@ public class HybridQueryPhaseSearcher extends QueryPhaseSearcherWrapper {
         final boolean hasFilterCollector,
         final boolean hasTimeout
     ) throws IOException {
-        if (!isHybridQuery(query, searchContext)) {
+        if (!HybridQueryUtil.isHybridQuery(query, searchContext)) {
             validateQuery(searchContext, query);
             return super.searchWith(searchContext, searcher, query, collectors, hasFilterCollector, hasTimeout);
         } else {
-        return super.searchWith(searchContext, searcher, query, collectors, hasFilterCollector, hasTimeout);
+            Query hybridQuery = extractHybridQuery(searchContext, query);
+            return super.searchWith(searchContext, searcher, hybridQuery, collectors, hasFilterCollector, hasTimeout);
+        }
     }
 
     @VisibleForTesting
