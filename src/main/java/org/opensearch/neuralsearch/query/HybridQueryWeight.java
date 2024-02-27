@@ -5,6 +5,7 @@
 package org.opensearch.neuralsearch.query;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.Collectors;
@@ -16,6 +17,7 @@ import org.apache.lucene.search.Matches;
 import org.apache.lucene.search.MatchesUtils;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
+import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.Weight;
 
 /**
@@ -65,6 +67,52 @@ public final class HybridQueryWeight extends Weight {
         return MatchesUtils.fromSubMatches(mis);
     }
 
+    @Override
+    public ScorerSupplier scorerSupplier(LeafReaderContext context) throws IOException {
+        // critical section
+        List<ScorerSupplier> scorerSuppliers = new ArrayList<>();
+        for (Weight w : weights) {
+            ScorerSupplier ss = w.scorerSupplier(context);
+            if (ss != null) {
+                scorerSuppliers.add(ss);
+            }
+        }
+
+        if (scorerSuppliers.isEmpty()) {
+            return null;
+        } else if (scorerSuppliers.size() == 1) {
+            return scorerSuppliers.get(0);
+        } else {
+            final Weight thisWeight = this;
+            return new ScorerSupplier() {
+
+                private long cost = -1;
+
+                @Override
+                public Scorer get(long leadCost) throws IOException {
+                    List<Scorer> scorers = new ArrayList<>();
+                    for (ScorerSupplier ss : scorerSuppliers) {
+                        scorers.add(ss.get(leadCost));
+                    }
+                    return new HybridQueryScorer(thisWeight, scorers, scoreMode);
+                }
+
+                @Override
+                public long cost() {
+                    if (cost == -1) {
+                        long cost = 0;
+                        for (ScorerSupplier ss : scorerSuppliers) {
+                            cost += ss.cost();
+                        }
+                        this.cost = cost;
+                    }
+                    return cost;
+                }
+            };
+        }
+        // return super.scorerSupplier(context);
+    }
+
     /**
      * Create the scorer used to score our associated Query
      *
@@ -75,7 +123,7 @@ public final class HybridQueryWeight extends Weight {
      */
     @Override
     public Scorer scorer(LeafReaderContext context) throws IOException {
-        List<Scorer> scorers = weights.stream().map(w -> {
+        /*List<Scorer> scorers = weights.stream().map(w -> {
             try {
                 return w.scorer(context);
             } catch (IOException e) {
@@ -87,7 +135,14 @@ public final class HybridQueryWeight extends Weight {
         if (scorers.stream().allMatch(Objects::isNull)) {
             return null;
         }
-        return new HybridQueryScorer(this, scorers);
+        return new HybridQueryScorer(this, scorers);*/
+        // critical section
+        ScorerSupplier supplier = scorerSupplier(context);
+        if (supplier == null) {
+            return null;
+        }
+        supplier.setTopLevelScoringClause();
+        return supplier.get(Long.MAX_VALUE);
     }
 
     /**

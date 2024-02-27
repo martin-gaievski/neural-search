@@ -6,6 +6,7 @@ package org.opensearch.neuralsearch.query;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -18,10 +19,13 @@ import org.apache.lucene.search.DisiWrapper;
 import org.apache.lucene.search.DisjunctionDISIApproximation;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
+import org.apache.lucene.search.TwoPhaseIterator;
 import org.apache.lucene.search.Weight;
 
 import lombok.Getter;
+import org.apache.lucene.util.PriorityQueue;
 
 /**
  * Class abstracts functionality of Scorer for hybrid query. When iterating over documents in increasing
@@ -40,12 +44,59 @@ public final class HybridQueryScorer extends Scorer {
 
     private final Map<Query, List<Integer>> queryToIndex;
 
+    private final DocIdSetIterator approximation;
+    HybridScorePropagator disjunctionBlockPropagator;
+    private final TwoPhase twoPhase;
+
     public HybridQueryScorer(Weight weight, List<Scorer> subScorers) throws IOException {
+        this(weight, subScorers, ScoreMode.TOP_SCORES);
+    }
+
+    public HybridQueryScorer(Weight weight, List<Scorer> subScorers, ScoreMode scoreMode) throws IOException {
         super(weight);
+        // max
         this.subScorers = Collections.unmodifiableList(subScorers);
+        // custom
         subScores = new float[subScorers.size()];
         this.queryToIndex = mapQueryToIndex();
+        // base
         this.subScorersPQ = initializeSubScorersPQ();
+        // base
+        this.approximation = new DisjunctionDISIApproximation(this.subScorersPQ);
+        // max
+        if (scoreMode == ScoreMode.TOP_SCORES) {
+            this.disjunctionBlockPropagator = new HybridScorePropagator(subScorers);
+        } else {
+            this.disjunctionBlockPropagator = null;
+        }
+        // base
+        boolean hasApproximation = false;
+        float sumMatchCost = 0;
+        long sumApproxCost = 0;
+        // Compute matchCost as the average over the matchCost of the subScorers.
+        // This is weighted by the cost, which is an expected number of matching documents.
+        for (DisiWrapper w : subScorersPQ) {
+            long costWeight = (w.cost <= 1) ? 1 : w.cost;
+            sumApproxCost += costWeight;
+            if (w.twoPhaseView != null) {
+                hasApproximation = true;
+                sumMatchCost += w.matchCost * costWeight;
+            }
+        }
+        if (hasApproximation == false) { // no sub scorer supports approximations
+            twoPhase = null;
+        } else {
+            final float matchCost = sumMatchCost / sumApproxCost;
+            twoPhase = new TwoPhase(approximation, matchCost, subScorersPQ);
+        }
+    }
+
+    @Override
+    public int advanceShallow(int target) throws IOException {
+        if (disjunctionBlockPropagator != null) {
+            return disjunctionBlockPropagator.advanceShallow(target);
+        }
+        return super.advanceShallow(target);
     }
 
     /**
@@ -55,7 +106,7 @@ public final class HybridQueryScorer extends Scorer {
      */
     @Override
     public float score() throws IOException {
-        DisiWrapper topList = subScorersPQ.topList();
+        /*DisiWrapper topList = subScorersPQ.topList();
         float totalScore = 0.0f;
         for (DisiWrapper disiWrapper = topList; disiWrapper != null; disiWrapper = disiWrapper.next) {
             // check if this doc has match in the subQuery. If not, add score as 0.0 and continue
@@ -64,7 +115,32 @@ public final class HybridQueryScorer extends Scorer {
             }
             totalScore += disiWrapper.scorer.score();
         }
-        return totalScore;
+        return totalScore;*/
+        return score(getSubMatches());
+    }
+
+    private float score(DisiWrapper topList) throws IOException {
+        float scoreMax = 0;
+        double otherScoreSum = 0;
+        for (DisiWrapper w = topList; w != null; w = w.next) {
+            float subScore = w.scorer.score();
+            if (subScore >= scoreMax) {
+                otherScoreSum += scoreMax;
+                scoreMax = subScore;
+            } else {
+                otherScoreSum += subScore;
+            }
+        }
+        return (float) (scoreMax + otherScoreSum);
+    }
+
+    DisiWrapper getSubMatches() throws IOException {
+        if (twoPhase == null) {
+            return subScorersPQ.topList();
+        } else {
+            return twoPhase.getSubMatches();
+        }
+        // return subScorersPQ.topList();
     }
 
     /**
@@ -73,7 +149,17 @@ public final class HybridQueryScorer extends Scorer {
      */
     @Override
     public DocIdSetIterator iterator() {
-        return new DisjunctionDISIApproximation(this.subScorersPQ);
+        if (twoPhase != null) {
+            return TwoPhaseIterator.asDocIdSetIterator(twoPhase);
+        } else {
+            return approximation;
+        }
+        // return new DisjunctionDISIApproximation(this.subScorersPQ);
+    }
+
+    @Override
+    public TwoPhaseIterator twoPhaseIterator() {
+        return twoPhase;
     }
 
     /**
@@ -91,6 +177,17 @@ public final class HybridQueryScorer extends Scorer {
                 throw new RuntimeException(e);
             }
         }).max(Float::compare).orElse(0.0f);
+    }
+
+    @Override
+    public void setMinCompetitiveScore(float minScore) throws IOException {
+        if (disjunctionBlockPropagator != null) {
+            disjunctionBlockPropagator.setMinCompetitiveScore(minScore);
+        }
+
+        for (Scorer scorer : subScorers) {
+            scorer.setMinCompetitiveScore(minScore);
+        }
     }
 
     /**
@@ -168,5 +265,94 @@ public final class HybridQueryScorer extends Scorer {
             subScorersPQ.add(w);
         }
         return subScorersPQ;
+    }
+
+    @Override
+    public Collection<ChildScorable> getChildren() throws IOException {
+        ArrayList<ChildScorable> children = new ArrayList<>();
+        for (DisiWrapper scorer = getSubMatches(); scorer != null; scorer = scorer.next) {
+            children.add(new ChildScorable(scorer.scorer, "SHOULD"));
+        }
+        return children;
+    }
+
+    static class TwoPhase extends TwoPhaseIterator {
+
+        private final float matchCost;
+        // list of verified matches on the current doc
+        DisiWrapper verifiedMatches;
+        // priority queue of approximations on the current doc that have not been verified yet
+        final PriorityQueue<DisiWrapper> unverifiedMatches;
+        DisiPriorityQueue subScorers;
+
+        private TwoPhase(DocIdSetIterator approximation, float matchCost, DisiPriorityQueue subScorers) {
+            super(approximation);
+            this.matchCost = matchCost;
+            this.subScorers = subScorers;
+            unverifiedMatches = new PriorityQueue<DisiWrapper>(subScorers.size()) {
+                @Override
+                protected boolean lessThan(DisiWrapper a, DisiWrapper b) {
+                    return a.matchCost < b.matchCost;
+                }
+            };
+        }
+
+        DisiWrapper getSubMatches() throws IOException {
+            // iteration order does not matter
+            for (DisiWrapper w : unverifiedMatches) {
+                if (w.twoPhaseView.matches()) {
+                    w.next = verifiedMatches;
+                    verifiedMatches = w;
+                }
+            }
+            unverifiedMatches.clear();
+            return verifiedMatches;
+        }
+
+        @Override
+        public boolean matches() throws IOException {
+            verifiedMatches = null;
+            unverifiedMatches.clear();
+
+            for (DisiWrapper w = subScorers.topList(); w != null;) {
+                DisiWrapper next = w.next;
+
+                if (w.twoPhaseView == null) {
+                    // implicitly verified, move it to verifiedMatches
+                    w.next = verifiedMatches;
+                    verifiedMatches = w;
+
+                    // if (needsScores == false) {
+                    // we can stop here
+                    // return true;
+                    // }
+                } else {
+                    unverifiedMatches.add(w);
+                }
+                w = next;
+            }
+
+            if (verifiedMatches != null) {
+                return true;
+            }
+
+            // verify subs that have an two-phase iterator
+            // least-costly ones first
+            while (unverifiedMatches.size() > 0) {
+                DisiWrapper w = unverifiedMatches.pop();
+                if (w.twoPhaseView.matches()) {
+                    w.next = null;
+                    verifiedMatches = w;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        @Override
+        public float matchCost() {
+            return matchCost;
+        }
     }
 }

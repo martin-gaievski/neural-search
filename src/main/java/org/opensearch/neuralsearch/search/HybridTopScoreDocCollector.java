@@ -19,7 +19,6 @@ import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.TopDocs;
-import org.apache.lucene.search.TopScoreDocCollector;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.util.PriorityQueue;
 import org.opensearch.neuralsearch.query.HybridQueryScorer;
@@ -50,13 +49,36 @@ public class HybridTopScoreDocCollector implements Collector {
     public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
         docBase = context.docBase;
 
-        return new TopScoreDocCollector.ScorerLeafCollector() {
+        return new LeafCollector() {
             HybridQueryScorer compoundQueryScorer;
+            private Scorable scorer;
 
             @Override
             public void setScorer(Scorable scorer) throws IOException {
-                super.setScorer(scorer);
-                compoundQueryScorer = (HybridQueryScorer) scorer;
+                // super.setScorer(scorer);
+                this.scorer = scorer;
+                // compoundQueryScorer = (HybridQueryScorer) scorer;
+                if (scorer instanceof HybridQueryScorer) {
+                    compoundQueryScorer = (HybridQueryScorer) scorer;
+                } else {
+                    compoundQueryScorer = getHybridQueryScorer(scorer);
+                }
+            }
+
+            private HybridQueryScorer getHybridQueryScorer(final Scorable scorer) throws IOException {
+                if (scorer == null) {
+                    return null;
+                }
+                if (scorer instanceof HybridQueryScorer) {
+                    return (HybridQueryScorer) scorer;
+                }
+                for (Scorable.ChildScorable childScorable : scorer.getChildren()) {
+                    HybridQueryScorer hybridQueryScorer = getHybridQueryScorer(childScorable.child);
+                    if (hybridQueryScorer != null) {
+                        return hybridQueryScorer;
+                    }
+                }
+                return null;
             }
 
             @Override
