@@ -25,7 +25,6 @@ import org.apache.lucene.search.Weight;
  */
 public final class HybridQueryWeight extends Weight {
 
-    private final HybridQuery queries;
     // The Weights for our subqueries, in 1-1 correspondence
     private final List<Weight> weights;
 
@@ -38,7 +37,6 @@ public final class HybridQueryWeight extends Weight {
      */
     public HybridQueryWeight(HybridQuery hybridQuery, IndexSearcher searcher, ScoreMode scoreMode, float boost) throws IOException {
         super(hybridQuery);
-        this.queries = hybridQuery;
         weights = hybridQuery.getSubQueries().stream().map(q -> {
             try {
                 return searcher.createWeight(q, scoreMode, boost);
@@ -72,75 +70,18 @@ public final class HybridQueryWeight extends Weight {
     @Override
     public ScorerSupplier scorerSupplier(LeafReaderContext context) throws IOException {
         // critical section
-        /*List<ScorerSupplier> scorerSuppliers = new ArrayList<>();
-        for (Weight w : weights) {
-            ScorerSupplier ss = w.scorerSupplier(context);
-            if (ss != null) {
-                scorerSuppliers.add(ss);
-            }
-        }
-
-        if (scorerSuppliers.isEmpty()) {
-            return null;
-            // } else if (scorerSuppliers.size() == 1) {
-            // return scorerSuppliers.get(0);
-        } else {
-            final Weight thisWeight = this;
-            return new ScorerSupplier() {
-
-                private long cost = -1;
-
-                @Override
-                public Scorer get(long leadCost) throws IOException {
-                    List<Scorer> scorers = new ArrayList<>();
-                    for (ScorerSupplier ss : scorerSuppliers) {
-                        scorers.add(ss.get(leadCost));
-                    }
-                    return new HybridQueryScorer(thisWeight, scorers, scoreMode);
-                }
-
-                @Override
-                public long cost() {
-                    if (cost == -1) {
-                        long cost = 0;
-                        for (ScorerSupplier ss : scorerSuppliers) {
-                            cost += ss.cost();
-                        }
-                        this.cost = cost;
-                    }
-                    return cost;
-                }
-
-                @Override
-                public void setTopLevelScoringClause() throws IOException {
-                    for (ScorerSupplier ss : scorerSuppliers) {
-                        // sub scorers need to be able to skip too as calls to setMinCompetitiveScore get
-                        // propagated
-                        ss.setTopLevelScoringClause();
-                    }
-                }
-            };
-        }*/
         // return super.scorerSupplier(context);
         List<ScorerSupplier> scorerSuppliers = new ArrayList<>();
         for (Weight w : weights) {
             ScorerSupplier ss = w.scorerSupplier(context);
             scorerSuppliers.add(ss);
         }
-        List<Scorer> scorers = weights.stream().map(w -> {
-            try {
-                return w.scorer(context);
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-        }).collect(Collectors.toList());
 
         if (scorerSuppliers.isEmpty()) {
             return null;
         } else {
             final Weight thisWeight = this;
             return new ScorerSupplier() {
-
                 private long cost = -1;
 
                 @Override
@@ -161,14 +102,10 @@ public final class HybridQueryWeight extends Weight {
                 public long cost() {
                     if (cost == -1) {
                         long cost = 0;
-                        for (int i = 0; i < scorerSuppliers.size(); i++) {
-                            ScorerSupplier ss = scorerSuppliers.get(i);
+                        for (ScorerSupplier ss : scorerSuppliers) {
                             if (Objects.nonNull(ss)) {
                                 cost += ss.cost();
-                            } /*else {
-                                cost += scorers.get(i).iterator().cost();
-                              }*/
-                            // cost += ss.cost();
+                            }
                         }
                         this.cost = cost;
                     }

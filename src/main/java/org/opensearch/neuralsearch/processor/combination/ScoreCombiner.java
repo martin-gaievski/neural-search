@@ -7,11 +7,9 @@ package org.opensearch.neuralsearch.processor.combination;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.stream.Collectors;
 
 import org.apache.lucene.search.ScoreDoc;
@@ -134,15 +132,12 @@ public class ScoreCombiner {
     }
 
     protected int getMaxHits(final List<TopDocs> topDocsPerSubQuery) {
-        List<ScoreDoc[]> scoreDocs = topDocsPerSubQuery.stream()
-            .map(topdDoc -> topdDoc.scoreDocs)
-            .filter(Objects::nonNull)
-            .collect(Collectors.toList());
-        Set<Integer> uniqueDocIds = new HashSet<>();
-        for (ScoreDoc[] scoreDocsArray : scoreDocs) {
-            uniqueDocIds.addAll(Arrays.stream(scoreDocsArray).map(scoreDoc -> scoreDoc.doc).collect(Collectors.toList()));
+        int maxHits = 0;
+        for (TopDocs topDocs : topDocsPerSubQuery) {
+            int hits = topDocs.scoreDocs.length;
+            maxHits = Math.max(maxHits, hits);
         }
-        return uniqueDocIds.size();
+        return maxHits;
     }
 
     private TotalHits getTotalHits(final List<TopDocs> topDocsPerSubQuery, int maxHits) {

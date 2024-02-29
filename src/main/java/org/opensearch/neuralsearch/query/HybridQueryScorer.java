@@ -16,7 +16,6 @@ import java.util.Objects;
 
 import org.apache.lucene.search.DisiPriorityQueue;
 import org.apache.lucene.search.DisiWrapper;
-import org.apache.lucene.search.DisjunctionDISIApproximation;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreMode;
@@ -48,7 +47,7 @@ public final class HybridQueryScorer extends Scorer {
 
     private final DocIdSetIterator approximation;
     HybridScorePropagator disjunctionBlockPropagator;
-    // private final TwoPhase twoPhase;
+    private final TwoPhase twoPhase;
 
     public HybridQueryScorer(Weight weight, List<Scorer> subScorers) throws IOException {
         this(weight, subScorers, ScoreMode.TOP_SCORES);
@@ -64,7 +63,7 @@ public final class HybridQueryScorer extends Scorer {
         // base
         this.subScorersPQ = initializeSubScorersPQ();
         // base
-        // this.approximation = new DisjunctionDISIApproximation(this.subScorersPQ);
+        boolean needsScores = scoreMode != ScoreMode.COMPLETE_NO_SCORES;
         this.approximation = new HybridDisjunctionDISIApproximation(this.subScorersPQ);
         // max
         if (scoreMode == ScoreMode.TOP_SCORES) {
@@ -86,12 +85,12 @@ public final class HybridQueryScorer extends Scorer {
                 sumMatchCost += w.matchCost * costWeight;
             }
         }
-        /*if (hasApproximation == false) { // no sub scorer supports approximations
+        if (!hasApproximation) { // no sub scorer supports approximations
             twoPhase = null;
         } else {
             final float matchCost = sumMatchCost / sumApproxCost;
-            twoPhase = new TwoPhase(approximation, matchCost, subScorersPQ);
-        }*/
+            twoPhase = new TwoPhase(approximation, matchCost, subScorersPQ, needsScores);
+        }
     }
 
     @Override
@@ -147,12 +146,11 @@ public final class HybridQueryScorer extends Scorer {
     }
 
     DisiWrapper getSubMatches() throws IOException {
-        // if (twoPhase == null) {
-        return subScorersPQ.topList();
-        // } else {
-        // return twoPhase.getSubMatches();
-        // }
-        // return subScorersPQ.topList();
+        if (twoPhase == null) {
+            return subScorersPQ.topList();
+        } else {
+            return twoPhase.getSubMatches();
+        }
     }
 
     /**
@@ -161,19 +159,17 @@ public final class HybridQueryScorer extends Scorer {
      */
     @Override
     public DocIdSetIterator iterator() {
-        /*if (twoPhase != null) {
+        if (twoPhase != null) {
             return TwoPhaseIterator.asDocIdSetIterator(twoPhase);
-        } else {*/
-        return approximation;
-        // }
-        // return new DisjunctionDISIApproximation(this.subScorersPQ);
-        // return new HybridDisjunctionDISIApproximation(this.subScorersPQ);
+        } else {
+            return approximation;
+        }
     }
 
-    /*@Override
+    @Override
     public TwoPhaseIterator twoPhaseIterator() {
         return twoPhase;
-    }*/
+    }
 
     /**
      * Return the maximum score that documents between the last target that this iterator was shallow-advanced to included and upTo included.
@@ -295,24 +291,25 @@ public final class HybridQueryScorer extends Scorer {
     }
 
     static class TwoPhase extends TwoPhaseIterator {
-
         private final float matchCost;
         // list of verified matches on the current doc
         DisiWrapper verifiedMatches;
         // priority queue of approximations on the current doc that have not been verified yet
         final PriorityQueue<DisiWrapper> unverifiedMatches;
         DisiPriorityQueue subScorers;
+        boolean needsScores;
 
-        private TwoPhase(DocIdSetIterator approximation, float matchCost, DisiPriorityQueue subScorers) {
+        private TwoPhase(DocIdSetIterator approximation, float matchCost, DisiPriorityQueue subScorers, boolean needsScores) {
             super(approximation);
             this.matchCost = matchCost;
             this.subScorers = subScorers;
-            unverifiedMatches = new PriorityQueue<DisiWrapper>(subScorers.size()) {
+            unverifiedMatches = new PriorityQueue<>(subScorers.size()) {
                 @Override
                 protected boolean lessThan(DisiWrapper a, DisiWrapper b) {
                     return a.matchCost < b.matchCost;
                 }
             };
+            this.needsScores = needsScores;
         }
 
         DisiWrapper getSubMatches() throws IOException {
@@ -340,10 +337,10 @@ public final class HybridQueryScorer extends Scorer {
                     w.next = verifiedMatches;
                     verifiedMatches = w;
 
-                    // if (needsScores == false) {
-                    // we can stop here
-                    // return true;
-                    // }
+                    if (!needsScores) {
+                        // we can stop here
+                        return true;
+                    }
                 } else {
                     unverifiedMatches.add(w);
                 }
@@ -374,13 +371,12 @@ public final class HybridQueryScorer extends Scorer {
         }
     }
 
-    public class HybridDisjunctionDISIApproximation extends DisjunctionDISIApproximation {
+    static class HybridDisjunctionDISIApproximation extends DocIdSetIterator {
 
         final DisiPriorityQueue subIterators;
         final long cost;
 
         public HybridDisjunctionDISIApproximation(DisiPriorityQueue subIterators) {
-            super(subIterators);
             this.subIterators = subIterators;
             long cost = 0;
             for (DisiWrapper w : subIterators) {

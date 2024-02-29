@@ -7,6 +7,7 @@ package org.opensearch.neuralsearch.query;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
@@ -142,7 +143,7 @@ public final class HybridQuery extends Query implements Iterable<Query> {
     }
 
     public Collection<Query> getSubQueries() {
-        return subQueries;
+        return Collections.unmodifiableCollection(subQueries);
     }
 
     /**

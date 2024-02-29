@@ -289,7 +289,6 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     private Collection<Query> toQueries(Collection<QueryBuilder> queryBuilders, QueryShardContext context) throws QueryShardException {
         List<Query> queries = queryBuilders.stream().map(qb -> {
             try {
-                // return Rewriteable.rewrite(qb, context).toQuery(context);
                 return qb.rewrite(context).toQuery(context);
             } catch (IOException e) {
                 throw new RuntimeException(e);
