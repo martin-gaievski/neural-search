@@ -31,6 +31,8 @@ public final class HybridQueryWeight extends Weight {
 
     private final ScoreMode scoreMode;
 
+    static final int BOOLEAN_REWRITE_TERM_COUNT_THRESHOLD = 16;
+
     /**
      * Construct the Weight for this Query searched by searcher. Recursively construct subquery weights.
      */
@@ -70,7 +72,7 @@ public final class HybridQueryWeight extends Weight {
     @Override
     public ScorerSupplier scorerSupplier(LeafReaderContext context) throws IOException {
         // critical section
-        List<ScorerSupplier> scorerSuppliers = new ArrayList<>();
+        /*List<ScorerSupplier> scorerSuppliers = new ArrayList<>();
         for (Weight w : weights) {
             ScorerSupplier ss = w.scorerSupplier(context);
             if (ss != null) {
@@ -80,8 +82,8 @@ public final class HybridQueryWeight extends Weight {
 
         if (scorerSuppliers.isEmpty()) {
             return null;
-        } else if (scorerSuppliers.size() == 1) {
-            return scorerSuppliers.get(0);
+            // } else if (scorerSuppliers.size() == 1) {
+            // return scorerSuppliers.get(0);
         } else {
             final Weight thisWeight = this;
             return new ScorerSupplier() {
@@ -108,9 +110,83 @@ public final class HybridQueryWeight extends Weight {
                     }
                     return cost;
                 }
+
+                @Override
+                public void setTopLevelScoringClause() throws IOException {
+                    for (ScorerSupplier ss : scorerSuppliers) {
+                        // sub scorers need to be able to skip too as calls to setMinCompetitiveScore get
+                        // propagated
+                        ss.setTopLevelScoringClause();
+                    }
+                }
+            };
+        }*/
+        // return super.scorerSupplier(context);
+        List<ScorerSupplier> scorerSuppliers = new ArrayList<>();
+        for (Weight w : weights) {
+            ScorerSupplier ss = w.scorerSupplier(context);
+            scorerSuppliers.add(ss);
+        }
+        List<Scorer> scorers = weights.stream().map(w -> {
+            try {
+                return w.scorer(context);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }).collect(Collectors.toList());
+
+        if (scorerSuppliers.isEmpty()) {
+            return null;
+        } else {
+            final Weight thisWeight = this;
+            return new ScorerSupplier() {
+
+                private long cost = -1;
+
+                @Override
+                public Scorer get(long leadCost) throws IOException {
+                    List<Scorer> tScorers = new ArrayList<>();
+                    for (int i = 0; i < scorerSuppliers.size(); i++) {
+                        ScorerSupplier ss = scorerSuppliers.get(i);
+                        if (Objects.nonNull(ss)) {
+                            tScorers.add(ss.get(leadCost));
+                        } else {
+                            tScorers.add(null);
+                        }
+                    }
+                    return new HybridQueryScorer(thisWeight, tScorers, scoreMode);
+                }
+
+                @Override
+                public long cost() {
+                    if (cost == -1) {
+                        long cost = 0;
+                        for (int i = 0; i < scorerSuppliers.size(); i++) {
+                            ScorerSupplier ss = scorerSuppliers.get(i);
+                            if (Objects.nonNull(ss)) {
+                                cost += ss.cost();
+                            } /*else {
+                                cost += scorers.get(i).iterator().cost();
+                              }*/
+                            // cost += ss.cost();
+                        }
+                        this.cost = cost;
+                    }
+                    return cost;
+                }
+
+                @Override
+                public void setTopLevelScoringClause() throws IOException {
+                    for (ScorerSupplier ss : scorerSuppliers) {
+                        // sub scorers need to be able to skip too as calls to setMinCompetitiveScore get
+                        // propagated
+                        if (Objects.nonNull(ss)) {
+                            ss.setTopLevelScoringClause();
+                        }
+                    }
+                }
             };
         }
-        // return super.scorerSupplier(context);
     }
 
     /**
@@ -153,6 +229,11 @@ public final class HybridQueryWeight extends Weight {
      */
     @Override
     public boolean isCacheable(LeafReaderContext ctx) {
+        if (weights.size() > BOOLEAN_REWRITE_TERM_COUNT_THRESHOLD) {
+            // Disallow caching large queries to not encourage users
+            // to build large queries
+            return false;
+        }
         return weights.stream().allMatch(w -> w.isCacheable(ctx));
     }
 

@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.Objects;
 
 public class HybridScorePropagator {
 
@@ -27,7 +28,7 @@ public class HybridScorePropagator {
     private int leadIndex = 0;
 
     HybridScorePropagator(Collection<Scorer> scorers) throws IOException {
-        this.scorers = scorers.toArray(Scorer[]::new);
+        this.scorers = scorers.stream().filter(Objects::nonNull).toArray(Scorer[]::new);
         for (Scorer scorer : this.scorers) {
             scorer.advanceShallow(0);
         }
