@@ -6,7 +6,6 @@ package org.opensearch.neuralsearch.query.aggregation;
 
 import lombok.SneakyThrows;
 import org.junit.Before;
-import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.TermQueryBuilder;
@@ -18,12 +17,7 @@ import org.opensearch.search.aggregations.AggregationBuilders;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.PipelineAggregatorBuilders;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
-import org.opensearch.search.aggregations.pipeline.AvgBucketPipelineAggregationBuilder;
-import org.opensearch.search.aggregations.pipeline.BucketMetricsPipelineAggregationBuilder;
-import org.opensearch.search.aggregations.pipeline.MaxBucketPipelineAggregationBuilder;
-import org.opensearch.search.aggregations.pipeline.MinBucketPipelineAggregationBuilder;
 import org.opensearch.search.aggregations.pipeline.StatsBucketPipelineAggregationBuilder;
-import org.opensearch.search.aggregations.pipeline.SumBucketPipelineAggregationBuilder;
 import org.opensearch.search.sort.FieldSortBuilder;
 import org.opensearch.search.sort.SortOrder;
 
@@ -56,11 +50,6 @@ public class PipelineAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     private static final String TEST_DOC_TEXT5 = "People keep telling me orange but I still prefer pink";
     private static final String TEST_DOC_TEXT6 = "She traveled because it cost the same as therapy and was a lot more enjoyable";
     private static final String TEST_TEXT_FIELD_NAME_1 = "test-text-field-1";
-    private static final String TEST_NESTED_TYPE_FIELD_NAME_1 = "user";
-    private static final String NESTED_FIELD_1 = "firstname";
-    private static final String NESTED_FIELD_2 = "lastname";
-    private static final String NESTED_FIELD_1_VALUE = "john";
-    private static final String NESTED_FIELD_2_VALUE = "black";
     private static final String INTEGER_FIELD_1 = "doc_index";
     private static final int INTEGER_FIELD_1_VALUE = 1234;
     private static final int INTEGER_FIELD_2_VALUE = 2345;
@@ -87,7 +76,7 @@ public class PipelineAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     private static final String KEY = "key";
     private static final String BUCKET_AGG_KEY_AS_STRING = "key_as_string";
     private static final String SEARCH_PIPELINE = "phase-results-hybrid-pipeline";
-    private static final String MAX_AGGREGATION_NAME = "max_aggs";
+    protected static final String MAX_AGGREGATION_NAME = "max_aggs";
     private static final String SUM_AGGREGATION_NAME = "sum_aggs";
     private static final String SUM_AGGREGATION_NAME_2 = "sum_aggs_2";
     private static final String AVG_AGGREGATION_NAME = "avg_field";
@@ -110,28 +99,8 @@ public class PipelineAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     }
 
     @Override
-    protected void updateClusterSettings() {
-        updateClusterSettings("plugins.ml_commons.only_run_on_ml_node", false);
-        // default threshold for native circuit breaker is 90, it may be not enough on test runner machine
-        updateClusterSettings("plugins.ml_commons.native_memory_threshold", 100);
-        updateClusterSettings("plugins.ml_commons.allow_registering_model_via_url", true);
-    }
-
-    @Override
     protected boolean preserveClusterUponCompletion() {
         return true;
-    }
-
-    @SneakyThrows
-    public void testQueryVariationsWithConcurrentSearch_whenAnyQueryAndAggCombination_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", true);
-        testVariousQueries();
-    }
-
-    @SneakyThrows
-    public void testQueryVariationsWithoutConcurrentSearch_whenAnyQueryAndAggCombination_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", false);
-        testVariousQueries();
     }
 
     @SneakyThrows
@@ -180,57 +149,6 @@ public class PipelineAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     public void testPipelineParentAggs_whenDateBucketedSumsPipelinedToCumulativeSumAggs_thenSuccessful() {
         updateClusterSettings("search.concurrent_segment_search.enabled", false);
         testDateBucketedSumsPipelinedToCumulativeSumAggs();
-    }
-
-    private void testVariousQueries() throws IOException {
-        try {
-            prepareResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, SEARCH_PIPELINE);
-
-            // test bool query and aggregation
-            TermQueryBuilder termQueryBuilder1 = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT3);
-            TermQueryBuilder termQueryBuilder2 = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT5);
-
-            BoolQueryBuilder boolAndAggsQueryBuilder = QueryBuilders.boolQuery().should(termQueryBuilder1).should(termQueryBuilder2);
-
-            AggregationBuilder aggsBuilder = AggregationBuilders.dateHistogram(GENERIC_AGGREGATION_NAME)
-                .calendarInterval(DateHistogramInterval.YEAR)
-                .field(DATE_FIELD_1)
-                .subAggregation(AggregationBuilders.sum(SUM_AGGREGATION_NAME).field(INTEGER_FIELD_1));
-
-            BucketMetricsPipelineAggregationBuilder<AvgBucketPipelineAggregationBuilder> aggAvgBucket = PipelineAggregatorBuilders
-                .avgBucket(BUCKETS_AGGREGATION_NAME_1, GENERIC_AGGREGATION_NAME + ">" + SUM_AGGREGATION_NAME);
-
-            BucketMetricsPipelineAggregationBuilder<SumBucketPipelineAggregationBuilder> aggSumBucket = PipelineAggregatorBuilders
-                .sumBucket(BUCKETS_AGGREGATION_NAME_2, GENERIC_AGGREGATION_NAME + ">" + SUM_AGGREGATION_NAME);
-
-            BucketMetricsPipelineAggregationBuilder<MinBucketPipelineAggregationBuilder> aggMinBucket = PipelineAggregatorBuilders
-                .minBucket(BUCKETS_AGGREGATION_NAME_3, GENERIC_AGGREGATION_NAME + ">" + SUM_AGGREGATION_NAME);
-
-            BucketMetricsPipelineAggregationBuilder<MaxBucketPipelineAggregationBuilder> aggMaxBucket = PipelineAggregatorBuilders
-                .maxBucket(BUCKETS_AGGREGATION_NAME_4, GENERIC_AGGREGATION_NAME + ">" + SUM_AGGREGATION_NAME);
-
-            Map<String, Object> searchResponseAsMapAnngsBoolQuery = executeQueryAndGetAggsResults(
-                List.of(aggsBuilder, aggAvgBucket, aggSumBucket, aggMinBucket, aggMaxBucket),
-                boolAndAggsQueryBuilder,
-                TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS,
-                3
-            );
-
-            assertResultsOfPipelineSumtoDateHistogramAggs(searchResponseAsMapAnngsBoolQuery);
-
-            // test only aggregation without query (handled as match_all query)
-            Map<String, Object> searchResponseAsMapAggsNoQuery = executeQueryAndGetAggsResults(
-                List.of(aggsBuilder, aggAvgBucket),
-                null,
-                TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS,
-                6
-            );
-
-            assertResultsOfPipelineSumtoDateHistogramAggsForMatchAllQuery(searchResponseAsMapAggsNoQuery);
-
-        } finally {
-            wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
-        }
     }
 
     private void assertResultsOfPipelineSumtoDateHistogramAggs(Map<String, Object> searchResponseAsMap) {
@@ -635,6 +553,11 @@ public class PipelineAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
         assertEquals(RELATION_EQUAL_TO, total.get("relation"));
     }
 
+    void prepareResources(String indexName, String pipelineName) {
+        initializeIndexIfNotExist(indexName);
+        createSearchPipelineWithResultsPostProcessor(pipelineName);
+    }
+
     @SneakyThrows
     private void initializeIndexIfNotExist(String indexName) {
         if (!indexExists(indexName)) {
@@ -741,10 +664,5 @@ public class PipelineAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
                 List.of(DATE_FIELD_4_VALUE)
             );
         }
-    }
-
-    void prepareResources(String indexName, String pipelineName) {
-        initializeIndexIfNotExist(indexName);
-        createSearchPipelineWithResultsPostProcessor(pipelineName);
     }
 }

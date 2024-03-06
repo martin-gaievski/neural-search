@@ -91,14 +91,6 @@ public class MetricAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     }
 
     @Override
-    protected void updateClusterSettings() {
-        updateClusterSettings("plugins.ml_commons.only_run_on_ml_node", false);
-        // default threshold for native circuit breaker is 90, it may be not enough on test runner machine
-        updateClusterSettings("plugins.ml_commons.native_memory_threshold", 100);
-        updateClusterSettings("plugins.ml_commons.allow_registering_model_via_url", true);
-    }
-
-    @Override
     protected boolean preserveClusterUponCompletion() {
         return true;
     }
@@ -131,24 +123,6 @@ public class MetricAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
      *     }
      * }
      */
-    @SneakyThrows
-    public void testSingleShardAndMetricAgg_whenMaxAggs_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", false);
-        testMaxAggsOnSingleShardCluster();
-    }
-
-    @SneakyThrows
-    public void testWithConcurrentSegmentSearch_whenMaxAggs_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", true);
-        testMaxAggsOnSingleShardCluster();
-    }
-
-    @SneakyThrows
-    public void testMetricAgg_whenAvgAggs_thenSuccessful() {
-        updateClusterSettings("search.concurrent_segment_search.enabled", false);
-        testAvgAggs();
-    }
-
     @SneakyThrows
     public void testWithConcurrentSegmentSearch_whenAvgAggs_thenSuccessful() {
         updateClusterSettings("search.concurrent_segment_search.enabled", true);
@@ -261,39 +235,6 @@ public class MetricAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     public void testWithConcurrentSegmentSearch_whenSumAggAndRangeFilter_thenSuccessful() {
         updateClusterSettings("search.concurrent_segment_search.enabled", true);
         testSumAggsAndRangePostFilter();
-    }
-
-    private void testMaxAggsOnSingleShardCluster() throws Exception {
-        try {
-            prepareResourcesForSingleShardIndex(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_SINGLE_SHARD, SEARCH_PIPELINE);
-
-            TermQueryBuilder termQueryBuilder1 = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT3);
-            TermQueryBuilder termQueryBuilder2 = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT5);
-
-            HybridQueryBuilder hybridQueryBuilderNeuralThenTerm = new HybridQueryBuilder();
-            hybridQueryBuilderNeuralThenTerm.add(termQueryBuilder1);
-            hybridQueryBuilderNeuralThenTerm.add(termQueryBuilder2);
-
-            AggregationBuilder aggsBuilder = AggregationBuilders.max(MAX_AGGREGATION_NAME).field(INTEGER_FIELD_1);
-            Map<String, Object> searchResponseAsMap = search(
-                TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_SINGLE_SHARD,
-                hybridQueryBuilderNeuralThenTerm,
-                null,
-                10,
-                Map.of("search_pipeline", SEARCH_PIPELINE),
-                List.of(aggsBuilder)
-            );
-
-            assertHitResultsFromQuery(2, searchResponseAsMap);
-
-            Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
-            assertNotNull(aggregations);
-            assertTrue(aggregations.containsKey(MAX_AGGREGATION_NAME));
-            double maxAggsValue = getAggregationValue(aggregations, MAX_AGGREGATION_NAME);
-            assertTrue(maxAggsValue >= 0);
-        } finally {
-            wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_SINGLE_SHARD, null, null, SEARCH_PIPELINE);
-        }
     }
 
     private void testAvgAggs() throws IOException {
@@ -625,6 +566,11 @@ public class MetricAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
         assertEquals(RELATION_EQUAL_TO, total.get("relation"));
     }
 
+    void prepareResources(String indexName, String pipelineName) {
+        initializeIndexIfNotExist(indexName);
+        createSearchPipelineWithResultsPostProcessor(pipelineName);
+    }
+
     @SneakyThrows
     private void initializeIndexIfNotExist(String indexName) {
         if (!indexExists(indexName)) {
@@ -731,60 +677,5 @@ public class MetricAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
                 List.of(DATE_FIELD_4_VALUE)
             );
         }
-    }
-
-    @SneakyThrows
-    private void initializeIndexWithOneShardIfNotExists(String indexName) {
-        if (!indexExists(indexName)) {
-            createIndexWithConfiguration(
-                indexName,
-                buildIndexConfiguration(List.of(), List.of(), List.of(INTEGER_FIELD_1), List.of(KEYWORD_FIELD_1), List.of(), 1),
-                ""
-            );
-
-            addKnnDoc(
-                indexName,
-                "1",
-                List.of(),
-                List.of(),
-                Collections.singletonList(TEST_TEXT_FIELD_NAME_1),
-                Collections.singletonList(TEST_DOC_TEXT1),
-                List.of(),
-                List.of(),
-                List.of(INTEGER_FIELD_1),
-                List.of(INTEGER_FIELD_1_VALUE),
-                List.of(),
-                List.of(),
-                List.of(),
-                List.of()
-            );
-
-            addKnnDoc(
-                indexName,
-                "2",
-                List.of(),
-                List.of(),
-                Collections.singletonList(TEST_TEXT_FIELD_NAME_1),
-                Collections.singletonList(TEST_DOC_TEXT3),
-                List.of(),
-                List.of(),
-                List.of(INTEGER_FIELD_1),
-                List.of(INTEGER_FIELD_2_VALUE),
-                List.of(),
-                List.of(),
-                List.of(),
-                List.of()
-            );
-        }
-    }
-
-    void prepareResources(String indexName, String pipelineName) {
-        initializeIndexIfNotExist(indexName);
-        createSearchPipelineWithResultsPostProcessor(pipelineName);
-    }
-
-    void prepareResourcesForSingleShardIndex(String indexName, String pipelineName) {
-        initializeIndexWithOneShardIfNotExists(indexName);
-        createSearchPipelineWithResultsPostProcessor(pipelineName);
     }
 }

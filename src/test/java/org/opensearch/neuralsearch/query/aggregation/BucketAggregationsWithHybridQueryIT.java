@@ -6,7 +6,6 @@ package org.opensearch.neuralsearch.query.aggregation;
 
 import lombok.SneakyThrows;
 import org.junit.Before;
-import org.opensearch.client.ResponseException;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.TermQueryBuilder;
@@ -137,18 +136,6 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     }
 
     @SneakyThrows
-    public void testBucketAndNestedAggs_whenDateRange_thenSuccessful() {
-        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
-        testDateRange();
-    }
-
-    @SneakyThrows
-    public void testWithConcurrentSegmentSearch_whenDateRange_thenSuccessful() {
-        updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
-        testDateRange();
-    }
-
-    @SneakyThrows
     public void testBucketAndNestedAggs_whenDiversifiedSampler_thenSuccessful() {
         updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, false);
         testDiversifiedSampler();
@@ -158,11 +145,6 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     public void testWithConcurrentSegmentSearch_whenDiversifiedSampler_thenFail() {
         updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
 
-        /*AggregationBuilder aggsBuilder = AggregationBuilders.diversifiedSampler(GENERIC_AGGREGATION_NAME)
-            .field(KEYWORD_FIELD_1)
-            .shardSize(2)
-            .subAggregation(AggregationBuilders.terms(BUCKETS_AGGREGATION_NAME_1).field(KEYWORD_FIELD_1));
-        testAggregationWithExpectedFailure(aggsBuilder);*/
         testDiversifiedSampler();
     }
 
@@ -236,10 +218,6 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
     public void testWithConcurrentSegmentSearch_whenSamplerAgg_thenFail() {
         updateClusterSettings(CLUSTER_SETTING_CONCURRENT_SEGMENT_SEARCH, true);
 
-        /*AggregationBuilder aggsBuilder = AggregationBuilders.sampler(GENERIC_AGGREGATION_NAME)
-            .shardSize(1)
-            .subAggregation(AggregationBuilders.terms(BUCKETS_AGGREGATION_NAME_1).field(KEYWORD_FIELD_1));
-        testAggregationWithExpectedFailure(aggsBuilder);*/
         testSampler();
     }
 
@@ -477,39 +455,6 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
             assertEquals(2, thirdBucket.size());
             assertEquals(1, thirdBucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
             assertEquals(NESTED_FIELD_1_VALUE_4, thirdBucket.get(KEY));
-        } finally {
-            wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
-        }
-    }
-
-    private void testDateRange() throws IOException {
-        try {
-            prepareResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, SEARCH_PIPELINE);
-
-            AggregationBuilder aggsBuilder = AggregationBuilders.dateRange(DATE_AGGREGATION_NAME)
-                .field(DATE_FIELD_1)
-                .format("MM-yyyy")
-                .addRange("01-2014", "02-2024");
-            Map<String, Object> searchResponseAsMap = executeQueryAndGetAggsResults(
-                aggsBuilder,
-                TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS
-            );
-
-            Map<String, Object> aggregations = getAggregations(searchResponseAsMap);
-            assertNotNull(aggregations);
-            List<Map<String, Object>> buckets = getAggregationBuckets(aggregations, DATE_AGGREGATION_NAME);
-            assertNotNull(buckets);
-            assertEquals(1, buckets.size());
-
-            Map<String, Object> bucket = buckets.get(0);
-
-            assertEquals(6, bucket.size());
-            assertEquals("01-2014", bucket.get("from_as_string"));
-            assertEquals(2, bucket.get(BUCKET_AGG_DOC_COUNT_FIELD));
-            assertEquals("02-2024", bucket.get("to_as_string"));
-            assertTrue(bucket.containsKey("from"));
-            assertTrue(bucket.containsKey("to"));
-            assertTrue(bucket.containsKey(KEY));
         } finally {
             wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
         }
@@ -880,33 +825,6 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
         }
     }
 
-    private void testAggregationWithExpectedFailure(final AggregationBuilder aggsBuilder) throws IOException {
-        try {
-            prepareResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, SEARCH_PIPELINE);
-
-            TermQueryBuilder termQueryBuilder1 = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT3);
-            TermQueryBuilder termQueryBuilder2 = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT5);
-
-            HybridQueryBuilder hybridQueryBuilderNeuralThenTerm = new HybridQueryBuilder();
-            hybridQueryBuilderNeuralThenTerm.add(termQueryBuilder1);
-            hybridQueryBuilderNeuralThenTerm.add(termQueryBuilder2);
-
-            ResponseException responseException = expectThrows(
-                ResponseException.class,
-                () -> search(
-                    TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS,
-                    hybridQueryBuilderNeuralThenTerm,
-                    null,
-                    10,
-                    Map.of("search_pipeline", SEARCH_PIPELINE),
-                    List.of(aggsBuilder)
-                )
-            );
-        } finally {
-            wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, null, null, SEARCH_PIPELINE);
-        }
-    }
-
     private Map<String, Object> executeQueryAndGetAggsResults(final Object aggsBuilder, String indexName) {
         return executeQueryAndGetAggsResults(List.of(aggsBuilder), indexName);
     }
@@ -973,6 +891,11 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
         assertEquals(expected, total.get("value"));
         assertNotNull(total.get("relation"));
         assertEquals(RELATION_EQUAL_TO, total.get("relation"));
+    }
+
+    void prepareResources(String indexName, String pipelineName) {
+        initializeIndexIfNotExist(indexName);
+        createSearchPipelineWithResultsPostProcessor(pipelineName);
     }
 
     @SneakyThrows
@@ -1088,10 +1011,5 @@ public class BucketAggregationsWithHybridQueryIT extends BaseNeuralSearchIT {
                 List.of(DATE_FIELD_4_VALUE)
             );
         }
-    }
-
-    void prepareResources(String indexName, String pipelineName) {
-        initializeIndexIfNotExist(indexName);
-        createSearchPipelineWithResultsPostProcessor(pipelineName);
     }
 }

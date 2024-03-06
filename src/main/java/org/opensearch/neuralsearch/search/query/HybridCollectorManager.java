@@ -28,7 +28,6 @@ import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -54,7 +53,6 @@ public abstract class HybridCollectorManager implements CollectorManager<Collect
      * @return
      * @throws IOException
      */
-
     public static CollectorManager createHybridCollectorManager(final SearchContext searchContext) throws IOException {
         final IndexReader reader = searchContext.searcher().getIndexReader();
         final int totalNumDocs = Math.max(0, reader.numDocs());
@@ -236,6 +234,10 @@ public abstract class HybridCollectorManager implements CollectorManager<Collect
         }
     }
 
+    /**
+     * Implementation of the HybridCollector that doesn't save collector's state and return new instance of every
+     * call of newCollector
+     */
     static class HybridCollectorConcurrentSearchManager extends HybridCollectorManager {
 
         public HybridCollectorConcurrentSearchManager(

@@ -15,7 +15,6 @@ import org.opensearch.search.query.QuerySearchResult;
 import org.opensearch.search.query.ReduceableSearchResult;
 
 import java.io.IOException;
-import java.util.Collection;
 import java.util.List;
 
 import static org.opensearch.neuralsearch.search.query.HybridQueryPhaseSearcher.isHybridQuery;
@@ -48,7 +47,7 @@ public class HybridAggregationProcessor implements AggregationProcessor {
 
     @Override
     public void postProcess(SearchContext context) {
-        if ((HybridQueryUtil.isHybridQuery(context.query(), context)) {
+        if (HybridQueryUtil.isHybridQuery(context.query(), context)) {
             // for case when concurrent search is not enabled (default as of 2.12 release) reduce for collector
             // managers is not called
             // (https://github.com/opensearch-project/OpenSearch/blob/2.12/server/src/main/java/org/opensearch/search/query/QueryPhase.java#L333-L373)
