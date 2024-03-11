@@ -17,8 +17,6 @@ import org.opensearch.search.query.ReduceableSearchResult;
 import java.io.IOException;
 import java.util.List;
 
-import static org.opensearch.neuralsearch.search.query.HybridQueryPhaseSearcher.isHybridQuery;
-
 /**
  * Defines logic for pre- and post-phases of document scores collection. Responsible for registering custom
  * collector manager for hybris query (pre phase) and reducing results (post phase)
@@ -31,7 +29,6 @@ public class HybridAggregationProcessor implements AggregationProcessor {
     @Override
     public void preProcess(SearchContext context) {
         delegateAggsProcessor.preProcess(context);
-
 
         if (HybridQueryUtil.isHybridQuery(context.query(), context)) {
             // adding collector manager for hybrid query

@@ -415,10 +415,8 @@ public class HybridQueryIT extends BaseNeuralSearchIT {
 
     @SneakyThrows
     public void testIndexWithNestedFields_whenHybridQueryIncludesNested_thenSuccess() {
-        String modelId = null;
         try {
             initializeIndexIfNotExist(TEST_MULTI_DOC_INDEX_WITH_NESTED_TYPE_NAME_ONE_SHARD);
-            modelId = prepareModel();
             createSearchPipelineWithResultsPostProcessor(SEARCH_PIPELINE);
             TermQueryBuilder termQueryBuilder = QueryBuilders.termQuery(TEST_TEXT_FIELD_NAME_1, TEST_QUERY_TEXT);
             NestedQueryBuilder nestedQueryBuilder = QueryBuilders.nestedQuery(
@@ -448,7 +446,7 @@ public class HybridQueryIT extends BaseNeuralSearchIT {
             assertNotNull(total.get("relation"));
             assertEquals(RELATION_EQUAL_TO, total.get("relation"));
         } finally {
-            wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_NESTED_TYPE_NAME_ONE_SHARD, null, modelId, SEARCH_PIPELINE);
+            wipeOfTestResources(TEST_MULTI_DOC_INDEX_WITH_NESTED_TYPE_NAME_ONE_SHARD, null, null, SEARCH_PIPELINE);
         }
     }
 
@@ -609,7 +607,10 @@ public class HybridQueryIT extends BaseNeuralSearchIT {
 
     private void testDateRange() throws IOException {
         try {
-            prepareResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, SEARCH_PIPELINE);
+            initializeIndexIfNotExist(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS);
+            createSearchPipelineWithResultsPostProcessor(SEARCH_PIPELINE);
+            // try {
+            // prepareResources(TEST_MULTI_DOC_INDEX_WITH_TEXT_AND_INT_MULTIPLE_SHARDS, SEARCH_PIPELINE);
 
             AggregationBuilder aggsBuilder = AggregationBuilders.dateRange(DATE_AGGREGATION_NAME)
                 .field(DATE_FIELD_1)

@@ -229,7 +229,6 @@ public class HybridQueryPhaseSearcherTests extends OpenSearchQueryTestCase {
 
         releaseResources(directory, w, reader);
 
-
         verify(hybridQueryPhaseSearcher, never()).extractHybridQuery(any(), any());
     }
 

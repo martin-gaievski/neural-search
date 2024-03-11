@@ -546,20 +546,20 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
      */
     @SneakyThrows
     protected void addKnnDoc(
-        String index,
-        String docId,
-        List<String> vectorFieldNames,
-        List<Object[]> vectors,
-        List<String> textFieldNames,
-        List<String> texts,
-        List<String> nestedFieldNames,
-        List<Map<String, String>> nestedFields,
-        List<String> integerFieldNames,
-        List<Integer> integerFieldValues,
-        List<String> keywordFieldNames,
-        List<String> keywordFieldValues,
-        List<String> dateFieldNames,
-        List<String> dateFieldValues
+        final String index,
+        final String docId,
+        final List<String> vectorFieldNames,
+        final List<Object[]> vectors,
+        final List<String> textFieldNames,
+        final List<String> texts,
+        final List<String> nestedFieldNames,
+        final List<Map<String, String>> nestedFields,
+        final List<String> integerFieldNames,
+        final List<Integer> integerFieldValues,
+        final List<String> keywordFieldNames,
+        final List<String> keywordFieldValues,
+        final List<String> dateFieldNames,
+        final List<String> dateFieldValues
     ) {
         Request request = new Request("POST", "/" + index + "/_doc/" + docId + "?refresh=true");
         XContentBuilder builder = XContentFactory.jsonBuilder().startObject();
@@ -819,12 +819,6 @@ public abstract class BaseNeuralSearchIT extends OpenSearchSecureRestTestCase {
 
         for (String dateField : dateFields) {
             xContentBuilder.startObject(dateField).field("type", "date").field("format", "MM/dd/yyyy").endObject();
-<<<<<<< HEAD
-
-        for (String keywordField : dateFields) {
-            xContentBuilder.startObject(keywordField).field("type", "date").field("format", "MM/dd/yyyy").endObject();
-=======
->>>>>>> b37fc4a (Testing apporach with aggregationProcessor pre and post phases)
         }
 
         xContentBuilder.endObject().endObject().endObject();
