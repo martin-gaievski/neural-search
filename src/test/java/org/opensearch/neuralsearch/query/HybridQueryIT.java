@@ -629,7 +629,7 @@ public class HybridQueryIT extends BaseNeuralSearchIT {
     }
 
     @SneakyThrows
-    public void testWrappedQueryWithFilter_whenIndexAliasHasFilters_thenSuccess() {
+    public void testIndexAlias_whenHybridQueryAndIndexAliasHasFilter_thenSuccess() {
         String modelId = null;
         String alias = "alias_with_filter";
         try {
