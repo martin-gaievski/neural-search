@@ -203,20 +203,23 @@ public final class HybridQueryScorer extends Scorer {
             Query query = scorer.getWeight().getQuery();
             List<Integer> indexes = queryToIndex.get(query);
             // we need to find the index of first sub-query that hasn't been set yet. Such score will have initial value of "0.0"
-            int index = indexes.stream()
-                .mapToInt(idx -> idx)
-                .filter(idx -> Float.compare(scores[idx], 0.0f) == 0)
-                .findFirst()
-                .orElseThrow(
-                    () -> new IllegalStateException(
-                        String.format(
-                            Locale.ROOT,
-                            "cannot set score for one of hybrid search subquery [%s] and document [%d]",
-                            query.toString(),
-                            scorer.docID()
-                        )
+            int index = -1;
+            for (int idx : indexes) {
+                if (Float.compare(scores[idx], 0.0f) == 0) {
+                    index = idx;
+                    break;
+                }
+            }
+            if (index == -1) {
+                throw new IllegalStateException(
+                    String.format(
+                        Locale.ROOT,
+                        "cannot set score for one of hybrid search subquery [%s] and document [%d]",
+                        query.toString(),
+                        scorer.docID()
                     )
                 );
+            }
             scores[index] = scorer.score();
         }
         return scores;
