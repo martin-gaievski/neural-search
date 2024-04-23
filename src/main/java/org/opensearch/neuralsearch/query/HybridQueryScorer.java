@@ -14,6 +14,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 
+import com.google.common.primitives.Ints;
 import org.apache.lucene.search.DisiPriorityQueue;
 import org.apache.lucene.search.DisiWrapper;
 import org.apache.lucene.search.DisjunctionDISIApproximation;
@@ -42,7 +43,7 @@ public final class HybridQueryScorer extends Scorer {
 
     private final float[] subScores;
 
-    private final Map<Query, List<Integer>> queryToIndex;
+    private final Map<Query, int[]> queryToIndex;
 
     private final DocIdSetIterator approximation;
     private final HybridScoreBlockBoundaryPropagator disjunctionBlockPropagator;
@@ -201,7 +202,7 @@ public final class HybridQueryScorer extends Scorer {
                 continue;
             }
             Query query = scorer.getWeight().getQuery();
-            List<Integer> indexes = queryToIndex.get(query);
+            int[] indexes = queryToIndex.get(query);
             // we need to find the index of first sub-query that hasn't been set yet. Such score will have initial value of "0.0"
             int index = -1;
             for (int idx : indexes) {
@@ -225,7 +226,7 @@ public final class HybridQueryScorer extends Scorer {
         return scores;
     }
 
-    private Map<Query, List<Integer>> mapQueryToIndex() {
+    private Map<Query, int[]> mapQueryToIndex() {
         Map<Query, List<Integer>> queryToIndex = new HashMap<>();
         int idx = 0;
         for (Scorer scorer : subScorers) {
@@ -238,14 +239,17 @@ public final class HybridQueryScorer extends Scorer {
             queryToIndex.get(query).add(idx);
             idx++;
         }
-        return queryToIndex;
+        // convert it to the int array for better performance
+        Map<Query, int[]> queryToIndexArrayBased = new HashMap<>();
+        queryToIndex.forEach((key, value) -> queryToIndexArrayBased.put(key, Ints.toArray(value)));
+        return queryToIndexArrayBased;
     }
 
     private DisiPriorityQueue initializeSubScorersPQ() {
         Objects.requireNonNull(queryToIndex, "should not be null");
         Objects.requireNonNull(subScorers, "should not be null");
         // we need to count this way in order to include all identical sub-queries
-        int numOfSubQueries = queryToIndex.values().stream().map(List::size).reduce(0, Integer::sum);
+        int numOfSubQueries = queryToIndex.values().stream().map(array -> array.length).reduce(0, Integer::sum);
         DisiPriorityQueue subScorersPQ = new DisiPriorityQueue(numOfSubQueries);
         for (Scorer scorer : subScorers) {
             if (scorer == null) {
