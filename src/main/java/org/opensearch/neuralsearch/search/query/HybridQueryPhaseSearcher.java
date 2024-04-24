@@ -21,6 +21,7 @@ import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.query.QueryCollectorContext;
 import org.opensearch.search.query.QueryPhase;
+import org.opensearch.search.query.QueryPhaseSearcher;
 import org.opensearch.search.query.QueryPhaseSearcherWrapper;
 
 import lombok.extern.log4j.Log4j2;
@@ -36,6 +37,14 @@ import static org.opensearch.neuralsearch.util.HybridQueryUtil.isHybridQuery;
 @Log4j2
 public class HybridQueryPhaseSearcher extends QueryPhaseSearcherWrapper {
 
+    private final QueryPhaseSearcher noDocCollectorDefaultQueryPhaseSearcher;
+    private final QueryPhaseSearcher noDocsCollectorConcurrentQueryPhaseSearcher;
+
+    public HybridQueryPhaseSearcher() {
+        this.noDocCollectorDefaultQueryPhaseSearcher = new NoDocCollectorDefaultQueryPhaseSearcher();
+        this.noDocsCollectorConcurrentQueryPhaseSearcher = new NoDocCollectorConcurrentQueryPhaseSearcher();
+    }
+
     public boolean searchWith(
         final SearchContext searchContext,
         final ContextIndexSearcher searcher,
@@ -49,7 +58,29 @@ public class HybridQueryPhaseSearcher extends QueryPhaseSearcherWrapper {
             return super.searchWith(searchContext, searcher, query, collectors, hasFilterCollector, hasTimeout);
         } else {
             Query hybridQuery = extractHybridQuery(searchContext, query);
-            return super.searchWith(searchContext, searcher, hybridQuery, collectors, hasFilterCollector, hasTimeout);
+            return searchWithForHybridQuery(searchContext, searcher, hybridQuery, collectors, hasFilterCollector, hasTimeout);
+        }
+    }
+
+    private boolean searchWithForHybridQuery(
+        final SearchContext searchContext,
+        final ContextIndexSearcher searcher,
+        final Query query,
+        final LinkedList<QueryCollectorContext> collectors,
+        final boolean hasFilterCollector,
+        final boolean hasTimeout
+    ) throws IOException {
+        if (searchContext.shouldUseConcurrentSearch()) {
+            return noDocsCollectorConcurrentQueryPhaseSearcher.searchWith(searchContext, searcher, query, collectors, hasFilterCollector, hasTimeout);
+        } else {
+            return noDocCollectorDefaultQueryPhaseSearcher.searchWith(
+                searchContext,
+                searcher,
+                query,
+                collectors,
+                hasFilterCollector,
+                hasTimeout
+            );
         }
     }
 
