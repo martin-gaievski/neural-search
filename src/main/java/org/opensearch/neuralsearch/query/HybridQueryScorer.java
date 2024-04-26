@@ -8,18 +8,13 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Locale;
-import java.util.Map;
 import java.util.Objects;
 
-import com.google.common.primitives.Ints;
 import org.apache.lucene.search.DisiPriorityQueue;
 import org.apache.lucene.search.DisiWrapper;
 import org.apache.lucene.search.DisjunctionDISIApproximation;
 import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.TwoPhaseIterator;
@@ -55,7 +50,6 @@ public final class HybridQueryScorer extends Scorer {
         super(weight);
         this.subScorers = Collections.unmodifiableList(subScorers);
         subScores = new float[subScorers.size()];
-        // this.queryToIndex = mapQueryToIndex();
         this.subScorersPQ = initializeSubScorersPQ();
         boolean needsScores = scoreMode != ScoreMode.COMPLETE_NO_SCORES;
 
@@ -192,15 +186,14 @@ public final class HybridQueryScorer extends Scorer {
      */
     public float[] hybridScores() throws IOException {
         float[] scores = new float[subScores.length];
-        MyDisiWrapper topList = (MyDisiWrapper) subScorersPQ.topList();
-        for (MyDisiWrapper disiWrapper = topList; disiWrapper != null; disiWrapper = (MyDisiWrapper) disiWrapper.next) {
+        HybridDisiWrapper topList = (HybridDisiWrapper) subScorersPQ.topList();
+        for (HybridDisiWrapper disiWrapper = topList; disiWrapper != null; disiWrapper = (HybridDisiWrapper) disiWrapper.next) {
             // check if this doc has match in the subQuery. If not, add score as 0.0 and continue
             Scorer scorer = disiWrapper.scorer;
             if (scorer.docID() == DocIdSetIterator.NO_MORE_DOCS) {
                 continue;
             }
-            int index = disiWrapper.getSubQueryIndex();
-            scores[index] = scorer.score();
+            scores[disiWrapper.getSubQueryIndex()] = scorer.score();
         }
         return scores;
     }
@@ -217,7 +210,7 @@ public final class HybridQueryScorer extends Scorer {
             if (scorer == null) {
                 continue;
             }
-            final MyDisiWrapper w = new MyDisiWrapper(scorer);
+            final HybridDisiWrapper w = new HybridDisiWrapper(scorer);
             w.setSubQueryIndex(i);
             subScorersPQ.add(w);
         }

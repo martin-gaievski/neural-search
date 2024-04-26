@@ -37,14 +37,6 @@ import static org.opensearch.neuralsearch.util.HybridQueryUtil.isHybridQuery;
 @Log4j2
 public class HybridQueryPhaseSearcher extends QueryPhaseSearcherWrapper {
 
-    private final QueryPhaseSearcher noDocCollectorDefaultQueryPhaseSearcher;
-    private final QueryPhaseSearcher noDocsCollectorConcurrentQueryPhaseSearcher;
-
-    public HybridQueryPhaseSearcher() {
-        this.noDocCollectorDefaultQueryPhaseSearcher = new NoDocCollectorDefaultQueryPhaseSearcher();
-        this.noDocsCollectorConcurrentQueryPhaseSearcher = new NoDocCollectorConcurrentQueryPhaseSearcher();
-    }
-
     public boolean searchWith(
         final SearchContext searchContext,
         final ContextIndexSearcher searcher,
@@ -58,29 +50,7 @@ public class HybridQueryPhaseSearcher extends QueryPhaseSearcherWrapper {
             return super.searchWith(searchContext, searcher, query, collectors, hasFilterCollector, hasTimeout);
         } else {
             Query hybridQuery = extractHybridQuery(searchContext, query);
-            return searchWithForHybridQuery(searchContext, searcher, hybridQuery, collectors, hasFilterCollector, hasTimeout);
-        }
-    }
-
-    private boolean searchWithForHybridQuery(
-        final SearchContext searchContext,
-        final ContextIndexSearcher searcher,
-        final Query query,
-        final LinkedList<QueryCollectorContext> collectors,
-        final boolean hasFilterCollector,
-        final boolean hasTimeout
-    ) throws IOException {
-        if (searchContext.shouldUseConcurrentSearch()) {
-            return noDocsCollectorConcurrentQueryPhaseSearcher.searchWith(searchContext, searcher, query, collectors, hasFilterCollector, hasTimeout);
-        } else {
-            return noDocCollectorDefaultQueryPhaseSearcher.searchWith(
-                searchContext,
-                searcher,
-                query,
-                collectors,
-                hasFilterCollector,
-                hasTimeout
-            );
+            return super.searchWith(searchContext, searcher, hybridQuery, collectors, hasFilterCollector, hasTimeout);
         }
     }
 

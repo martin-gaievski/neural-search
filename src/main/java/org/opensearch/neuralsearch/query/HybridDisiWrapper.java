@@ -9,13 +9,17 @@ import lombok.Setter;
 import org.apache.lucene.search.DisiWrapper;
 import org.apache.lucene.search.Scorer;
 
+/**
+ * Wrapper for DisiWrapper, saves state of sub-queries for performance reasons
+ */
 @Getter
 @Setter
-public class MyDisiWrapper extends DisiWrapper {
+public class HybridDisiWrapper extends DisiWrapper {
 
+    //index of disi wrapper sub-query object when its part of the hybrid query
     int subQueryIndex;
 
-    public MyDisiWrapper(Scorer scorer) {
+    public HybridDisiWrapper(Scorer scorer) {
         super(scorer);
     }
 }
