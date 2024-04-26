@@ -693,7 +693,7 @@ public class NeuralQueryBuilderTests extends OpenSearchTestCase {
               }
           }
         */
-        setUpClusterService(Version.V_2_14_0);
+        setUpClusterService(Version.V_2_12_0);
         XContentBuilder xContentBuilder = XContentFactory.jsonBuilder()
             .startObject()
             .startObject(FIELD_NAME)
@@ -725,7 +725,7 @@ public class NeuralQueryBuilderTests extends OpenSearchTestCase {
               }
           }
         */
-        setUpClusterService(Version.V_2_14_0);
+        setUpClusterService(Version.V_2_12_0);
         XContentBuilder xContentBuilder = XContentFactory.jsonBuilder()
             .startObject()
             .startObject(FIELD_NAME)
@@ -758,7 +758,7 @@ public class NeuralQueryBuilderTests extends OpenSearchTestCase {
               }
           }
         */
-        setUpClusterService(Version.V_2_14_0);
+        setUpClusterService(Version.V_2_12_0);
         XContentBuilder xContentBuilder = null;
         try {
             xContentBuilder = XContentFactory.jsonBuilder()

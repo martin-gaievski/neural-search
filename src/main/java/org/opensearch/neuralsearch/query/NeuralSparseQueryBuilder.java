@@ -77,7 +77,7 @@ public class NeuralSparseQueryBuilder extends AbstractQueryBuilder<NeuralSparseQ
     private String modelId;
     private Float maxTokenScore;
     private Supplier<Map<String, Float>> queryTokensSupplier;
-    private static final Version MINIMAL_SUPPORTED_VERSION_DEFAULT_MODEL_ID = Version.V_2_13_0;
+    private static final Version MINIMAL_SUPPORTED_VERSION_DEFAULT_MODEL_ID = Version.V_2_12_0;
 
     public static void initialize(MLCommonsClientAccessor mlClient) {
         NeuralSparseQueryBuilder.ML_CLIENT = mlClient;
