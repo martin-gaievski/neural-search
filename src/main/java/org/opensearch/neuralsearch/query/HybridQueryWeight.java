@@ -146,6 +146,7 @@ public final class HybridQueryWeight extends Weight {
                 }
             }
             return new HybridQueryScorer(weight, tScorers, scoreMode);
+            // return new HybridQueryScorer_Bak(weight, tScorers, scoreMode);
         }
 
         @Override

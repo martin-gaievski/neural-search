@@ -4,6 +4,7 @@
  */
 package org.opensearch.neuralsearch.query;
 
+import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.search.DisiPriorityQueue;
@@ -19,10 +20,12 @@ import org.opensearch.neuralsearch.search.HybridDisiWrapper;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
-import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -31,33 +34,78 @@ import java.util.Objects;
  * corresponds to order of sub-queries in an input Hybrid query.
  */
 @Log4j2
-public final class HybridQueryScorer extends Scorer {
+public final class HybridQueryScorer_HighestScoreDocIterator extends Scorer {
 
     // score for each of sub-query in this hybrid query
     @Getter
-    private final List<Scorer> subScorers;
+    private final List<HybridScorerWrapper> subScorers;
 
-    private final DisiPriorityQueue subScorersPQ;
+    // private final DisiPriorityQueue subScorersPQ;
+    final DocIdSetIterator[] approximations;
+    final TwoPhaseIterator[] twoPhases;
 
-    private float[] subScores;
+    Map<Integer, float[]> scoresByDocId = new HashMap<>();
 
-    private final DocIdSetIterator approximation;
-    private final HybridScoreBlockBoundaryPropagator disjunctionBlockPropagator;
-    private final TwoPhase twoPhase;
+    // private final float[] subScores;
+    float minScore;
 
-    public HybridQueryScorer(final Weight weight, final List<Scorer> subScorers) throws IOException {
+    // private final DocIdSetIterator approximation;
+    // private final HybridScoreBlockBoundaryPropagator disjunctionBlockPropagator;
+    // private final TwoPhase twoPhase;
+
+    public HybridQueryScorer_HighestScoreDocIterator(final Weight weight, final List<Scorer> subScorers) throws IOException {
         this(weight, subScorers, ScoreMode.TOP_SCORES);
     }
 
-    HybridQueryScorer(final Weight weight, final List<Scorer> subScorers, final ScoreMode scoreMode) throws IOException {
+    HybridQueryScorer_HighestScoreDocIterator(final Weight weight, final List<Scorer> subScorers, final ScoreMode scoreMode)
+        throws IOException {
         super(weight);
-        this.subScorers = Collections.unmodifiableList(subScorers);
-        subScores = new float[subScorers.size()];
-        this.subScorersPQ = initializeSubScorersPQ();
+
+        this.subScorers = new ArrayList<>();
+        for (int i = 0; i < subScorers.size(); i++) {
+            Scorer s = subScorers.get(i);
+            HybridScorerWrapper hybridQueryScorer = new HybridScorerWrapper(i, s);
+            this.subScorers.add(hybridQueryScorer);
+        }
+        // sort scorers by cost
+        // this.subScorers.sort(Comparator.comparingLong(s -> s.iterator().cost()));
+        this.subScorers.sort((s1, s2) -> {
+            if (Objects.isNull(s1.getScorer()) && Objects.isNull(s2.getScorer())) {
+                return 0;
+            }
+            if (Objects.isNull(s1.getScorer())) {
+                return -1;
+            }
+            if (Objects.isNull(s2.getScorer())) {
+                return 1;
+            }
+            return Long.compare(s1.getScorer().iterator().cost(), s2.getScorer().iterator().cost());
+        });
+        this.approximations = new DocIdSetIterator[subScorers.size()];
+        List<TwoPhaseIterator> twoPhaseList = new ArrayList<>();
+        for (int i = 0; i < subScorers.size(); i++) {
+            Scorer scorer = subScorers.get(i);
+            if (Objects.isNull(scorer)) {
+                continue;
+            }
+            TwoPhaseIterator twoPhase = scorer.twoPhaseIterator();
+            if (twoPhase != null) {
+                twoPhaseList.add(twoPhase);
+                approximations[i] = twoPhase.approximation();
+            } else {
+                approximations[i] = scorer.iterator();
+            }
+            scorer.advanceShallow(0);
+        }
+        this.twoPhases = twoPhaseList.toArray(new TwoPhaseIterator[twoPhaseList.size()]);
+        Arrays.sort(this.twoPhases, Comparator.comparingDouble(TwoPhaseIterator::matchCost));
+
+        // subScores = new float[subScorers.size()];
+        // this.subScorersPQ = initializeSubScorersPQ();
         boolean needsScores = scoreMode != ScoreMode.COMPLETE_NO_SCORES;
 
-        this.approximation = new HybridSubqueriesDISIApproximation(this.subScorersPQ);
-        if (scoreMode == ScoreMode.TOP_SCORES) {
+        // this.approximation = new HybridSubqueriesDISIApproximation(this.subScorersPQ);
+        /*if (scoreMode == ScoreMode.TOP_SCORES) {
             this.disjunctionBlockPropagator = new HybridScoreBlockBoundaryPropagator(subScorers);
         } else {
             this.disjunctionBlockPropagator = null;
@@ -81,15 +129,7 @@ public final class HybridQueryScorer extends Scorer {
         } else {
             final float matchCost = sumMatchCost / sumApproxCost;
             twoPhase = new TwoPhase(approximation, matchCost, subScorersPQ, needsScores);
-        }
-    }
-
-    @Override
-    public int advanceShallow(int target) throws IOException {
-        if (disjunctionBlockPropagator != null) {
-            return disjunctionBlockPropagator.advanceShallow(target);
-        }
-        return super.advanceShallow(target);
+        }*/
     }
 
     /**
@@ -99,44 +139,30 @@ public final class HybridQueryScorer extends Scorer {
      */
     @Override
     public float score() throws IOException {
-        return score(getSubMatches());
+        int docId = docID();
+        float[] scores = new float[subScorers.size()];
+        scoresByDocId.put(docId, scores);
+        double score = 0;
+        for (HybridScorerWrapper scorerWrapper : subScorers) {
+            Scorer scorer = scorerWrapper.getScorer();
+            if (Objects.nonNull(scorer)) {
+                score += scorer.score();
+                scores[scorerWrapper.getQueryIndex()] = scorer.score();
+            }
+        }
+        return (float) score;
     }
 
     private float score(DisiWrapper topList) throws IOException {
-        if (topList instanceof HybridDisiWrapper == false) {
-            log.error(
-                String.format(
-                    Locale.ROOT,
-                    "Unexpected type of DISI wrapper, expected [%s] but found [%s]",
-                    HybridDisiWrapper.class.getSimpleName(),
-                    subScorersPQ.topList().getClass().getSimpleName()
-                )
-            );
-            throw new IllegalStateException(
-                "Unable to collect scores for one of the sub-queries, encountered an unexpected type of score iterator."
-            );
-        }
-        subScores = new float[subScorers.size()];
         float totalScore = 0.0f;
-        for (HybridDisiWrapper disiWrapper = (HybridDisiWrapper) topList; disiWrapper != null; disiWrapper =
-            (HybridDisiWrapper) disiWrapper.next) {
+        for (DisiWrapper disiWrapper = topList; disiWrapper != null; disiWrapper = disiWrapper.next) {
             // check if this doc has match in the subQuery. If not, add score as 0.0 and continue
             if (disiWrapper.scorer.docID() == DocIdSetIterator.NO_MORE_DOCS) {
                 continue;
             }
-            float subQueryScore = disiWrapper.scorer.score();
-            subScores[disiWrapper.getSubQueryIndex()] = subQueryScore;
-            totalScore += subQueryScore;
+            totalScore += disiWrapper.scorer.score();
         }
         return totalScore;
-    }
-
-    DisiWrapper getSubMatches() throws IOException {
-        if (twoPhase == null) {
-            return subScorersPQ.topList();
-        } else {
-            return twoPhase.getSubMatches();
-        }
     }
 
     /**
@@ -145,16 +171,155 @@ public final class HybridQueryScorer extends Scorer {
      */
     @Override
     public DocIdSetIterator iterator() {
-        if (twoPhase != null) {
-            return TwoPhaseIterator.asDocIdSetIterator(twoPhase);
-        } else {
-            return approximation;
-        }
+        return twoPhases.length == 0 ? approximation() : TwoPhaseIterator.asDocIdSetIterator(twoPhaseIterator());
     }
 
     @Override
     public TwoPhaseIterator twoPhaseIterator() {
-        return twoPhase;
+        if (twoPhases.length == 0) {
+            return null;
+        }
+        float matchCost = (float) Arrays.stream(twoPhases).mapToDouble(TwoPhaseIterator::matchCost).sum();
+        final DocIdSetIterator approx = approximation();
+        return new TwoPhaseIterator(approx) {
+            @Override
+            public boolean matches() throws IOException {
+                for (TwoPhaseIterator twoPhase : twoPhases) {
+                    assert twoPhase.approximation().docID() == docID();
+                    if (twoPhase.matches() == false) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            @Override
+            public float matchCost() {
+                return matchCost;
+            }
+        };
+    }
+
+    private DocIdSetIterator approximation() {
+        final DocIdSetIterator lead = approximations[0];
+
+        return new DocIdSetIterator() {
+
+            float maxScore;
+            int upTo = -1;
+
+            @Override
+            public int docID() {
+                return lead == null ? NO_MORE_DOCS : lead.docID();
+            }
+
+            @Override
+            public long cost() {
+                return lead.cost();
+            }
+
+            private void moveToNextBlock(int target) throws IOException {
+                upTo = advanceShallow(target);
+                maxScore = getMaxScore(upTo);
+            }
+
+            private int advanceTarget(int target) throws IOException {
+                if (target > upTo) {
+                    moveToNextBlock(target);
+                }
+
+                while (true) {
+                    assert upTo >= target;
+
+                    if (maxScore >= minScore) {
+                        return target;
+                    }
+
+                    if (upTo == NO_MORE_DOCS) {
+                        return NO_MORE_DOCS;
+                    }
+
+                    target = upTo + 1;
+
+                    moveToNextBlock(target);
+                }
+            }
+
+            @Override
+            public int nextDoc() throws IOException {
+                return advance(docID() + 1);
+            }
+
+            @Override
+            public int advance(int target) throws IOException {
+                return doNext(lead.advance(advanceTarget(target)));
+            }
+
+            private int doNext(int doc) throws IOException {
+                advanceHead: for (;;) {
+                    assert doc == lead.docID();
+
+                    if (doc == NO_MORE_DOCS) {
+                        return NO_MORE_DOCS;
+                    }
+
+                    if (doc > upTo) {
+                        // This check is useful when scorers return information about blocks
+                        // that do not actually have any matches. Otherwise `doc` will always
+                        // be in the current block already since it is always the result of
+                        // lead.advance(advanceTarget(some_doc_id))
+                        final int nextTarget = advanceTarget(doc);
+                        if (nextTarget != doc) {
+                            doc = lead.advance(nextTarget);
+                            continue;
+                        }
+                    }
+
+                    assert doc <= upTo;
+
+                    // then find agreement with other iterators
+                    for (int i = 1; i < approximations.length; ++i) {
+                        final DocIdSetIterator other = approximations[i];
+                        if (Objects.isNull(other)) {
+                            continue;
+                        }
+                        // other.doc may already be equal to doc if we "continued advanceHead"
+                        // on the previous iteration and the advance on the lead scorer exactly matched.
+                        if (other.docID() < doc) {
+                            final int next = other.advance(doc);
+
+                            if (next > doc) {
+                                // iterator beyond the current doc - advance lead and continue to the new highest
+                                // doc.
+                                doc = lead.advance(advanceTarget(next));
+                                continue advanceHead;
+                            }
+                        }
+
+                        assert other.docID() == doc;
+                    }
+
+                    // success - all iterators are on the same doc and the score is competitive
+                    return doc;
+                }
+            }
+        };
+    }
+
+    public int advanceShallow(int target) throws IOException {
+        // We use block boundaries of the lead scorer.
+        // It is tempting to fold in other clauses as well to have better bounds of
+        // the score, but then there is a risk of not progressing fast enough.
+        int result = subScorers.get(0).getScorer().advanceShallow(target);
+        // But we still need to shallow-advance other clauses, in order to have
+        // better score upper bounds
+        for (int i = 1; i < subScorers.size(); ++i) {
+            Scorer scorer = subScorers.get(i).getScorer();
+            if (Objects.nonNull(scorer)) {
+                scorer.advanceShallow(target);
+            }
+        }
+        return result;
     }
 
     /**
@@ -165,26 +330,19 @@ public final class HybridQueryScorer extends Scorer {
      */
     @Override
     public float getMaxScore(int upTo) throws IOException {
-        return subScorers.stream().filter(Objects::nonNull).filter(scorer -> scorer.docID() <= upTo).map(scorer -> {
-            try {
-                return scorer.getMaxScore(upTo);
-            } catch (IOException e) {
-                throw new RuntimeException(e);
+        double sum = 0;
+        for (HybridScorerWrapper scorerWrapper : subScorers) {
+            Scorer scorer = scorerWrapper.getScorer();
+            if (Objects.nonNull(scorer)) {
+                sum += scorer.getMaxScore(upTo);
             }
-        }).max(Float::compare).orElse(0.0f);
+        }
+        return (float) sum;
     }
 
     @Override
-    public void setMinCompetitiveScore(float minScore) throws IOException {
-        if (disjunctionBlockPropagator != null) {
-            disjunctionBlockPropagator.setMinCompetitiveScore(minScore);
-        }
-
-        for (Scorer scorer : subScorers) {
-            if (Objects.nonNull(scorer)) {
-                scorer.setMinCompetitiveScore(minScore);
-            }
-        }
+    public void setMinCompetitiveScore(float score) throws IOException {
+        minScore = score;
     }
 
     /**
@@ -193,10 +351,7 @@ public final class HybridQueryScorer extends Scorer {
      */
     @Override
     public int docID() {
-        if (subScorersPQ.size() == 0) {
-            return DocIdSetIterator.NO_MORE_DOCS;
-        }
-        return subScorersPQ.top().doc;
+        return subScorers.get(0).getScorer().docID();
     }
 
     /**
@@ -205,8 +360,8 @@ public final class HybridQueryScorer extends Scorer {
      * @throws IOException
      */
     public float[] hybridScores() throws IOException {
-        /*float[] scores = new float[subScores.length];
-        DisiWrapper topList = subScorersPQ.topList();
+        // float[] scores = new float[subScorers.size()];// new float[subScores.length];
+        /*DisiWrapper topList = subScorersPQ.topList();
         if (topList instanceof HybridDisiWrapper == false) {
             log.error(
                 String.format(
@@ -230,7 +385,14 @@ public final class HybridQueryScorer extends Scorer {
             scores[disiWrapper.getSubQueryIndex()] = scorer.score();
         }
         return scores;*/
-        return subScores;
+        /*for (HybridScorerWrapper hybridScorerWrapper : subScorers) {
+            int idx = hybridScorerWrapper.getQueryIndex();
+            if (Objects.nonNull(hybridScorerWrapper.getScorer())) {
+                scores[idx] = hybridScorerWrapper.getScorer().score();
+            }
+        }*/
+        float[] scores = scoresByDocId.get(docID());
+        return scores;
     }
 
     private DisiPriorityQueue initializeSubScorersPQ() {
@@ -239,7 +401,7 @@ public final class HybridQueryScorer extends Scorer {
         int numOfSubQueries = subScorers.size();
         DisiPriorityQueue subScorersPQ = new DisiPriorityQueue(numOfSubQueries);
         for (int idx = 0; idx < subScorers.size(); idx++) {
-            Scorer scorer = subScorers.get(idx);
+            Scorer scorer = subScorers.get(idx).getScorer();
             if (scorer == null) {
                 continue;
             }
@@ -250,10 +412,11 @@ public final class HybridQueryScorer extends Scorer {
     }
 
     @Override
-    public Collection<ChildScorable> getChildren() throws IOException {
+    public Collection<ChildScorable> getChildren() {
         ArrayList<ChildScorable> children = new ArrayList<>();
-        for (DisiWrapper scorer = getSubMatches(); scorer != null; scorer = scorer.next) {
-            children.add(new ChildScorable(scorer.scorer, "SHOULD"));
+        for (HybridScorerWrapper hybridScorerWrapper : subScorers) {
+            Scorer scorer = hybridScorerWrapper.getScorer();
+            children.add(new ChildScorable(scorer, "MUST"));
         }
         return children;
     }
@@ -385,5 +548,13 @@ public final class HybridQueryScorer extends Scorer {
             }
             return docIdSetIterator.advance(target);
         }
+    }
+
+    @AllArgsConstructor
+    static class HybridScorerWrapper {
+        @Getter
+        final int queryIndex;
+        @Getter
+        final Scorer scorer;
     }
 }

@@ -6,6 +6,7 @@ package org.opensearch.neuralsearch.search;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -22,10 +23,10 @@ import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.util.PriorityQueue;
-import org.opensearch.neuralsearch.query.HybridQueryScorer;
 
 import lombok.Getter;
 import lombok.extern.log4j.Log4j2;
+import org.opensearch.neuralsearch.query.HybridQueryScorer;
 
 /**
  * Collects the TopDocs after executing hybrid query. Uses HybridQueryTopDocs as DTO to handle each sub query results
@@ -39,7 +40,7 @@ public class HybridTopScoreDocCollector implements Collector {
     private int[] totalHits;
     private final int numOfHits;
     @Getter
-    private PriorityQueue<ScoreDoc>[] compoundScores;
+    private List<ScoreDoc>[] compoundScores;
 
     public HybridTopScoreDocCollector(int numHits, HitsThresholdChecker hitsThresholdChecker) {
         numOfHits = numHits;
@@ -99,9 +100,9 @@ public class HybridTopScoreDocCollector implements Collector {
                 float[] subScoresByQuery = compoundQueryScorer.hybridScores();
                 // iterate over results for each query
                 if (compoundScores == null) {
-                    compoundScores = new PriorityQueue[subScoresByQuery.length];
+                    compoundScores = new ArrayList[subScoresByQuery.length];
                     for (int i = 0; i < subScoresByQuery.length; i++) {
-                        compoundScores[i] = new HitQueue(numOfHits, true);
+                        compoundScores[i] = new ArrayList(numOfHits);
                     }
                     totalHits = new int[subScoresByQuery.length];
                 }
@@ -112,11 +113,13 @@ public class HybridTopScoreDocCollector implements Collector {
                         continue;
                     }
                     totalHits[i]++;
-                    PriorityQueue<ScoreDoc> pq = compoundScores[i];
+                    /*PriorityQueue<ScoreDoc> pq = compoundScores[i];
                     ScoreDoc topDoc = pq.top();
                     topDoc.doc = doc + docBase;
                     topDoc.score = score;
-                    pq.updateTop();
+                    pq.updateTop();*/
+                    ScoreDoc topDoc = new ScoreDoc(doc + docBase, score);
+                    compoundScores[i].add(topDoc);
                 }
             }
         };
@@ -141,7 +144,7 @@ public class HybridTopScoreDocCollector implements Collector {
         return topDocs;
     }
 
-    private TopDocs topDocsPerQuery(int start, int howMany, PriorityQueue<ScoreDoc> pq, int totalHits) {
+    private TopDocs topDocsPerQuery(int start, int howMany, List<ScoreDoc> pq, int totalHits) {
         if (howMany < 0) {
             throw new IllegalArgumentException(
                 String.format(Locale.ROOT, "Number of hits requested must be greater than 0 but value was %d", howMany)
@@ -158,13 +161,15 @@ public class HybridTopScoreDocCollector implements Collector {
             return EMPTY_TOPDOCS;
         }
 
+        Collections.sort(pq, (scoreDoc1, scoreDoc2) -> Float.compare(scoreDoc1.score, scoreDoc2.score));
+
         int size = howMany - start;
         ScoreDoc[] results = new ScoreDoc[size];
         // pq's pop() returns the 'least' element in the queue, therefore need
         // to discard the first ones, until we reach the requested range.
-        for (int i = pq.size() - start - size; i > 0; i--) {
+        /*for (int i = pq.size() - start - size; i > 0; i--) {
             pq.pop();
-        }
+        }*/
 
         // Get the requested results from pq.
         populateResults(results, size, pq);
@@ -172,11 +177,16 @@ public class HybridTopScoreDocCollector implements Collector {
         return new TopDocs(new TotalHits(totalHits, totalHitsRelation), results);
     }
 
-    protected void populateResults(ScoreDoc[] results, int howMany, PriorityQueue<ScoreDoc> pq) {
-        for (int i = howMany - 1; i >= 0 && pq.size() > 0; i--) {
+    protected void populateResults(ScoreDoc[] results, int howMany, List<ScoreDoc> pq) {
+        /*for (int i = howMany - 1; i >= 0 && pq.size() > 0; i--) {
             // adding to array if index is within [0..array_length - 1]
             if (i < results.length) {
                 results[i] = pq.pop();
+            }
+        }*/
+        for (int i = 0; i <= howMany - 1 && i < pq.size(); i++) {
+            if (i < results.length) {
+                results[i] = pq.get(i);
             }
         }
     }
