@@ -99,7 +99,8 @@ public final class HybridQueryScorer extends Scorer {
      */
     @Override
     public float score() throws IOException {
-        return score(getSubMatches());
+        // return score(getSubMatches());
+        return 1.0f;
     }
 
     private float score(DisiWrapper topList) throws IOException {
@@ -205,7 +206,7 @@ public final class HybridQueryScorer extends Scorer {
      * @throws IOException
      */
     public float[] hybridScores() throws IOException {
-        /*float[] scores = new float[subScores.length];
+        float[] scores = new float[subScores.length];
         DisiWrapper topList = subScorersPQ.topList();
         if (topList instanceof HybridDisiWrapper == false) {
             log.error(
@@ -229,8 +230,7 @@ public final class HybridQueryScorer extends Scorer {
             }
             scores[disiWrapper.getSubQueryIndex()] = scorer.score();
         }
-        return scores;*/
-        return subScores;
+        return scores;
     }
 
     private DisiPriorityQueue initializeSubScorersPQ() {

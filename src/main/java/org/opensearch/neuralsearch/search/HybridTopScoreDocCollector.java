@@ -96,12 +96,13 @@ public class HybridTopScoreDocCollector implements Collector {
                 if (Objects.isNull(compoundQueryScorer)) {
                     throw new IllegalArgumentException("scorers are null for all sub-queries in hybrid query");
                 }
+
                 float[] subScoresByQuery = compoundQueryScorer.hybridScores();
                 // iterate over results for each query
                 if (compoundScores == null) {
                     compoundScores = new PriorityQueue[subScoresByQuery.length];
                     for (int i = 0; i < subScoresByQuery.length; i++) {
-                        compoundScores[i] = new HitQueue(numOfHits, true);
+                        compoundScores[i] = new HitQueue(numOfHits, false);
                     }
                     totalHits = new int[subScoresByQuery.length];
                 }
@@ -113,10 +114,15 @@ public class HybridTopScoreDocCollector implements Collector {
                     }
                     totalHits[i]++;
                     PriorityQueue<ScoreDoc> pq = compoundScores[i];
-                    ScoreDoc topDoc = pq.top();
-                    topDoc.doc = doc + docBase;
-                    topDoc.score = score;
-                    pq.updateTop();
+                    // ScoreDoc topDoc = pq.top();
+                    // if (topDoc == null) {
+                    ScoreDoc topDoc = new ScoreDoc(doc + docBase, score);
+                    pq.insertWithOverflow(topDoc);
+                    // continue;
+                    // }
+                    // topDoc.doc = doc + docBase;
+                    // topDoc.score = score;
+                    // pq.updateTop();
                 }
             }
         };
