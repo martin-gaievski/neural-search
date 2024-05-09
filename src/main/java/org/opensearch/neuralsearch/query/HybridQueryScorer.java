@@ -22,7 +22,6 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
-import java.util.Locale;
 import java.util.Objects;
 
 /**
@@ -39,11 +38,10 @@ public final class HybridQueryScorer extends Scorer {
 
     private final DisiPriorityQueue subScorersPQ;
 
-    private float[] subScores;
-
     private final DocIdSetIterator approximation;
     private final HybridScoreBlockBoundaryPropagator disjunctionBlockPropagator;
     private final TwoPhase twoPhase;
+    private final int numSubqueries;
 
     public HybridQueryScorer(final Weight weight, final List<Scorer> subScorers) throws IOException {
         this(weight, subScorers, ScoreMode.TOP_SCORES);
@@ -52,7 +50,7 @@ public final class HybridQueryScorer extends Scorer {
     HybridQueryScorer(final Weight weight, final List<Scorer> subScorers, final ScoreMode scoreMode) throws IOException {
         super(weight);
         this.subScorers = Collections.unmodifiableList(subScorers);
-        subScores = new float[subScorers.size()];
+        this.numSubqueries = subScorers.size();
         this.subScorersPQ = initializeSubScorersPQ();
         boolean needsScores = scoreMode != ScoreMode.COMPLETE_NO_SCORES;
 
@@ -99,35 +97,12 @@ public final class HybridQueryScorer extends Scorer {
      */
     @Override
     public float score() throws IOException {
-        // return score(getSubMatches());
-        return 1.0f;
-    }
-
-    private float score(DisiWrapper topList) throws IOException {
-        if (topList instanceof HybridDisiWrapper == false) {
-            log.error(
-                String.format(
-                    Locale.ROOT,
-                    "Unexpected type of DISI wrapper, expected [%s] but found [%s]",
-                    HybridDisiWrapper.class.getSimpleName(),
-                    subScorersPQ.topList().getClass().getSimpleName()
-                )
-            );
-            throw new IllegalStateException(
-                "Unable to collect scores for one of the sub-queries, encountered an unexpected type of score iterator."
-            );
-        }
-        subScores = new float[subScorers.size()];
         float totalScore = 0.0f;
-        for (HybridDisiWrapper disiWrapper = (HybridDisiWrapper) topList; disiWrapper != null; disiWrapper =
-            (HybridDisiWrapper) disiWrapper.next) {
-            // check if this doc has match in the subQuery. If not, add score as 0.0 and continue
+        for (DisiWrapper disiWrapper : subScorersPQ) {
             if (disiWrapper.scorer.docID() == DocIdSetIterator.NO_MORE_DOCS) {
                 continue;
             }
-            float subQueryScore = disiWrapper.scorer.score();
-            subScores[disiWrapper.getSubQueryIndex()] = subQueryScore;
-            totalScore += subQueryScore;
+            totalScore += disiWrapper.scorer.score();
         }
         return totalScore;
     }
@@ -206,21 +181,8 @@ public final class HybridQueryScorer extends Scorer {
      * @throws IOException
      */
     public float[] hybridScores() throws IOException {
-        float[] scores = new float[subScores.length];
+        float[] scores = new float[numSubqueries];
         DisiWrapper topList = subScorersPQ.topList();
-        if (topList instanceof HybridDisiWrapper == false) {
-            log.error(
-                String.format(
-                    Locale.ROOT,
-                    "Unexpected type of DISI wrapper, expected [%s] but found [%s]",
-                    HybridDisiWrapper.class.getSimpleName(),
-                    subScorersPQ.topList().getClass().getSimpleName()
-                )
-            );
-            throw new IllegalStateException(
-                "Unable to collect scores for one of the sub-queries, encountered an unexpected type of score iterator."
-            );
-        }
         for (HybridDisiWrapper disiWrapper = (HybridDisiWrapper) topList; disiWrapper != null; disiWrapper =
             (HybridDisiWrapper) disiWrapper.next) {
             // check if this doc has match in the subQuery. If not, add score as 0.0 and continue
@@ -236,9 +198,8 @@ public final class HybridQueryScorer extends Scorer {
     private DisiPriorityQueue initializeSubScorersPQ() {
         Objects.requireNonNull(subScorers, "should not be null");
         // we need to count this way in order to include all identical sub-queries
-        int numOfSubQueries = subScorers.size();
-        DisiPriorityQueue subScorersPQ = new DisiPriorityQueue(numOfSubQueries);
-        for (int idx = 0; idx < subScorers.size(); idx++) {
+        DisiPriorityQueue subScorersPQ = new DisiPriorityQueue(numSubqueries);
+        for (int idx = 0; idx < numSubqueries; idx++) {
             Scorer scorer = subScorers.get(idx);
             if (scorer == null) {
                 continue;

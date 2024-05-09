@@ -237,10 +237,17 @@ public class HybridTopScoreDocCollectorTests extends OpenSearchQueryTestCase {
         ft.setOmitNorms(random().nextBoolean());
         ft.freeze();
 
+        int doc5 = RandomUtils.nextInt(0, 100_000);
+        int doc6 = RandomUtils.nextInt(0, 100_000);
+        int doc7 = RandomUtils.nextInt(0, 100_000);
+
         w.addDocument(getDocument(TEXT_FIELD_NAME, DOC_ID_1, FIELD_1_VALUE, ft));
         w.addDocument(getDocument(TEXT_FIELD_NAME, DOC_ID_2, FIELD_2_VALUE, ft));
         w.addDocument(getDocument(TEXT_FIELD_NAME, DOC_ID_3, FIELD_3_VALUE, ft));
         w.addDocument(getDocument(TEXT_FIELD_NAME, DOC_ID_4, FIELD_4_VALUE, ft));
+        w.addDocument(getDocument(TEXT_FIELD_NAME, doc5, "text5", ft));
+        w.addDocument(getDocument(TEXT_FIELD_NAME, doc6, "text6", ft));
+        w.addDocument(getDocument(TEXT_FIELD_NAME, doc7, "text7", ft));
         w.commit();
 
         DirectoryReader reader = DirectoryReader.open(w);
@@ -248,7 +255,7 @@ public class HybridTopScoreDocCollectorTests extends OpenSearchQueryTestCase {
         LeafReaderContext leafReaderContext = reader.getContext().leaves().get(0);
 
         HybridTopScoreDocCollector hybridTopScoreDocCollector = new HybridTopScoreDocCollector(
-            NUM_DOCS,
+            7,
             new HitsThresholdChecker(TOTAL_HITS_UP_TO)
         );
         Weight weight = mock(Weight.class);
@@ -256,9 +263,9 @@ public class HybridTopScoreDocCollectorTests extends OpenSearchQueryTestCase {
         LeafCollector leafCollector = hybridTopScoreDocCollector.getLeafCollector(leafReaderContext);
         assertNotNull(leafCollector);
 
-        int[] docIdsQuery1 = new int[] { DOC_ID_1, DOC_ID_2, DOC_ID_3 };
-        int[] docIdsQuery2 = new int[] { DOC_ID_4, DOC_ID_1 };
-        int[] docIdsQueryMatchAll = new int[] { DOC_ID_1, DOC_ID_2, DOC_ID_3, DOC_ID_4 };
+        int[] docIdsQuery1 = new int[] { DOC_ID_1, DOC_ID_2, DOC_ID_3, doc5 };
+        int[] docIdsQuery2 = new int[] { DOC_ID_4, DOC_ID_1, doc6 };
+        int[] docIdsQueryMatchAll = new int[] { DOC_ID_1, DOC_ID_2, DOC_ID_3, DOC_ID_4, doc5, doc6, doc7 };
         Arrays.sort(docIdsQuery1);
         Arrays.sort(docIdsQuery2);
         Arrays.sort(docIdsQueryMatchAll);

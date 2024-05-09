@@ -114,15 +114,10 @@ public class HybridTopScoreDocCollector implements Collector {
                     }
                     totalHits[i]++;
                     PriorityQueue<ScoreDoc> pq = compoundScores[i];
-                    // ScoreDoc topDoc = pq.top();
-                    // if (topDoc == null) {
                     ScoreDoc topDoc = new ScoreDoc(doc + docBase, score);
+                    // this way we're inserting into heap and do nothing else unless we reach the capacity
+                    // after that we pull out the lowest score element on each insert
                     pq.insertWithOverflow(topDoc);
-                    // continue;
-                    // }
-                    // topDoc.doc = doc + docBase;
-                    // topDoc.score = score;
-                    // pq.updateTop();
                 }
             }
         };
