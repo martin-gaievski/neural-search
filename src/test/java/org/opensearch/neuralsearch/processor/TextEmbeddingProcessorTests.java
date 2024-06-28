@@ -22,6 +22,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -34,6 +35,7 @@ import org.mockito.MockitoAnnotations;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.concurrent.AtomicArray;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.env.Environment;
 import org.opensearch.index.mapper.IndexFieldMapper;
@@ -285,6 +287,47 @@ public class TextEmbeddingProcessorTests extends InferenceProcessorTestCase {
 
     }
 
+    @SneakyThrows
+    public void testNestedFieldInMapping_withMapTypeInput_successful() {
+        // Map<String, String> map1 = new HashMap<>();
+        // map1.put("test1", "test2");
+        // Map<String, String> map2 = new HashMap<>();
+        // map2.put("parent.child_level1.child_level2", "test4");
+        Map<String, Object> sourceAndMetadata = new HashMap<>();
+        sourceAndMetadata.put(IndexFieldMapper.NAME, "my_index");
+        // sourceAndMetadata.put("key1", map1);
+        // sourceAndMetadata.put("key2", map2);
+        Map<String, String> childLevel2 = new HashMap<>();
+        childLevel2.put("child_level2", "text_field_value");
+        Map<String, Object> childLevel1 = new HashMap<>();
+        childLevel1.put("child_level1", childLevel2);
+        // Map<String, Object> parent = new HashMap<>();
+        // parent.put("parent", childLevel1);
+        sourceAndMetadata.put("parent", childLevel1);
+        IngestDocument ingestDocument = new IngestDocument(sourceAndMetadata, new HashMap<>());
+
+        Map<String, Processor.Factory> registry = new HashMap<>();
+        Map<String, Object> config = new HashMap<>();
+        config.put(TextEmbeddingProcessor.MODEL_ID_FIELD, "mockModelId");
+        config.put(TextEmbeddingProcessor.FIELD_MAP_FIELD, ImmutableMap.of("parent.child_level1.child_level2", "test3_knn"));
+        TextEmbeddingProcessor processor = textEmbeddingProcessorFactory.create(registry, PROCESSOR_TAG, DESCRIPTION, config);
+
+        List<List<Float>> modelTensorList = createMockVectorResult();
+        doAnswer(invocation -> {
+            ActionListener<List<List<Float>>> listener = invocation.getArgument(2);
+            listener.onResponse(modelTensorList);
+            return null;
+        }).when(mlCommonsClientAccessor).inferenceSentences(anyString(), anyList(), isA(ActionListener.class));
+
+        // BiConsumer handler = mock(BiConsumer.class);
+        AtomicInteger counter = new AtomicInteger(1);
+        AtomicArray<IngestDocumentWrapper> results = new AtomicArray<>(1);
+        BiConsumer handler = (doc, ex) -> {};
+        processor.execute(ingestDocument, handler);
+        verify(handler).accept(any(IngestDocument.class), isNull());
+
+    }
+
     public void testExecute_mapHasNonStringValue_throwIllegalArgumentException() {
         Map<String, String> map1 = ImmutableMap.of("test1", "test2");
         Map<String, Double> map2 = ImmutableMap.of("test3", 209.3D);
@@ -396,7 +439,7 @@ public class TextEmbeddingProcessorTests extends InferenceProcessorTestCase {
         IngestDocument ingestDocument = createPlainIngestDocument();
         TextEmbeddingProcessor processor = createInstanceWithNestedMapConfiguration(config);
 
-        Map<String, Object> knnMap = processor.buildMapWithTargetKeyAndOriginalValue(ingestDocument);
+        Map<String, Object> knnMap = processor.buildMapWithTargetKeys(ingestDocument);
 
         List<List<Float>> modelTensorList = createMockVectorResult();
         processor.setVectorFieldsToDocument(ingestDocument, knnMap, modelTensorList);
@@ -409,7 +452,7 @@ public class TextEmbeddingProcessorTests extends InferenceProcessorTestCase {
         IngestDocument ingestDocument = createPlainIngestDocument();
         TextEmbeddingProcessor processor = createInstanceWithNestedMapConfiguration(config);
 
-        Map<String, Object> knnMap = processor.buildMapWithTargetKeyAndOriginalValue(ingestDocument);
+        Map<String, Object> knnMap = processor.buildMapWithTargetKeys(ingestDocument);
 
         // To assert the order is not changed between config map and generated map.
         List<Object> configValueList = new LinkedList<>(config.values());
@@ -435,7 +478,7 @@ public class TextEmbeddingProcessorTests extends InferenceProcessorTestCase {
         Map<String, Object> config = createNestedMapConfiguration();
         IngestDocument ingestDocument = createNestedMapIngestDocument();
         TextEmbeddingProcessor processor = createInstanceWithNestedMapConfiguration(config);
-        Map<String, Object> knnMap = processor.buildMapWithTargetKeyAndOriginalValue(ingestDocument);
+        Map<String, Object> knnMap = processor.buildMapWithTargetKeys(ingestDocument);
         List<List<Float>> modelTensorList = createMockVectorResult();
         processor.buildNLPResult(knnMap, modelTensorList, ingestDocument.getSourceAndMetadata());
         Map<String, Object> favoritesMap = (Map<String, Object>) ingestDocument.getSourceAndMetadata().get("favorites");
@@ -451,7 +494,7 @@ public class TextEmbeddingProcessorTests extends InferenceProcessorTestCase {
         Map<String, Object> config = createNestedListConfiguration();
         IngestDocument ingestDocument = createNestedListIngestDocument();
         TextEmbeddingProcessor textEmbeddingProcessor = createInstanceWithNestedMapConfiguration(config);
-        Map<String, Object> knnMap = textEmbeddingProcessor.buildMapWithTargetKeyAndOriginalValue(ingestDocument);
+        Map<String, Object> knnMap = textEmbeddingProcessor.buildMapWithTargetKeys(ingestDocument);
         List<List<Float>> modelTensorList = createMockVectorResult();
         textEmbeddingProcessor.buildNLPResult(knnMap, modelTensorList, ingestDocument.getSourceAndMetadata());
         List<Map<String, Object>> nestedObj = (List<Map<String, Object>>) ingestDocument.getSourceAndMetadata().get("nestedField");
@@ -465,7 +508,7 @@ public class TextEmbeddingProcessorTests extends InferenceProcessorTestCase {
         Map<String, Object> config = createNestedList2LevelConfiguration();
         IngestDocument ingestDocument = create2LevelNestedListIngestDocument();
         TextEmbeddingProcessor textEmbeddingProcessor = createInstanceWithNestedMapConfiguration(config);
-        Map<String, Object> knnMap = textEmbeddingProcessor.buildMapWithTargetKeyAndOriginalValue(ingestDocument);
+        Map<String, Object> knnMap = textEmbeddingProcessor.buildMapWithTargetKeys(ingestDocument);
         List<List<Float>> modelTensorList = createMockVectorResult();
         textEmbeddingProcessor.buildNLPResult(knnMap, modelTensorList, ingestDocument.getSourceAndMetadata());
         Map<String, Object> nestedLevel1 = (Map<String, Object>) ingestDocument.getSourceAndMetadata().get("nestedField");
@@ -480,7 +523,7 @@ public class TextEmbeddingProcessorTests extends InferenceProcessorTestCase {
         Map<String, Object> config = createPlainStringConfiguration();
         IngestDocument ingestDocument = createPlainIngestDocument();
         TextEmbeddingProcessor processor = createInstanceWithNestedMapConfiguration(config);
-        Map<String, Object> knnMap = processor.buildMapWithTargetKeyAndOriginalValue(ingestDocument);
+        Map<String, Object> knnMap = processor.buildMapWithTargetKeys(ingestDocument);
         List<List<Float>> modelTensorList = createMockVectorResult();
         processor.setVectorFieldsToDocument(ingestDocument, knnMap, modelTensorList);
 
