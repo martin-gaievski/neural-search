@@ -38,6 +38,7 @@ import org.opensearch.neuralsearch.processor.TextChunkingProcessor;
 import org.opensearch.neuralsearch.processor.TextImageEmbeddingProcessor;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationFactory;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombiner;
+import org.opensearch.neuralsearch.processor.factory.RRFFactory;
 import org.opensearch.neuralsearch.processor.factory.TextChunkingProcessorFactory;
 import org.opensearch.neuralsearch.processor.factory.NormalizationProcessorFactory;
 import org.opensearch.neuralsearch.processor.factory.RerankProcessorFactory;
@@ -47,6 +48,7 @@ import org.opensearch.neuralsearch.processor.factory.TextImageEmbeddingProcessor
 import org.opensearch.neuralsearch.processor.normalization.ScoreNormalizationFactory;
 import org.opensearch.neuralsearch.processor.normalization.ScoreNormalizer;
 import org.opensearch.neuralsearch.processor.rerank.RerankProcessor;
+import org.opensearch.neuralsearch.processor.rrf.RRFProcessor;
 import org.opensearch.neuralsearch.query.HybridQueryBuilder;
 import org.opensearch.neuralsearch.query.NeuralQueryBuilder;
 import org.opensearch.neuralsearch.query.NeuralSparseQueryBuilder;
@@ -154,7 +156,9 @@ public class NeuralSearch extends Plugin implements ActionPlugin, SearchPlugin, 
     ) {
         return Map.of(
             NormalizationProcessor.TYPE,
-            new NormalizationProcessorFactory(normalizationProcessorWorkflow, scoreNormalizationFactory, scoreCombinationFactory)
+            new NormalizationProcessorFactory(normalizationProcessorWorkflow, scoreNormalizationFactory, scoreCombinationFactory),
+            RRFProcessor.TYPE,
+            new RRFFactory()
         );
     }
 
