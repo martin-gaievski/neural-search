@@ -51,6 +51,7 @@ import org.opensearch.neuralsearch.query.HybridQueryBuilder;
 import org.opensearch.neuralsearch.query.NeuralQueryBuilder;
 import org.opensearch.neuralsearch.query.NeuralSparseQueryBuilder;
 import org.opensearch.neuralsearch.query.ext.RerankSearchExtBuilder;
+import org.opensearch.neuralsearch.search.fetch.ExplainNormalizationPhase;
 import org.opensearch.neuralsearch.search.query.HybridQueryPhaseSearcher;
 import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
 import org.opensearch.plugins.ActionPlugin;
@@ -61,6 +62,7 @@ import org.opensearch.plugins.SearchPipelinePlugin;
 import org.opensearch.plugins.SearchPlugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
+import org.opensearch.search.fetch.FetchSubPhase;
 import org.opensearch.search.pipeline.SearchPhaseResultsProcessor;
 import org.opensearch.search.pipeline.SearchRequestProcessor;
 import org.opensearch.search.pipeline.SearchResponseProcessor;
@@ -194,5 +196,11 @@ public class NeuralSearch extends Plugin implements ActionPlugin, SearchPlugin, 
                 parser -> RerankSearchExtBuilder.parse(parser)
             )
         );
+    }
+
+    @Override
+    public List<FetchSubPhase> getFetchSubPhases(FetchPhaseConstructionContext context) {
+        ExplainNormalizationPhase explainNormalizationPhase = new ExplainNormalizationPhase();
+        return List.of(explainNormalizationPhase);
     }
 }

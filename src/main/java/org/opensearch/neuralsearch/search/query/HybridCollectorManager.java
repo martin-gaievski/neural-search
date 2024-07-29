@@ -67,6 +67,7 @@ public abstract class HybridCollectorManager implements CollectorManager<Collect
     private final TopDocsMerger topDocsMerger;
     @Nullable
     private final FieldDoc after;
+    private final SearchContext searchContext;
 
     /**
      * Create new instance of HybridCollectorManager depending on the concurrent search beeing enabled or disabled.
@@ -103,7 +104,8 @@ public abstract class HybridCollectorManager implements CollectorManager<Collect
                 trackTotalHitsUpTo,
                 searchContext.sort(),
                 filteringWeight,
-                searchContext.searchAfter()
+                searchContext.searchAfter(),
+                searchContext
             )
             : new HybridCollectorNonConcurrentManager(
                 numDocs,
@@ -111,7 +113,8 @@ public abstract class HybridCollectorManager implements CollectorManager<Collect
                 trackTotalHitsUpTo,
                 searchContext.sort(),
                 filteringWeight,
-                searchContext.searchAfter()
+                searchContext.searchAfter(),
+                searchContext
             );
     }
 
@@ -417,7 +420,8 @@ public abstract class HybridCollectorManager implements CollectorManager<Collect
             int trackTotalHitsUpTo,
             SortAndFormats sortAndFormats,
             Weight filteringWeight,
-            ScoreDoc searchAfter
+            ScoreDoc searchAfter,
+            SearchContext searchContext
         ) {
             super(
                 numHits,
@@ -426,7 +430,8 @@ public abstract class HybridCollectorManager implements CollectorManager<Collect
                 sortAndFormats,
                 filteringWeight,
                 new TopDocsMerger(sortAndFormats),
-                (FieldDoc) searchAfter
+                (FieldDoc) searchAfter,
+                searchContext
             );
             scoreCollector = Objects.requireNonNull(super.newCollector(), "collector for hybrid query cannot be null");
         }
@@ -455,7 +460,8 @@ public abstract class HybridCollectorManager implements CollectorManager<Collect
             int trackTotalHitsUpTo,
             SortAndFormats sortAndFormats,
             Weight filteringWeight,
-            ScoreDoc searchAfter
+            ScoreDoc searchAfter,
+            SearchContext searchContext
         ) {
             super(
                 numHits,
@@ -464,7 +470,8 @@ public abstract class HybridCollectorManager implements CollectorManager<Collect
                 sortAndFormats,
                 filteringWeight,
                 new TopDocsMerger(sortAndFormats),
-                (FieldDoc) searchAfter
+                (FieldDoc) searchAfter,
+                searchContext
             );
         }
     }

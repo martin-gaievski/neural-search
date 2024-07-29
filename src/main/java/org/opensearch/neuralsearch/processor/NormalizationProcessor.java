@@ -11,6 +11,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
+import org.apache.lucene.search.Explanation;
 import org.opensearch.action.search.QueryPhaseResultConsumer;
 import org.opensearch.action.search.SearchPhaseContext;
 import org.opensearch.action.search.SearchPhaseName;
@@ -21,6 +22,7 @@ import org.opensearch.search.SearchPhaseResult;
 import org.opensearch.search.fetch.FetchSearchResult;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.pipeline.SearchPhaseResultsProcessor;
+import org.opensearch.search.query.ExplainResult;
 import org.opensearch.search.query.QuerySearchResult;
 
 import lombok.AllArgsConstructor;
@@ -52,11 +54,23 @@ public class NormalizationProcessor implements SearchPhaseResultsProcessor {
         final SearchPhaseResults<Result> searchPhaseResult,
         final SearchPhaseContext searchPhaseContext
     ) {
+        boolean explain = searchPhaseContext.getRequest().source().explain() == null
+            ? false
+            : searchPhaseContext.getRequest().source().explain();
         if (shouldSkipProcessor(searchPhaseResult)) {
             log.debug("Query results are not compatible with normalization processor");
             return;
         }
         List<QuerySearchResult> querySearchResults = getQueryPhaseSearchResults(searchPhaseResult);
+        if (explain) {
+            Explanation explanation = Explanation.match(0.0f, "normalization processor");
+            QuerySearchResult querySearchResult = querySearchResults.get(0);
+            if (Objects.isNull(querySearchResult.getExplainResult())) {
+                ExplainResult explainResult = new ExplainResult();
+                explainResult.getExplanationList().add(explanation);
+                querySearchResult.setExplainResult(explainResult);
+            }
+        }
         Optional<FetchSearchResult> fetchSearchResult = getFetchSearchResults(searchPhaseResult);
         normalizationWorkflow.execute(querySearchResults, fetchSearchResult, normalizationTechnique, combinationTechnique);
     }
