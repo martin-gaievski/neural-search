@@ -13,6 +13,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
+import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.Sort;
@@ -27,6 +28,7 @@ import org.opensearch.neuralsearch.processor.normalization.ScoreNormalizer;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.fetch.FetchSearchResult;
+import org.opensearch.search.query.ExplainResult;
 import org.opensearch.search.query.QuerySearchResult;
 
 import lombok.AllArgsConstructor;
@@ -45,6 +47,15 @@ public class NormalizationProcessorWorkflow {
     private final ScoreNormalizer scoreNormalizer;
     private final ScoreCombiner scoreCombiner;
 
+    public void execute(
+        final List<QuerySearchResult> querySearchResults,
+        final Optional<FetchSearchResult> fetchSearchResultOptional,
+        final ScoreNormalizationTechnique normalizationTechnique,
+        final ScoreCombinationTechnique combinationTechnique
+    ) {
+        execute(querySearchResults, fetchSearchResultOptional, normalizationTechnique, combinationTechnique, false);
+    }
+
     /**
      * Start execution of this workflow
      * @param querySearchResults input data with QuerySearchResult from multiple shards
@@ -55,7 +66,8 @@ public class NormalizationProcessorWorkflow {
         final List<QuerySearchResult> querySearchResults,
         final Optional<FetchSearchResult> fetchSearchResultOptional,
         final ScoreNormalizationTechnique normalizationTechnique,
-        final ScoreCombinationTechnique combinationTechnique
+        final ScoreCombinationTechnique combinationTechnique,
+        boolean explain
     ) {
         // save original state
         List<Integer> unprocessedDocIds = unprocessedDocIds(querySearchResults);
@@ -83,6 +95,23 @@ public class NormalizationProcessorWorkflow {
         log.debug("Post-process query results after score normalization and combination");
         updateOriginalQueryResults(combineScoresDTO);
         updateOriginalFetchResults(querySearchResults, fetchSearchResultOptional, unprocessedDocIds);
+        if (explain) {
+            String explanationDetailsMessage = String.format(
+                Locale.ROOT,
+                "normalization processor with normalization technique [%s] and combination technique [%s]",
+                combinationTechnique,
+                normalizationTechnique
+            );
+            Explanation explanation = Explanation.match(0.0f, explanationDetailsMessage);
+            for (QuerySearchResult querySearchResult : querySearchResults) {
+                if (Objects.isNull(querySearchResult.getExplainResult())) {
+                    ExplainResult explainResult = new ExplainResult();
+                    explainResult.setExplanation(explanation);
+                    querySearchResult.setExplainResult(explainResult);
+                }
+                querySearchResult.getExplainResult().setExplanation(explanation);
+            }
+        }
     }
 
     /**

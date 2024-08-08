@@ -12,8 +12,6 @@ import org.opensearch.search.fetch.FetchSubPhaseProcessor;
 import org.opensearch.search.query.ExplainResult;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Objects;
 
 public class ExplainNormalizationPhase implements FetchSubPhase {
@@ -36,14 +34,14 @@ public class ExplainNormalizationPhase implements FetchSubPhase {
                 ExplainResult coordinatorLevelExplain = context.getQueryResult().getExplainResult();
                 Explanation searchQueryExplanation = hitContext.hit().getExplanation();
                 if (Objects.nonNull(searchQueryExplanation)) {
-                    List<Explanation> explanationList = new ArrayList<>(coordinatorLevelExplain.getExplanationList());
-                    explanationList.add(searchQueryExplanation);
-                    Explanation topLevelExplanation = Explanation.match(
-                        searchQueryExplanation.getValue(),
-                        "hybrid query match: ",
-                        coordinatorLevelExplain.getExplanationList().toArray(new Explanation[0])
+                    Explanation explanation = coordinatorLevelExplain.getExplanation();
+                    Explanation combinedExplanation = Explanation.match(
+                        1.0,
+                        "combined explannation of search and coordinator levels",
+                        explanation,
+                        searchQueryExplanation
                     );
-                    hitContext.hit().explanation(topLevelExplanation);
+                    hitContext.hit().explanation(combinedExplanation);
                 }
                 // we use the top level doc id, since we work with the top level searcher
             }
