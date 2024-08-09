@@ -114,7 +114,7 @@ public class NormalizationProcessorTests extends OpenSearchTestCase {
             new NormalizationProcessorWorkflow(new ScoreNormalizer(), new ScoreCombiner())
         );
 
-        assertEquals(DESCRIPTION, normalizationProcessor.getDescription());
+        assertEquals(DESCRIPTION, normalizationProcessor.description());
         assertEquals(PROCESSOR_TAG, normalizationProcessor.getTag());
         assertEquals(SearchPhaseName.FETCH, normalizationProcessor.getAfterPhase());
         assertEquals(SearchPhaseName.QUERY, normalizationProcessor.getBeforePhase());
