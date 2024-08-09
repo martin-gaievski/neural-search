@@ -367,7 +367,7 @@ public class MLOpenSearchRerankProcessorTests extends OpenSearchTestCase {
 
     public void testBasics() throws IOException {
         assert (processor.getTag().equals("rerank processor"));
-        assert (processor.getDescription().equals("processor for reranking with a cross encoder"));
+        assert (processor.description().equals("processor for reranking with a cross encoder"));
         assert (!processor.isIgnoreFailure());
         assertThrows(
             "Use asyncProcessResponse unless you can guarantee to not deadlock yourself",
