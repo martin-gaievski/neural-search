@@ -76,6 +76,14 @@ task testAgainstOldCluster(type: StandaloneRestIntegTestTask) {
         }
     }
 
+    // Excluding the test because hybrid query with rescore is not compatible with 2.14 and lower
+    if (ext.neural_search_bwc_version.startsWith("2.11") || ext.neural_search_bwc_version.startsWith("2.12")
+        || ext.neural_search_bwc_version.startsWith("2.13") || ext.neural_search_bwc_version.startsWith("2.14")) {
+        filter {
+            excludeTestsMatching "org.opensearch.neuralsearch.bwc.HybridSearchIT.testNormalizationProcessorWithRescore_whenIndexWithMultipleShards_E2EFlow"
+        }
+    }
+
     // Excluding the test because we introduce this feature in 2.13
     if (ext.neural_search_bwc_version.startsWith("2.11") || ext.neural_search_bwc_version.startsWith("2.12")){
         filter {
