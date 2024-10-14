@@ -10,12 +10,13 @@ import java.util.Map;
 import java.util.Set;
 
 import lombok.ToString;
+import org.opensearch.neuralsearch.processor.ExplainableTechnique;
 
 /**
  * Abstracts combination of scores based on arithmetic mean method
  */
 @ToString(onlyExplicitlyIncluded = true)
-public class ArithmeticMeanScoreCombinationTechnique implements ScoreCombinationTechnique {
+public class ArithmeticMeanScoreCombinationTechnique implements ScoreCombinationTechnique, ExplainableTechnique {
     @ToString.Include
     public static final String TECHNIQUE_NAME = "arithmetic_mean";
     public static final String PARAM_NAME_WEIGHTS = "weights";
@@ -32,7 +33,7 @@ public class ArithmeticMeanScoreCombinationTechnique implements ScoreCombination
 
     @Override
     public String describe() {
-        return String.format(Locale.ROOT, "combination technique %s [%s]", TECHNIQUE_NAME, "score = (score1 + score2 + ... + scoreN)/N");
+        return String.format(Locale.ROOT, "combination technique [%s] with optional parameters [%s]", TECHNIQUE_NAME, weights);
     }
 
     /**

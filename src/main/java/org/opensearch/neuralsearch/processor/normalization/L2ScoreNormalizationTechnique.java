@@ -18,12 +18,13 @@ import org.opensearch.neuralsearch.processor.CompoundTopDocs;
 
 import lombok.ToString;
 import org.opensearch.neuralsearch.processor.DocIdAtQueryPhase;
+import org.opensearch.neuralsearch.processor.ExplainableTechnique;
 
 /**
  * Abstracts normalization of scores based on L2 method
  */
 @ToString(onlyExplicitlyIncluded = true)
-public class L2ScoreNormalizationTechnique implements ScoreNormalizationTechnique {
+public class L2ScoreNormalizationTechnique implements ScoreNormalizationTechnique, ExplainableTechnique {
     @ToString.Include
     public static final String TECHNIQUE_NAME = "l2";
     private static final float MIN_SCORE = 0.0f;
@@ -55,17 +56,10 @@ public class L2ScoreNormalizationTechnique implements ScoreNormalizationTechniqu
         }
     }
 
-    @Override
     public String describe() {
-        return String.format(
-            Locale.ROOT,
-            "normalization technique %s [%s]",
-            TECHNIQUE_NAME,
-            "score = score/sqrt(score1^2 + score2^2 + ... + scoreN^2)"
-        );
+        return String.format(Locale.ROOT, "normalization technique [%s]", TECHNIQUE_NAME);
     }
 
-    @Override
     public Map<DocIdAtQueryPhase, String> explain(List<CompoundTopDocs> queryTopDocs) {
         Map<DocIdAtQueryPhase, List<Float>> normalizedScores = new HashMap<>();
         Map<DocIdAtQueryPhase, List<Float>> sourceScores = new HashMap<>();
@@ -79,21 +73,18 @@ public class L2ScoreNormalizationTechnique implements ScoreNormalizationTechniqu
             for (int j = 0; j < topDocsPerSubQuery.size(); j++) {
                 TopDocs subQueryTopDoc = topDocsPerSubQuery.get(j);
                 for (ScoreDoc scoreDoc : subQueryTopDoc.scoreDocs) {
-                    normalizedScores.computeIfAbsent(
-                        new DocIdAtQueryPhase(scoreDoc.doc, compoundQueryTopDocs.getSearchShard()),
-                        k -> new ArrayList<>()
-                    ).add(normalizeSingleScore(scoreDoc.score, normsPerSubquery.get(j)));
-                    sourceScores.computeIfAbsent(
-                        new DocIdAtQueryPhase(scoreDoc.doc, compoundQueryTopDocs.getSearchShard()),
-                        k -> new ArrayList<>()
-                    ).add(scoreDoc.score);
+                    DocIdAtQueryPhase docIdAtQueryPhase = new DocIdAtQueryPhase(scoreDoc.doc, compoundQueryTopDocs.getSearchShard());
+                    float normalizedScore = normalizeSingleScore(scoreDoc.score, normsPerSubquery.get(j));
+                    normalizedScores.computeIfAbsent(docIdAtQueryPhase, k -> new ArrayList<>()).add(scoreDoc.score);
+                    sourceScores.computeIfAbsent(docIdAtQueryPhase, k -> new ArrayList<>()).add(scoreDoc.score);
+                    scoreDoc.score = normalizedScore;
                 }
             }
         }
         Map<DocIdAtQueryPhase, String> explain = sourceScores.entrySet().stream().collect(Collectors.toMap(Map.Entry::getKey, entry -> {
             List<Float> srcScores = entry.getValue();
             List<Float> normScores = normalizedScores.get(entry.getKey());
-            return "source scores " + srcScores + " normalized scores " + normScores;
+            return String.format("source scores %s normalized scores %s", srcScores, normScores);
         }));
         return explain;
     }

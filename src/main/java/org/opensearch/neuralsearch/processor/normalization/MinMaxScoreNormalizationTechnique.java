@@ -21,12 +21,13 @@ import com.google.common.primitives.Floats;
 
 import lombok.ToString;
 import org.opensearch.neuralsearch.processor.DocIdAtQueryPhase;
+import org.opensearch.neuralsearch.processor.ExplainableTechnique;
 
 /**
  * Abstracts normalization of scores based on min-max method
  */
 @ToString(onlyExplicitlyIncluded = true)
-public class MinMaxScoreNormalizationTechnique implements ScoreNormalizationTechnique {
+public class MinMaxScoreNormalizationTechnique implements ScoreNormalizationTechnique, ExplainableTechnique {
     @ToString.Include
     public static final String TECHNIQUE_NAME = "min_max";
     private static final float MIN_SCORE = 0.001f;
@@ -69,17 +70,10 @@ public class MinMaxScoreNormalizationTechnique implements ScoreNormalizationTech
         }
     }
 
-    @Override
     public String describe() {
-        return String.format(
-            Locale.ROOT,
-            "normalization technique %s [%s]",
-            TECHNIQUE_NAME,
-            "score = (score - min_score)/(max_score - min_score)"
-        );
+        return String.format(Locale.ROOT, "normalization technique [%s]", TECHNIQUE_NAME);
     }
 
-    @Override
     public Map<DocIdAtQueryPhase, String> explain(List<CompoundTopDocs> queryTopDocs) {
         Map<DocIdAtQueryPhase, List<Float>> normalizedScores = new HashMap<>();
         Map<DocIdAtQueryPhase, List<Float>> sourceScores = new HashMap<>();
@@ -106,14 +100,11 @@ public class MinMaxScoreNormalizationTechnique implements ScoreNormalizationTech
             for (int j = 0; j < topDocsPerSubQuery.size(); j++) {
                 TopDocs subQueryTopDoc = topDocsPerSubQuery.get(j);
                 for (ScoreDoc scoreDoc : subQueryTopDoc.scoreDocs) {
-                    normalizedScores.computeIfAbsent(
-                        new DocIdAtQueryPhase(scoreDoc.doc, compoundQueryTopDocs.getSearchShard()),
-                        k -> new ArrayList<>()
-                    ).add(normalizeSingleScore(scoreDoc.score, minScoresPerSubquery[j], maxScoresPerSubquery[j]));
-                    sourceScores.computeIfAbsent(
-                        new DocIdAtQueryPhase(scoreDoc.doc, compoundQueryTopDocs.getSearchShard()),
-                        k -> new ArrayList<>()
-                    ).add(scoreDoc.score);
+                    DocIdAtQueryPhase docIdAtQueryPhase = new DocIdAtQueryPhase(scoreDoc.doc, compoundQueryTopDocs.getSearchShard());
+                    float normalizedScore = normalizeSingleScore(scoreDoc.score, minScoresPerSubquery[j], maxScoresPerSubquery[j]);
+                    normalizedScores.computeIfAbsent(docIdAtQueryPhase, k -> new ArrayList<>()).add(normalizedScore);
+                    sourceScores.computeIfAbsent(docIdAtQueryPhase, k -> new ArrayList<>()).add(scoreDoc.score);
+                    scoreDoc.score = normalizedScore;
                 }
             }
         }
@@ -121,7 +112,7 @@ public class MinMaxScoreNormalizationTechnique implements ScoreNormalizationTech
         Map<DocIdAtQueryPhase, String> explain = sourceScores.entrySet().stream().collect(Collectors.toMap(Map.Entry::getKey, entry -> {
             List<Float> srcScores = entry.getValue();
             List<Float> normScores = normalizedScores.get(entry.getKey());
-            return "source scores " + srcScores + " normalized scores " + normScores;
+            return String.format("source scores %s normalized scores %s", srcScores, normScores);
         }));
         return explain;
     }
