@@ -4,7 +4,13 @@
  */
 package org.opensearch.neuralsearch.query;
 
-import lombok.Getter;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.search.DisiPriorityQueue;
 import org.apache.lucene.search.DisiWrapper;
@@ -14,15 +20,10 @@ import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.TwoPhaseIterator;
 import org.apache.lucene.search.Weight;
+
+import lombok.Getter;
 import org.apache.lucene.util.PriorityQueue;
 import org.opensearch.neuralsearch.search.HybridDisiWrapper;
-
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.List;
-import java.util.Objects;
 
 /**
  * Class abstracts functionality of Scorer for hybrid query. When iterating over documents in increasing
@@ -97,8 +98,13 @@ public final class HybridQueryScorer extends Scorer {
      */
     @Override
     public float score() throws IOException {
+        return score(getSubMatches());
+    }
+
+    private float score(DisiWrapper topList) throws IOException {
         float totalScore = 0.0f;
-        for (DisiWrapper disiWrapper : subScorersPQ) {
+        for (DisiWrapper disiWrapper = topList; disiWrapper != null; disiWrapper = disiWrapper.next) {
+            // check if this doc has match in the subQuery. If not, add score as 0.0 and continue
             if (disiWrapper.scorer.docID() == DocIdSetIterator.NO_MORE_DOCS) {
                 continue;
             }
