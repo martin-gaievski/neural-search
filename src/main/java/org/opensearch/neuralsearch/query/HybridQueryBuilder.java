@@ -109,7 +109,14 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      */
     @Override
     protected Query doToQuery(QueryShardContext queryShardContext) throws IOException {
-        Collection<Query> queryCollection = toQueries(queries, queryShardContext);
+        Collection<Query> queryCollection = new ArrayList<>();
+        for (QueryBuilder query : queries) {
+            Query luceneQuery = query.toQuery(queryShardContext);
+            if (luceneQuery != null) {
+                queryCollection.add(luceneQuery);
+            }
+        }
+        // Collection<Query> queryCollection = toQueries(queries, queryShardContext);
         if (queryCollection.isEmpty()) {
             return Queries.newMatchNoDocsQuery(String.format(Locale.ROOT, "no clauses for %s query", NAME));
         }
@@ -236,9 +243,8 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             newBuilder.queryName(queryName);
             newBuilder.boost(boost);
             return newBuilder;
-        } else {
-            return this;
         }
+        return this;
     }
 
     /**

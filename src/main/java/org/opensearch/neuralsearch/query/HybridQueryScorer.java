@@ -8,12 +8,12 @@ import lombok.Getter;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.search.DisiPriorityQueue;
 import org.apache.lucene.search.DisiWrapper;
-import org.apache.lucene.search.DisjunctionDISIApproximation;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.TwoPhaseIterator;
 import org.apache.lucene.search.Weight;
+import org.apache.lucene.util.MathUtil;
 import org.apache.lucene.util.PriorityQueue;
 import org.opensearch.neuralsearch.search.HybridDisiWrapper;
 
@@ -97,8 +97,13 @@ public final class HybridQueryScorer extends Scorer {
      */
     @Override
     public float score() throws IOException {
+        return score(getSubMatches());
+    }
+
+    private float score(DisiWrapper topList) throws IOException {
         float totalScore = 0.0f;
-        for (DisiWrapper disiWrapper : subScorersPQ) {
+        for (DisiWrapper disiWrapper = topList; disiWrapper != null; disiWrapper = disiWrapper.next) {
+            // check if this doc has match in the subQuery. If not, add score as 0.0 and continue
             if (disiWrapper.scorer.docID() == DocIdSetIterator.NO_MORE_DOCS) {
                 continue;
             }
@@ -141,13 +146,24 @@ public final class HybridQueryScorer extends Scorer {
      */
     @Override
     public float getMaxScore(int upTo) throws IOException {
-        return subScorers.stream().filter(Objects::nonNull).filter(scorer -> scorer.docID() <= upTo).map(scorer -> {
+        /*return subScorers.stream().filter(Objects::nonNull).filter(scorer -> scorer.docID() <= upTo).map(scorer -> {
             try {
                 return scorer.getMaxScore(upTo);
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
-        }).max(Float::compare).orElse(0.0f);
+        }).max(Float::compare).orElse(0.0f);*/
+        double maxScoreSum = 0;
+        int count = 0;
+        for (Scorer scorer : subScorers) {
+            if (scorer != null) {
+                if (scorer.docID() <= upTo) {
+                    maxScoreSum += scorer.getMaxScore(upTo);
+                }
+                count++;
+            }
+        }
+        return (float) MathUtil.sumUpperBound(maxScoreSum, count);
     }
 
     @Override
@@ -310,33 +326,57 @@ public final class HybridQueryScorer extends Scorer {
      * sub iterators that return empty results
      */
     static class HybridSubqueriesDISIApproximation extends DocIdSetIterator {
-        final DocIdSetIterator docIdSetIterator;
+        // final DocIdSetIterator docIdSetIterator;
         final DisiPriorityQueue subIterators;
+        final long cost;
 
         public HybridSubqueriesDISIApproximation(final DisiPriorityQueue subIterators) {
-            docIdSetIterator = new DisjunctionDISIApproximation(subIterators);
+            // docIdSetIterator = new DisjunctionDISIApproximation(subIterators);
+            long cost = 0;
+            for (DisiWrapper w : subIterators) {
+                if (w != null) {
+                    cost += w.cost;
+                }
+            }
             this.subIterators = subIterators;
+            this.cost = cost;
         }
 
         @Override
         public long cost() {
-            return docIdSetIterator.cost();
+            // return docIdSetIterator.cost();
+            return cost;
         }
 
         @Override
         public int docID() {
+            /*if (subIterators.size() == 0) {
+                return NO_MORE_DOCS;
+            }
+            return docIdSetIterator.docID();*/
             if (subIterators.size() == 0) {
                 return NO_MORE_DOCS;
             }
-            return docIdSetIterator.docID();
+            return subIterators.top().doc;
         }
 
         @Override
         public int nextDoc() throws IOException {
+            /*if (subIterators.size() == 0) {
+                return NO_MORE_DOCS;
+            }
+            return docIdSetIterator.nextDoc();*/
             if (subIterators.size() == 0) {
                 return NO_MORE_DOCS;
             }
-            return docIdSetIterator.nextDoc();
+            DisiWrapper top = subIterators.top();
+            final int doc = top.doc;
+            do {
+                top.doc = top.approximation.nextDoc();
+                top = subIterators.updateTop();
+            } while (top.doc == doc);
+
+            return top.doc;
         }
 
         @Override
@@ -344,7 +384,14 @@ public final class HybridQueryScorer extends Scorer {
             if (subIterators.size() == 0) {
                 return NO_MORE_DOCS;
             }
-            return docIdSetIterator.advance(target);
+            // return docIdSetIterator.advance(target);
+            DisiWrapper top = subIterators.top();
+            do {
+                top.doc = top.approximation.advance(target);
+                top = subIterators.updateTop();
+            } while (top.doc < target);
+
+            return top.doc;
         }
     }
 }

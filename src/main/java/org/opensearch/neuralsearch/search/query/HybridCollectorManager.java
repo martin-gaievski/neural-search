@@ -31,8 +31,11 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.apache.lucene.search.TotalHits.Relation;
 import static org.opensearch.neuralsearch.search.query.TopDocsMerger.TOP_DOCS_MERGER_TOP_SCORES;
@@ -126,11 +129,8 @@ public abstract class HybridCollectorManager implements CollectorManager<Collect
         DocValueFormat[] docValueFormats = getSortValueFormats(sortAndFormats);
         for (HybridTopScoreDocCollector hybridTopScoreDocCollector : hybridTopScoreDocCollectors) {
             List<TopDocs> topDocs = hybridTopScoreDocCollector.topDocs();
-            TopDocs newTopDocs = getNewTopDocs(
-                getTotalHits(this.trackTotalHitsUpTo, topDocs, hybridTopScoreDocCollector.getTotalHits()),
-                topDocs
-            );
-            TopDocsAndMaxScore topDocsAndMaxScore = new TopDocsAndMaxScore(newTopDocs, hybridTopScoreDocCollector.getMaxScore());
+            TopDocs newTopDocs = getNewTopDocs(getTotalHits(this.trackTotalHitsUpTo, topDocs), topDocs);
+            TopDocsAndMaxScore topDocsAndMaxScore = new TopDocsAndMaxScore(newTopDocs, getMaxScore(topDocs));
 
             results.add((QuerySearchResult result) -> reduceCollectorResults(result, topDocsAndMaxScore, docValueFormats, newTopDocs));
         }
@@ -202,7 +202,7 @@ public abstract class HybridCollectorManager implements CollectorManager<Collect
         return new TopDocs(totalHits, scoreDocs);
     }
 
-    private TotalHits getTotalHits(int trackTotalHitsUpTo, final List<TopDocs> topDocs, final long maxTotalHits) {
+    private TotalHits getTotalHits(int trackTotalHitsUpTo, final List<TopDocs> topDocs) {
         final Relation relation = trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_DISABLED
             ? Relation.GREATER_THAN_OR_EQUAL_TO
             : Relation.EQUAL_TO;
@@ -210,7 +210,29 @@ public abstract class HybridCollectorManager implements CollectorManager<Collect
             return new TotalHits(0, relation);
         }
 
+        List<ScoreDoc[]> scoreDocs = topDocs.stream()
+            .map(topdDoc -> topdDoc.scoreDocs)
+            .filter(Objects::nonNull)
+            .collect(Collectors.toList());
+        Set<Integer> uniqueDocIds = new HashSet<>();
+        for (ScoreDoc[] scoreDocsArray : scoreDocs) {
+            uniqueDocIds.addAll(Arrays.stream(scoreDocsArray).map(scoreDoc -> scoreDoc.doc).collect(Collectors.toList()));
+        }
+        long maxTotalHits = uniqueDocIds.size();
+
         return new TotalHits(maxTotalHits, relation);
+    }
+
+    private float getMaxScore(final List<TopDocs> topDocs) {
+        if (topDocs.isEmpty()) {
+            return 0.0f;
+        } else {
+            return topDocs.stream()
+                .map(docs -> docs.scoreDocs.length == 0 ? new ScoreDoc(-1, 0.0f) : docs.scoreDocs[0])
+                .map(scoreDoc -> scoreDoc.score)
+                .max(Float::compare)
+                .get();
+        }
     }
 
     private DocValueFormat[] getSortValueFormats(final SortAndFormats sortAndFormats) {

@@ -10,9 +10,12 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.Callable;
 import java.util.stream.Collectors;
+import java.util.stream.LongStream;
+import java.util.stream.StreamSupport;
 
 import lombok.RequiredArgsConstructor;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.search.BulkScorer;
 import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Matches;
@@ -21,6 +24,7 @@ import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.Weight;
+import org.apache.lucene.util.PriorityQueue;
 import org.opensearch.neuralsearch.executors.HybridQueryExecutor;
 import org.opensearch.neuralsearch.executors.HybridQueryExecutorCollector;
 import org.opensearch.neuralsearch.executors.HybridQueryScoreSupplierCollectorManager;
@@ -31,6 +35,33 @@ import static org.opensearch.neuralsearch.query.HybridQueryBuilder.MAX_NUMBER_OF
  * Calculates query weights and build query scorers for hybrid query.
  */
 public final class HybridQueryWeight extends Weight {
+
+    @Override
+    public BulkScorer bulkScorer(LeafReaderContext context) throws IOException {
+        final BulkScorer bulkScorer = hybridScorer(context);
+        if (bulkScorer != null) {
+            // bulk scoring is applicable, use it
+            return bulkScorer;
+        } else {
+            // use a Scorer-based impl (BS2)
+            return super.bulkScorer(context);
+        }
+    }
+
+    BulkScorer hybridScorer(LeafReaderContext context) throws IOException {
+        List<BulkScorer> optional = new ArrayList<>();
+        for (Weight w : weights) {
+            BulkScorer subScorer = w.bulkScorer(context);
+
+            if (subScorer != null) {
+                optional.add(subScorer);
+            }
+        }
+        if (optional.isEmpty()) {
+            return null;
+        }
+        return new HybridBulkScorer(this, optional, 1, true);
+    }
 
     // The Weights for our subqueries, in 1-1 correspondence
     private final List<Weight> weights;
@@ -62,14 +93,19 @@ public final class HybridQueryWeight extends Weight {
      */
     @Override
     public Matches matches(LeafReaderContext context, int doc) throws IOException {
-        List<Matches> mis = weights.stream().map(weight -> {
-            try {
-                return weight.matches(context, doc);
-            } catch (IOException e) {
-                throw new RuntimeException(e);
+        List<Matches> mis = new ArrayList<>();
+        int countMatches = 0;
+        for (Weight w : weights) {
+            Matches m = w.matches(context, doc);
+            if (m != null) {
+                countMatches++;
+                mis.add(m);
             }
-        }).filter(Objects::nonNull).collect(Collectors.toList());
-        return MatchesUtils.fromSubMatches(mis);
+        }
+        if (countMatches == MAX_NUMBER_OF_SUB_QUERIES) {
+            return MatchesUtils.fromSubMatches(mis);
+        }
+        return null;
     }
 
     /**
@@ -170,20 +206,38 @@ public final class HybridQueryWeight extends Weight {
                 }
             }
             return new HybridQueryScorer(weight, tScorers, scoreMode);
+            // return new DisjunctionSumScorer(weight, tScorers, scoreMode);
         }
 
         @Override
         public long cost() {
             if (cost == -1) {
                 long cost = 0;
-                for (ScorerSupplier ss : scorerSuppliers) {
+
+                /*for (ScorerSupplier ss : scorerSuppliers) {
                     if (Objects.nonNull(ss)) {
                         cost += ss.cost();
                     }
-                }
+                }*/
+                cost = computeCost(
+                    scorerSuppliers.stream().map(ScorerSupplier::cost).mapToLong(Number::longValue),
+                    scorerSuppliers.size(),
+                    1
+                );
                 this.cost = cost;
             }
             return cost;
+        }
+
+        static long computeCost(LongStream costs, int numScorers, int minShouldMatch) {
+            final PriorityQueue<Long> pq = new PriorityQueue<>(numScorers - minShouldMatch + 1) {
+                @Override
+                protected boolean lessThan(Long a, Long b) {
+                    return a > b;
+                }
+            };
+            costs.forEach(pq::insertWithOverflow);
+            return StreamSupport.stream(pq.spliterator(), false).mapToLong(Number::longValue).sum();
         }
 
         @Override
