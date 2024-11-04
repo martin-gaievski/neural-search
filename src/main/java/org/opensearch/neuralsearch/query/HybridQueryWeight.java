@@ -13,6 +13,7 @@ import java.util.stream.Collectors;
 
 import lombok.RequiredArgsConstructor;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.search.BulkScorer;
 import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Matches;
@@ -122,6 +123,15 @@ public final class HybridQueryWeight extends Weight {
         }
         supplier.setTopLevelScoringClause();
         return supplier.get(Long.MAX_VALUE);
+    }
+
+    @Override
+    public BulkScorer bulkScorer(LeafReaderContext context) throws IOException {
+        Scorer scorer = scorer(context);
+        if (scorer == null) {
+            return null;
+        }
+        return new HybridBulkScorer(scorer.iterator(), scorer);
     }
 
     /**
