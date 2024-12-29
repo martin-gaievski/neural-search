@@ -7,9 +7,7 @@ package org.opensearch.neuralsearch.query;
 import com.google.common.annotations.VisibleForTesting;
 import lombok.Getter;
 import lombok.extern.log4j.Log4j2;
-import org.apache.lucene.search.DisiPriorityQueue;
 import org.apache.lucene.search.DisiWrapper;
-import org.apache.lucene.search.DisjunctionDISIApproximation;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
@@ -17,6 +15,8 @@ import org.apache.lucene.search.TwoPhaseIterator;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.util.PriorityQueue;
 import org.opensearch.neuralsearch.search.HybridDisiWrapper;
+import org.opensearch.neuralsearch.search.SimpleDisiIterator;
+import org.opensearch.neuralsearch.search.SimpleDisjunctionDISIApproximation;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -37,7 +37,8 @@ public class HybridQueryScorer extends Scorer {
     @Getter
     private final List<Scorer> subScorers;
 
-    private final DisiPriorityQueue subScorersPQ;
+    // private final DisiPriorityQueue subScorersPQ;
+    private final SimpleDisiIterator subScorersPQ;
 
     private final DocIdSetIterator approximation;
     private final HybridScoreBlockBoundaryPropagator disjunctionBlockPropagator;
@@ -207,19 +208,20 @@ public class HybridQueryScorer extends Scorer {
         return scores;
     }
 
-    private DisiPriorityQueue initializeSubScorersPQ() {
+    private SimpleDisiIterator initializeSubScorersPQ() {
         Objects.requireNonNull(subScorers, "should not be null");
         // we need to count this way in order to include all identical sub-queries
-        DisiPriorityQueue subScorersPQ = new DisiPriorityQueue(numSubqueries);
+        // DisiPriorityQueue subScorersPQ = new DisiPriorityQueue(numSubqueries);
+        List<DisiWrapper> disiWrappers = new ArrayList<>();
         for (int idx = 0; idx < numSubqueries; idx++) {
             Scorer scorer = subScorers.get(idx);
             if (scorer == null) {
                 continue;
             }
             final HybridDisiWrapper disiWrapper = new HybridDisiWrapper(scorer, idx);
-            subScorersPQ.add(disiWrapper);
+            disiWrappers.add(disiWrapper);
         }
-        return subScorersPQ;
+        return new SimpleDisiIterator(disiWrappers.toArray(new DisiWrapper[0]));
     }
 
     @Override
@@ -244,10 +246,10 @@ public class HybridQueryScorer extends Scorer {
         DisiWrapper verifiedMatches;
         // priority queue of approximations on the current doc that have not been verified yet
         final PriorityQueue<DisiWrapper> unverifiedMatches;
-        DisiPriorityQueue subScorers;
+        SimpleDisiIterator subScorers;
         boolean needsScores;
 
-        private TwoPhase(DocIdSetIterator approximation, float matchCost, DisiPriorityQueue subScorers, boolean needsScores) {
+        private TwoPhase(DocIdSetIterator approximation, float matchCost, SimpleDisiIterator subScorers, boolean needsScores) {
             super(approximation);
             this.matchCost = matchCost;
             this.subScorers = subScorers;
@@ -323,10 +325,10 @@ public class HybridQueryScorer extends Scorer {
      */
     static class HybridSubqueriesDISIApproximation extends DocIdSetIterator {
         final DocIdSetIterator docIdSetIterator;
-        final DisiPriorityQueue subIterators;
+        final SimpleDisiIterator subIterators;
 
-        public HybridSubqueriesDISIApproximation(final DisiPriorityQueue subIterators) {
-            docIdSetIterator = new DisjunctionDISIApproximation(subIterators);
+        public HybridSubqueriesDISIApproximation(final SimpleDisiIterator subIterators) {
+            docIdSetIterator = new SimpleDisjunctionDISIApproximation(subIterators);
             this.subIterators = subIterators;
         }
 
