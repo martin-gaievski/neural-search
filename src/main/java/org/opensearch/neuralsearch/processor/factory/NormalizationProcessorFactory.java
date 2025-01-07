@@ -7,6 +7,7 @@ package org.opensearch.neuralsearch.processor.factory;
 import static org.opensearch.ingest.ConfigurationUtils.readOptionalMap;
 import static org.opensearch.ingest.ConfigurationUtils.readStringProperty;
 
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 
@@ -23,6 +24,7 @@ import org.opensearch.search.pipeline.SearchPhaseResultsProcessor;
 
 import lombok.AllArgsConstructor;
 import lombok.extern.log4j.Log4j2;
+import org.opensearch.search.pipeline.SearchResponseProcessor;
 
 /**
  * Factory for query results normalization processor for search pipeline. Instantiates processor based on user provided input.
@@ -90,4 +92,28 @@ public class NormalizationProcessorFactory implements Processor.Factory<SearchPh
             normalizationProcessorWorkflow
         );
     }
+
+    @Override
+    public <D extends Processor> D dependentProcessors(
+        Map<String, Processor.Factory<D>> processorFactories,
+        String tag,
+        String description,
+        boolean ignoreFailure,
+        Map<String, Object> config,
+        Processor.PipelineContext pipelineContext
+    ) throws Exception {
+        ExplanationResponseProcessorFactory explanationResponseProcessorFactory = new ExplanationResponseProcessorFactory();
+
+        // Create a new map with the correct type
+        Map<String, Processor.Factory<SearchResponseProcessor>> convertedFactories = new HashMap<>();
+        for (Map.Entry<String, Processor.Factory<D>> entry : processorFactories.entrySet()) {
+            // This cast might need to be validated depending on your specific use case
+            @SuppressWarnings("unchecked")
+            Processor.Factory<SearchResponseProcessor> converted = (Processor.Factory<SearchResponseProcessor>) entry.getValue();
+            convertedFactories.put(entry.getKey(), converted);
+        }
+
+        return (D) explanationResponseProcessorFactory.create(convertedFactories, tag, description, ignoreFailure, config, pipelineContext);
+    }
+
 }
