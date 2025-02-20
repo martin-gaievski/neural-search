@@ -63,6 +63,7 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
         return new LeafCollector() {
             // HybridQueryScorer compoundQueryScorer;
             HybridBulkScorer.SubQueryScorer subQueryScorer;
+            float minScoreThreshold;
 
             @Override
             public void setScorer(Scorable scorer) throws IOException {
@@ -87,6 +88,7 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
                         );
                     }
                 }
+                minScoreThreshold = Float.MIN_VALUE;
             }
 
             private HybridBulkScorer.SubQueryScorer getHybridQueryScorer(final Scorable scorer) throws IOException {
@@ -141,6 +143,10 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
                 int docWithBase = doc + docBase;
                 totalHits.add(docWithBase);
 
+                if (score < minScoreThreshold) {
+                    return;
+                }
+
                 if (hitsThresholdChecker.isThresholdReached() && totalHitsRelation == TotalHits.Relation.EQUAL_TO) {
                     /*log.info(
                         "hit count threshold reached: total hits={}, threshold={}, action=updating_results",
@@ -155,30 +161,10 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
                 maxScore = Math.max(currentDoc.score, maxScore);
                 // this way we're inserting into heap and do nothing else unless we reach the capacity
                 // after that we pull out the lowest score element on each insert
-                pq.insertWithOverflow(currentDoc);
-
-                /*for (int i = 0; i < subScoresByQuery.length; i++) {
-                    float score = subScoresByQuery[i];
-                    // if score is 0.0 there is no hits for that sub-query
-                    if (score == 0) {
-                        continue;
-                    }
-                    if (hitsThresholdChecker.isThresholdReached() && totalHitsRelation == TotalHits.Relation.EQUAL_TO) {
-                        log.info(
-                            "hit count threshold reached: total hits={}, threshold={}, action=updating_results",
-                            totalHits,
-                            hitsThresholdChecker.getTotalHitsThreshold()
-                        );
-                        totalHitsRelation = TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO;
-                    }
-                    collectedHitsPerSubQuery[i]++;
-                    PriorityQueue<ScoreDoc> pq = compoundScores[i];
-                    ScoreDoc currentDoc = new ScoreDoc(doc + docBase, score);
-                    maxScore = Math.max(currentDoc.score, maxScore);
-                    // this way we're inserting into heap and do nothing else unless we reach the capacity
-                    // after that we pull out the lowest score element on each insert
-                    pq.insertWithOverflow(currentDoc);
-                }*/
+                ScoreDoc popedScoreDoc = pq.insertWithOverflow(currentDoc);
+                if (Objects.nonNull(popedScoreDoc)) {
+                    minScoreThreshold = popedScoreDoc.score;
+                }
             }
         };
     }
