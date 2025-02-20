@@ -15,6 +15,7 @@ import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.search.BulkScorer;
 import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Matches;
@@ -109,6 +110,12 @@ public final class HybridQueryWeight extends Weight {
         return null;
     }
 
+    /*@Override
+    public BulkScorer bulkScorer(LeafReaderContext context) throws IOException {
+        HybridQueryWeight.HybridScorerSupplier scorer = (HybridQueryWeight.HybridScorerSupplier) scorerSupplier(context);
+        return new HybridBulkScorer(scorer, context.reader().maxDoc());
+    }*/
+
     /**
      * Check if weight object can be cached
      *
@@ -161,7 +168,17 @@ public final class HybridQueryWeight extends Weight {
 
     @RequiredArgsConstructor
     static class HybridScorerSupplier extends ScorerSupplier {
+
+        @Override
+        public BulkScorer bulkScorer() throws IOException {
+            // HybridQueryWeight.HybridScorerSupplier scorer = (HybridQueryWeight.HybridScorerSupplier) scorerSupplier(context);
+            // return new HybridBulkScorer(scorer, context.reader().maxDoc());
+            HybridQueryScorer scorer = (HybridQueryScorer) get(Long.MAX_VALUE);
+            return new HybridBulkScorer(scorer, Integer.MAX_VALUE);
+        }
+
         private long cost = -1;
+        @Getter
         private final List<ScorerSupplier> scorerSuppliers;
         private final Weight weight;
         private final ScoreMode scoreMode;
