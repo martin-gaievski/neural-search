@@ -135,7 +135,7 @@ public final class HybridQueryWeight extends Weight {
             return null;
         }*/
         HybridQueryWeight.HybridScorerSupplier scorer = (HybridQueryWeight.HybridScorerSupplier) scorerSupplier(context);
-        return new HybridBulkScorer(scorer);
+        return new HybridBulkScorer(scorer, context.reader().maxDoc());
     }
 
     /**

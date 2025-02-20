@@ -11,6 +11,7 @@ import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.ScorerSupplier;
+import org.apache.lucene.search.TwoPhaseIterator;
 import org.apache.lucene.util.Bits;
 
 import java.io.IOException;
@@ -23,8 +24,9 @@ public class HybridBulkScorer extends BulkScorer {
     private final HybridQueryWeight.HybridScorerSupplier scorers;
     private static final int BULK_SIZE = 128; // Size of the block to process in bulk
     final long cost;
+    private final int maxDoc;
 
-    public HybridBulkScorer(HybridQueryWeight.HybridScorerSupplier scorers) {
+    public HybridBulkScorer(HybridQueryWeight.HybridScorerSupplier scorers, int maxDoc) {
         // this.iterator = iterator;
         this.scorers = scorers;
         long cost = 0;
@@ -35,11 +37,12 @@ public class HybridBulkScorer extends BulkScorer {
             cost += scorer.cost();
         }
         this.cost = cost;
+        this.maxDoc = maxDoc;
     }
 
     @Override
     public int score(LeafCollector collector, Bits acceptDocs, int min, int max) throws IOException {
-        int doc = min;
+        // int doc = min;
         List<Scorer> scorers = new ArrayList<>();
         for (ScorerSupplier scorerSupplier : this.scorers.getScorerSuppliers()) {
             if (Objects.isNull(scorerSupplier)) {
@@ -56,6 +59,7 @@ public class HybridBulkScorer extends BulkScorer {
 
             SubQueryScorer subQueryScorer = new SubQueryScorer(scorer, i, scorers.size());
             collector.setScorer(subQueryScorer);
+            TwoPhaseIterator twoPhase = scorer.twoPhaseIterator();
             /*TwoPhaseIterator twoPhase = scorer.twoPhaseIterator();
             DocIdSetIterator docIdSetIterator = scorer.iterator();
             DocIdSetIterator scorerIterator = twoPhase == null ? docIdSetIterator : twoPhase.approximation();
@@ -77,14 +81,50 @@ public class HybridBulkScorer extends BulkScorer {
                 }
             }*/
             // }
-            DocIdSetIterator docIdSetIterator = scorer.iterator();
-            docIdSetIterator.advance(min);
-            for (doc = docIdSetIterator.docID(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = docIdSetIterator.nextDoc()) {
-                if (acceptDocs == null || acceptDocs.get(doc)) {
-                    collector.collect(doc);
+            // DocIdSetIterator docIdSetIterator = scorer.iterator();
+            DocIdSetIterator scorerIterator = twoPhase == null ? scorer.iterator() : twoPhase.approximation();
+            scorerIterator.advance(min);
+            int doc = scorerIterator.docID();
+            if (doc < min) {
+                if (doc == min - 1) {
+                    doc = scorerIterator.nextDoc();
+                } else {
+                    doc = scorerIterator.advance(min);
                 }
-                // collector.collect(doc);
             }
+            // for (; doc != DocIdSetIterator.NO_MORE_DOCS; doc = scorerIterator.nextDoc()) {
+            if (twoPhase == null) {
+                // Optimize simple iterators with collectors that can't skip
+                while (doc < max) {
+                    if (acceptDocs == null || acceptDocs.get(doc)) {
+                        collector.collect(doc);
+                    }
+                    doc = scorerIterator.nextDoc();
+                }
+            } else {
+                while (doc < max) {
+                    /*if (competitiveIterator != null) {
+                        assert competitiveIterator.docID() <= doc;
+                        if (competitiveIterator.docID() < doc) {
+                            competitiveIterator.advance(doc);
+                        }
+                        if (competitiveIterator.docID() != doc) {
+                            doc = iterator.advance(competitiveIterator.docID());
+                            continue;
+                        }
+                    }*/
+                    if ((acceptDocs == null || acceptDocs.get(doc)) && (twoPhase == null || twoPhase.matches())) {
+                        collector.collect(doc);
+                    }
+                    doc = scorerIterator.nextDoc();
+                }
+            }
+
+            /*if (acceptDocs == null || acceptDocs.get(doc)) {
+                collector.collect(doc);
+            }*/
+            // collector.collect(doc);
+            // }
 
             /*for (doc = docIdSetIterator.docID(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = docIdSetIterator.nextDoc()) {
                 if (acceptDocs == null || acceptDocs.get(doc)) {
