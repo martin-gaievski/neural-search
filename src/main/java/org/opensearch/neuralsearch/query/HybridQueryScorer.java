@@ -109,8 +109,8 @@ public class HybridQueryScorer extends Scorer {
             if (disiWrapper.scorer.docID() == DocIdSetIterator.NO_MORE_DOCS) {
                 continue;
             }
-            // totalScore += disiWrapper.scorer.score();
-            totalScore += 1.0;
+            totalScore += disiWrapper.scorer.score();
+            // totalScore += 1.0;
         }
         return totalScore;
     }

@@ -110,12 +110,6 @@ public final class HybridQueryWeight extends Weight {
         return null;
     }
 
-    /*@Override
-    public BulkScorer bulkScorer(LeafReaderContext context) throws IOException {
-        HybridQueryWeight.HybridScorerSupplier scorer = (HybridQueryWeight.HybridScorerSupplier) scorerSupplier(context);
-        return new HybridBulkScorer(scorer, context.reader().maxDoc());
-    }*/
-
     /**
      * Check if weight object can be cached
      *
@@ -171,8 +165,6 @@ public final class HybridQueryWeight extends Weight {
 
         @Override
         public BulkScorer bulkScorer() throws IOException {
-            // HybridQueryWeight.HybridScorerSupplier scorer = (HybridQueryWeight.HybridScorerSupplier) scorerSupplier(context);
-            // return new HybridBulkScorer(scorer, context.reader().maxDoc());
             HybridQueryScorer scorer = (HybridQueryScorer) get(Long.MAX_VALUE);
             return new HybridBulkScorer(scorer, Integer.MAX_VALUE);
         }

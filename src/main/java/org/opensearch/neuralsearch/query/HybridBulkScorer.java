@@ -20,8 +20,7 @@ import java.util.Objects;
 
 public class HybridBulkScorer extends BulkScorer {
     // private final DocIdSetIterator iterator;
-    private final HybridQueryScorer scorers;
-    private static final int BULK_SIZE = 128; // Size of the block to process in bulk
+    private final HybridQueryScorer scorers;// Size of the block to process in bulk
     final long cost;
     private final int maxDoc;
 
@@ -48,32 +47,9 @@ public class HybridBulkScorer extends BulkScorer {
             if (scorer == null) {
                 continue;
             }
-
             SubQueryScorer subQueryScorer = new SubQueryScorer(scorer, i, scorers.size());
             collector.setScorer(subQueryScorer);
             TwoPhaseIterator twoPhase = scorer.twoPhaseIterator();
-            /*TwoPhaseIterator twoPhase = scorer.twoPhaseIterator();
-            DocIdSetIterator docIdSetIterator = scorer.iterator();
-            DocIdSetIterator scorerIterator = twoPhase == null ? docIdSetIterator : twoPhase.approximation();
-            DocIdSetIterator competitiveIterator = collector.competitiveIterator();
-            // if (competitiveIterator == null && scorerIterator.docID() == -1) {
-            if (twoPhase == null) {
-                for (int doc1 = scorerIterator.nextDoc(); doc1 != DocIdSetIterator.NO_MORE_DOCS; doc1 = scorerIterator.nextDoc()) {
-                    if (acceptDocs == null || acceptDocs.get(doc1)) {
-                        collector.collect(doc1);
-                    }
-                }
-            } else {
-                // The scorer has an approximation, so run the approximation first, then check acceptDocs,
-                // then confirm
-                for (int doc1 = scorerIterator.nextDoc(); doc1 != DocIdSetIterator.NO_MORE_DOCS; doc1 = scorerIterator.nextDoc()) {
-                    if ((acceptDocs == null || acceptDocs.get(doc1)) && twoPhase.matches()) {
-                        collector.collect(doc1);
-                    }
-                }
-            }*/
-            // }
-            // DocIdSetIterator docIdSetIterator = scorer.iterator();
             DocIdSetIterator scorerIterator = twoPhase == null ? scorer.iterator() : twoPhase.approximation();
             scorerIterator.advance(min);
             int doc = scorerIterator.docID();
@@ -84,7 +60,6 @@ public class HybridBulkScorer extends BulkScorer {
                     doc = scorerIterator.advance(min);
                 }
             }
-            // for (; doc != DocIdSetIterator.NO_MORE_DOCS; doc = scorerIterator.nextDoc()) {
             if (twoPhase == null) {
                 // Optimize simple iterators with collectors that can't skip
                 while (doc < max) {
@@ -111,19 +86,6 @@ public class HybridBulkScorer extends BulkScorer {
                     doc = scorerIterator.nextDoc();
                 }
             }
-
-            /*if (acceptDocs == null || acceptDocs.get(doc)) {
-                collector.collect(doc);
-            }*/
-            // collector.collect(doc);
-            // }
-
-            /*for (doc = docIdSetIterator.docID(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = docIdSetIterator.nextDoc()) {
-                if (acceptDocs == null || acceptDocs.get(doc)) {
-                    collector.collect(doc);
-                }
-                // collector.collect(doc);
-            }*/
         }
         return DocIdSetIterator.NO_MORE_DOCS;
     }
