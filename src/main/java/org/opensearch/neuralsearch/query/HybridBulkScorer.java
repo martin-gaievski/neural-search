@@ -51,6 +51,81 @@ public class HybridBulkScorer extends BulkScorer {
             collector.setScorer(subQueryScorer);
             TwoPhaseIterator twoPhase = scorer.twoPhaseIterator();
             DocIdSetIterator scorerIterator = twoPhase == null ? scorer.iterator() : twoPhase.approximation();
+            DocIdSetIterator competitiveIterator = collector.competitiveIterator();
+            // scoreAll
+            if (competitiveIterator == null && scorerIterator.docID() == -1 && min == 0 && max == DocIdSetIterator.NO_MORE_DOCS) {
+                if (twoPhase == null) {
+                    for (int doc = scorerIterator.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = scorerIterator.nextDoc()) {
+                        if (acceptDocs == null || acceptDocs.get(doc)) {
+                            collector.collect(doc);
+                        }
+                    }
+                } else {
+                    // The scorer has an approximation, so run the approximation first, then check acceptDocs,
+                    // then confirm
+                    for (int doc = scorerIterator.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = scorerIterator.nextDoc()) {
+                        if ((acceptDocs == null || acceptDocs.get(doc)) && twoPhase.matches()) {
+                            collector.collect(doc);
+                        }
+                    }
+                }
+                // return DocIdSetIterator.NO_MORE_DOCS;
+            } else {
+                // scoreRange
+                if (competitiveIterator != null) {
+                    if (competitiveIterator.docID() > min) {
+                        min = competitiveIterator.docID();
+                        // The competitive iterator may not match any docs in the range.
+                        min = Math.min(min, max);
+                    }
+                }
+
+                int doc = scorerIterator.docID();
+                if (doc < min) {
+                    if (doc == min - 1) {
+                        doc = scorerIterator.nextDoc();
+                    } else {
+                        doc = scorerIterator.advance(min);
+                    }
+                }
+
+                if (twoPhase == null && competitiveIterator == null) {
+                    // Optimize simple iterators with collectors that can't skip
+                    while (doc < max) {
+                        if (acceptDocs == null || acceptDocs.get(doc)) {
+                            collector.collect(doc);
+                        }
+                        doc = scorerIterator.nextDoc();
+                    }
+                } else {
+                    while (doc < max) {
+                        if (competitiveIterator != null) {
+                            assert competitiveIterator.docID() <= doc;
+                            if (competitiveIterator.docID() < doc) {
+                                competitiveIterator.advance(doc);
+                            }
+                            if (competitiveIterator.docID() != doc) {
+                                doc = scorerIterator.advance(competitiveIterator.docID());
+                                continue;
+                            }
+                        }
+
+                        if ((acceptDocs == null || acceptDocs.get(doc)) && (twoPhase == null || twoPhase.matches())) {
+                            collector.collect(doc);
+                        }
+                        doc = scorerIterator.nextDoc();
+                    }
+                }
+            }
+            //
+            /*if (competitiveIterator != null) {
+                if (competitiveIterator.docID() > min) {
+                    min = competitiveIterator.docID();
+                    // The competitive iterator may not match any docs in the range.
+                    min = Math.min(min, max);
+                }
+            }
+
             scorerIterator.advance(min);
             int doc = scorerIterator.docID();
             if (doc < min) {
@@ -80,12 +155,14 @@ public class HybridBulkScorer extends BulkScorer {
                             continue;
                         }
                     }*/
-                    if ((acceptDocs == null || acceptDocs.get(doc)) && (twoPhase == null || twoPhase.matches())) {
-                        collector.collect(doc);
-                    }
-                    doc = scorerIterator.nextDoc();
-                }
+            /*if ((acceptDocs == null || acceptDocs.get(doc)) && (twoPhase == null || twoPhase.matches())) {
+                collector.collect(doc);
             }
+            doc = scorerIterator.nextDoc();
+            }
+            }
+            */
+
         }
         return DocIdSetIterator.NO_MORE_DOCS;
     }
