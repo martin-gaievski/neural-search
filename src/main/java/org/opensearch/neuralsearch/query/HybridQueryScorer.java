@@ -75,7 +75,7 @@ public class HybridQueryScorer extends Scorer {
                 sumMatchCost += w.matchCost * costWeight;
             }
         }
-        if (!hasApproximation) { // no sub scorer supports approximations
+        if (hasApproximation == false) { // no sub scorer supports approximations
             twoPhase = null;
         } else {
             final float matchCost = sumMatchCost / sumApproxCost;
@@ -285,7 +285,7 @@ public class HybridQueryScorer extends Scorer {
                     wrapper.next = verifiedMatches;
                     verifiedMatches = wrapper;
 
-                    if (!needsScores) {
+                    if (needsScores == false) {
                         // we can stop here
                         return true;
                     }

@@ -96,7 +96,7 @@ public final class HybridQueryWeight extends Weight {
         if (scorerSuppliers.isEmpty()) {
             return null;
         }
-        return new HybridScorerSupplier(scorerSuppliers, this, scoreMode);
+        return new HybridScorerSupplier(scorerSuppliers, this, scoreMode, context);
     }
 
     private Void addScoreSupplier(Weight weight, HybridQueryExecutorCollector<LeafReaderContext, ScorerSupplier> collector) {
@@ -146,7 +146,7 @@ public final class HybridQueryWeight extends Weight {
                 max = Math.max(max, score);
                 subsOnMatch.add(e);
             } else {
-                if (!match) {
+                if (match == false) {
                     subsOnNoMatch.add(e);
                 }
                 subsOnMatch.add(e);
@@ -165,15 +165,44 @@ public final class HybridQueryWeight extends Weight {
 
         @Override
         public BulkScorer bulkScorer() throws IOException {
+            /*if (hybridQueryWeight.parentQuery.s == null) {
+                return new HybridTopScoreDocCollector(numHits, hitsThresholdChecker);
+            } else {
+                // Sorting is applied
+                if (after == null) {
+                    return new SimpleFieldCollector(numHits, hitsThresholdChecker, sortAndFormats.sort);
+                } else {
+                    // search_after is applied
+                    validateSearchAfterFieldAndSortFormats();
+                    return new PagingFieldCollector(numHits, hitsThresholdChecker, sortAndFormats.sort, after);
+                }
+            }*/
+            /*Supplier<BulkScorer> supplier = () -> {
+                try {
+                    return super.bulkScorer();
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            };*/
+
             HybridQueryScorer scorer = (HybridQueryScorer) get(Long.MAX_VALUE);
-            return new HybridBulkScorer(scorer, Integer.MAX_VALUE);
+            List<BulkScorer> scorers = this.weight.getWeights().stream().map(w -> {
+                try {
+                    return w.bulkScorer(context);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }).toList();
+            return new HybridBulkScorer(scorer, Integer.MAX_VALUE, this.scorerSuppliers, scorers);
+            // return new HybridBulkScorer(scorer, Integer.MAX_VALUE);
         }
 
         private long cost = -1;
         @Getter
         private final List<ScorerSupplier> scorerSuppliers;
-        private final Weight weight;
+        private final HybridQueryWeight weight;
         private final ScoreMode scoreMode;
+        private final LeafReaderContext context;
 
         @Override
         public Scorer get(long leadCost) throws IOException {
