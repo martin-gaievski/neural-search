@@ -141,6 +141,8 @@ public abstract class HybridCollectorManager implements CollectorManager<Collect
         // Check if filterWeight is present. If it is present then return wrap Hybrid Sort collector object underneath the FilteredCollector
         // object and return it.
         return Objects.nonNull(filterWeight) ? new FilteredCollector(hybridCollector, filterWeight) : hybridCollector;
+        // return hybridCollector;
+        // return Objects.nonNull(filterWeight) ? new HybridFilteredCollector(hybridCollector, filterWeight) : hybridCollector;
     }
 
     private Collector getHybridQueryCollector() {
