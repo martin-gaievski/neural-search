@@ -6,11 +6,9 @@ package org.opensearch.neuralsearch.search.collector;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
-import java.util.Set;
 
 import lombok.Getter;
 import org.apache.lucene.index.LeafReaderContext;
@@ -37,19 +35,14 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
     private final HitsThresholdChecker hitsThresholdChecker;
     private TotalHits.Relation totalHitsRelation = TotalHits.Relation.EQUAL_TO;
 
-    private Set<Integer> totalHits = new HashSet<>();
+    @Getter
+    private int totalHits;
     private int[] collectedHitsPerSubQuery;
     private final int numOfHits;
     private PriorityQueue<ScoreDoc>[] compoundScores;
     @Getter
     private float maxScore = 0.0f;
 
-    public int getTotalHits() {
-        if (totalHits == null || totalHits.isEmpty()) {
-            return 0;
-        }
-        return totalHits.size();
-    }
 
     public HybridTopScoreDocCollector(int numHits, HitsThresholdChecker hitsThresholdChecker) {
         numOfHits = numHits;
@@ -59,8 +52,7 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
     @Override
     public LeafCollector getLeafCollector(LeafReaderContext context) {
         docBase = context.docBase;
-        LeafCollector leafCollector = new HybridTopScoreLeafCollector();
-        return leafCollector;
+        return new HybridTopScoreLeafCollector();
     }
 
     @Override
@@ -126,39 +118,16 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
     }
 
     public class HybridTopScoreLeafCollector implements LeafCollector {
-        // HybridQueryScorer compoundQueryScorer;
-        // HybridBulkScorer.SubQueryScorer subQueryScorer;
-        HybridBulkScorer.HybridCombinedSubQueryScorer subQueryScorer;
+        HybridBulkScorer.HybridCombinedSubQueryScorer compoundQueryScorer;
         float minScoreThreshold;
 
         @Override
         public void setScorer(Scorable scorer) throws IOException {
-            /*if (scorer instanceof HybridQueryScorer) {
-                log.debug("passed scorer is of type HybridQueryScorer, saving it for collecting documents and scores");
-                compoundQueryScorer = (HybridQueryScorer) scorer;
+            if (scorer instanceof HybridBulkScorer.HybridCombinedSubQueryScorer) {
+                compoundQueryScorer = (HybridBulkScorer.HybridCombinedSubQueryScorer) scorer;
             } else {
                 compoundQueryScorer = getHybridQueryScorer(scorer);
                 if (Objects.isNull(compoundQueryScorer)) {
-                    log.error(
-                        String.format(Locale.ROOT, "cannot find scorer of type HybridQueryScorer in a hierarchy of scorer %s", scorer)
-                    );
-                }
-            }*/
-            /*if (scorer instanceof HybridBulkScorer.SubQueryScorer) {
-                subQueryScorer = (HybridBulkScorer.SubQueryScorer) scorer;
-            } else {
-                subQueryScorer = getHybridQueryScorer(scorer);
-                if (Objects.isNull(subQueryScorer)) {
-                    log.error(
-                        String.format(Locale.ROOT, "cannot find scorer of type HybridQueryScorer in a hierarchy of scorer %s", scorer)
-                    );
-                }
-            }*/
-            if (scorer instanceof HybridBulkScorer.HybridCombinedSubQueryScorer) {
-                subQueryScorer = (HybridBulkScorer.HybridCombinedSubQueryScorer) scorer;
-            } else {
-                subQueryScorer = getHybridQueryScorer(scorer);
-                if (Objects.isNull(subQueryScorer)) {
                     log.error(
                         String.format(Locale.ROOT, "cannot find scorer of type HybridQueryScorer in a hierarchy of scorer %s", scorer)
                     );
@@ -167,28 +136,6 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
             minScoreThreshold = Float.MIN_VALUE;
         }
 
-        /*private HybridBulkScorer.SubQueryScorer getHybridQueryScorer(final Scorable scorer) throws IOException {
-            if (scorer == null) {
-                return null;
-            }
-            if (scorer instanceof HybridBulkScorer.SubQueryScorer) {
-                return (HybridBulkScorer.SubQueryScorer) scorer;
-            }
-            for (Scorable.ChildScorable childScorable : scorer.getChildren()) {
-                HybridBulkScorer.SubQueryScorer hybridQueryScorer = getHybridQueryScorer(childScorable.child());
-                if (Objects.nonNull(hybridQueryScorer)) {
-                    log.debug(
-                        String.format(
-                            Locale.ROOT,
-                            "found hybrid query scorer, it's child of scorer %s",
-                            childScorable.child().getClass().getSimpleName()
-                        )
-                    );
-                    return hybridQueryScorer;
-                }
-            }
-            return null;
-        }*/
         private HybridBulkScorer.HybridCombinedSubQueryScorer getHybridQueryScorer(final Scorable scorer) throws IOException {
             if (scorer == null) {
                 return null;
@@ -214,24 +161,20 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
 
         @Override
         public void collect(int doc) throws IOException {
-            /*if (Objects.isNull(compoundQueryScorer)) {
-                throw new IllegalArgumentException("scorers are null for all sub-queries in hybrid query");
-            }*/
-            // float[] subScoresByQuery = compoundQueryScorer.hybridScores();
-            if (Objects.isNull(subQueryScorer)) {
+            if (Objects.isNull(compoundQueryScorer)) {
                 return;
             }
             // iterate over results for each query
             if (compoundScores == null) {
                 // compoundScores = new PriorityQueue[subScoresByQuery.length];
-                compoundScores = new PriorityQueue[subQueryScorer.getNumOfSubQueries()];
-                for (int i = 0; i < subQueryScorer.getNumOfSubQueries(); i++) {
+                compoundScores = new PriorityQueue[compoundQueryScorer.getNumOfSubQueries()];
+                for (int i = 0; i < compoundQueryScorer.getNumOfSubQueries(); i++) {
                     compoundScores[i] = new HitQueue(numOfHits, false);
                 }
-                collectedHitsPerSubQuery = new int[subQueryScorer.getNumOfSubQueries()];
+                collectedHitsPerSubQuery = new int[compoundQueryScorer.getNumOfSubQueries()];
             }
             // Increment total hit count which represents unique doc found on the shard
-            // totalHits++;
+            totalHits++;
 
             /*float score = subQueryScorer.score();
             // if score is 0.0 there is no hits for that sub-query
@@ -258,7 +201,7 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
             if (Objects.nonNull(popedScoreDoc)) {
                 minScoreThreshold = popedScoreDoc.score;
             }*/
-            float[] scores = subQueryScorer.getScoresByDoc().get(doc);
+            float[] scores = compoundQueryScorer.getScoresByDoc().get(doc);
             for (int i = 0; i < scores.length; i++) {
                 float score = scores[i];
                 // if score is 0.0 there is no hits for that sub-query
@@ -266,11 +209,10 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
                     continue;
                 }
                 int docWithBase = doc + docBase;
-                totalHits.add(docWithBase);
 
-                // if (score < minScoreThreshold) {
-                // return;
-                // }
+                if (score < minScoreThreshold) {
+                    continue;
+                }
 
                 if (hitsThresholdChecker.isThresholdReached() && totalHitsRelation == TotalHits.Relation.EQUAL_TO) {
                     totalHitsRelation = TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO;

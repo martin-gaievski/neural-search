@@ -247,21 +247,7 @@ public class HybridBulkScorer extends BulkScorer {
         collector.setScorer(hybridCombinedSubQueryScorer);
         DocIdStreamView docIdStreamView = new DocIdStreamView();
         collector.collect(docIdStreamView);
-        // at this point we saved all doc ids to the list sorted and per sub-query
-        // Collections.sort(collectedDocs, Comparator.comparingInt(a -> a[1]));
-        /*for (int[] scorePair : collectedDocs) {
-            int i = scorePair[0];
-            int doc = scorePair[1];
-            Scorer scorer = scorers.get(i);
-            if (scorer == null) {
-                continue;
-            }
-            SubQueryScorer subQueryScorer = new SubQueryScorer(scorer, i, scorers.size());
-            collector.setScorer(subQueryScorer);
-            if (doc != DocIdSetIterator.NO_MORE_DOCS) {
-                collector.collect(doc);
-            }
-        }*/
+
         return DocIdSetIterator.NO_MORE_DOCS;
     }
 
@@ -278,9 +264,9 @@ public class HybridBulkScorer extends BulkScorer {
                 float[] scores = scoresByDoc.get(doc);
                 float combinedScore = 0.0f;
                 for (float score : scores) {
-                    // if (score > 0) {
-                    combinedScore += score;
-                    // }
+                    if (score > 0) {
+                        combinedScore += score;
+                    }
                 }
                 hybridCombinedSubQueryScorer.setScore(combinedScore);
                 consumer.accept(doc);
