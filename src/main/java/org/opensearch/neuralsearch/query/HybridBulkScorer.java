@@ -14,7 +14,6 @@ import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.ScorerSupplier;
-import org.apache.lucene.search.TwoPhaseIterator;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.PriorityQueue;
 
@@ -32,12 +31,8 @@ public class HybridBulkScorer extends BulkScorer {
     final long cost;
     private final int maxDoc;
     List<ScorerSupplier> scorerSuppliers;
-    List<BulkScorer> bulkScorers;
-    List<DisiWrapper> leads = new ArrayList<>();
-    final ScoreAndDoc scoreAndDoc = new ScoreAndDoc();
-    // final DisiWrapper[] leads;
-    // final HeadPriorityQueue head;
-    // final TailPriorityQueue tail;
+    // List<BulkScorer> bulkScorers;
+    HybridCombinedSubQueryScorer hybridCombinedSubQueryScorer = new HybridCombinedSubQueryScorer();
 
     Map<Integer, float[]> scoresByDoc = new HashMap<>();
 
@@ -84,15 +79,6 @@ public class HybridBulkScorer extends BulkScorer {
         // this.cost = cost(bulkScorers);
         this.maxDoc = maxDoc;
         this.scorerSuppliers = scorerSuppliers;
-        this.bulkScorers = bulkScorers;
-        /*for (ScorerSupplier scorerSupplier : scorerSuppliers) {
-            try {
-                Scorer scorer = scorerSupplier.get(Long.MAX_VALUE);
-                leads.add(new DisiWrapper(scorer, false));
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-        }*/
     }
 
     private static long cost(Collection<BulkScorer> scorers) {
@@ -172,7 +158,7 @@ public class HybridBulkScorer extends BulkScorer {
             // SubQueryScorer subQueryScorer = new SubQueryScorer(scorer, i, scorers.size());
 
             // collector.setScorer(subQueryScorer);
-            TwoPhaseIterator twoPhase = scorer.twoPhaseIterator();
+            /*TwoPhaseIterator twoPhase = scorer.twoPhaseIterator();
             // TwoPhaseIterator twoPhase = this.scorers.twoPhaseIterator();
             DocIdSetIterator scorerIterator = twoPhase == null ? scorer.iterator() : twoPhase.approximation();
             DocIdSetIterator competitiveIterator = collector.competitiveIterator();
@@ -182,7 +168,7 @@ public class HybridBulkScorer extends BulkScorer {
                     for (int doc = scorerIterator.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = scorerIterator.nextDoc()) {
                         if (acceptDocs == null || acceptDocs.get(doc)) {
                             // collector.collect(doc);
-                            scoresByDoc.computeIfAbsent(doc, k -> new float[scorers.size()])[i] = scorer.score();
+                            collectScoreOnly(scorer, doc, scorers, i);
                         }
                     }
                 } else {
@@ -191,7 +177,7 @@ public class HybridBulkScorer extends BulkScorer {
                     for (int doc = scorerIterator.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = scorerIterator.nextDoc()) {
                         if ((acceptDocs == null || acceptDocs.get(doc)) && twoPhase.matches()) {
                             // collector.collect(doc);
-                            scoresByDoc.computeIfAbsent(doc, k -> new float[scorers.size()])[i] = scorer.score();
+                            collectScoreOnly(scorer, doc, scorers, i);
                         }
                     }
                 }
@@ -219,7 +205,7 @@ public class HybridBulkScorer extends BulkScorer {
                     while (doc < max) {
                         if (acceptDocs == null || acceptDocs.get(doc)) {
                             // collector.collect(doc);
-                            scoresByDoc.computeIfAbsent(doc, k -> new float[scorers.size()])[i] = scorer.score();
+                            collectScoreOnly(scorer, doc, scorers, i);
                         }
                         doc = scorerIterator.nextDoc();
                     }
@@ -238,13 +224,13 @@ public class HybridBulkScorer extends BulkScorer {
 
                         if ((acceptDocs == null || acceptDocs.get(doc)) && (twoPhase == null || twoPhase.matches())) {
                             // collector.collect(doc);
-                            scoresByDoc.computeIfAbsent(doc, k -> new float[scorers.size()])[i] = scorer.score();
+                            collectScoreOnly(scorer, doc, scorers, i);
                         }
                         doc = scorerIterator.nextDoc();
                     }
                 }
-            }
-            /*DocIdSetIterator it = scorer.iterator();
+            }*/
+            DocIdSetIterator it = scorer.iterator();
             int doc = -1;
             if (doc < min) {
                 doc = it.advance(min);
@@ -253,10 +239,9 @@ public class HybridBulkScorer extends BulkScorer {
                 if (acceptDocs == null || acceptDocs.get(doc)) {
                     scoresByDoc.computeIfAbsent(doc, k -> new float[scorers.size()])[i] = scorer.score();
                 }
-            }*/
+            }
         }
 
-        HybridCombinedSubQueryScorer hybridCombinedSubQueryScorer = new HybridCombinedSubQueryScorer();
         hybridCombinedSubQueryScorer.setScoresByDoc(scoresByDoc);
         hybridCombinedSubQueryScorer.setNumOfSubQueries(scorers.size());
         collector.setScorer(hybridCombinedSubQueryScorer);
@@ -290,8 +275,21 @@ public class HybridBulkScorer extends BulkScorer {
         @Override
         public void forEach(CheckedIntConsumer<IOException> consumer) throws IOException {
             for (int doc : scoresByDoc.keySet()) {
+                float[] scores = scoresByDoc.get(doc);
+                float combinedScore = 0.0f;
+                for (float score : scores) {
+                    // if (score > 0) {
+                    combinedScore += score;
+                    // }
+                }
+                hybridCombinedSubQueryScorer.setScore(combinedScore);
                 consumer.accept(doc);
             }
+        }
+
+        @Override
+        public int count() throws IOException {
+            return scoresByDoc.size();
         }
     }
 
@@ -299,35 +297,10 @@ public class HybridBulkScorer extends BulkScorer {
     public static class HybridCombinedSubQueryScorer extends Scorable {
         Map<Integer, float[]> scoresByDoc;
         int numOfSubQueries;
-
-        @Override
-        public float score() throws IOException {
-            return 1.0f;
-        }
-    }
-
-    @Data
-    public static class SubQueryScorer extends Scorable {
-        final private Scorer scorer;
-        final private int index;
-        final private int numOfSubQueries;
-
-        @Override
-        public float score() throws IOException {
-            return scorer.score();
-        }
-    }
-
-    final class ScoreAndDoc extends Scorable {
         float score;
-        int doc = -1;
-
-        public int docID() {
-            return doc;
-        }
 
         @Override
-        public float score() {
+        public float score() throws IOException {
             return score;
         }
     }

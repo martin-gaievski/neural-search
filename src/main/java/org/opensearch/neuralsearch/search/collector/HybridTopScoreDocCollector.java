@@ -262,7 +262,7 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
             for (int i = 0; i < scores.length; i++) {
                 float score = scores[i];
                 // if score is 0.0 there is no hits for that sub-query
-                if (score == 0) {
+                if (score <= 0) {
                     continue;
                 }
                 int docWithBase = doc + docBase;
