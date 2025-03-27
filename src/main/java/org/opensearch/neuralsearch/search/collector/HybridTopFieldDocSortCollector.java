@@ -30,7 +30,7 @@ import org.apache.lucene.search.FieldComparator;
 import org.apache.lucene.search.CollectionTerminatedException;
 import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.util.PriorityQueue;
-import org.opensearch.neuralsearch.query.HybridQueryScorer;
+import org.opensearch.neuralsearch.query.HybridBulkScorer;
 import org.opensearch.common.Nullable;
 import org.opensearch.neuralsearch.search.HitsThresholdChecker;
 import org.opensearch.neuralsearch.search.lucene.MultiLeafFieldComparator;
@@ -128,7 +128,8 @@ public abstract class HybridTopFieldDocSortCollector implements HybridSearchColl
     }
 
     protected abstract class HybridTopDocSortLeafCollector implements LeafCollector {
-        protected HybridQueryScorer compoundQueryScorer;
+        // protected HybridQueryScorer compoundQueryScorer;
+        HybridBulkScorer.HybridCombinedSubQueryScorer compoundQueryScorer;
         private boolean collectedAllCompetitiveHits = false;
 
         /**
@@ -143,11 +144,9 @@ public abstract class HybridTopFieldDocSortCollector implements HybridSearchColl
             this.initializeLeafComparatorsPerSegmentOnce = true;
         }
 
-        @Override
-        public void setScorer(final Scorable scorer) throws IOException {
-            if (scorer instanceof HybridQueryScorer) {
-                log.debug("passed scorer is of type HybridQueryScorer, saving it for collecting documents and scores");
-                compoundQueryScorer = (HybridQueryScorer) scorer;
+        public void setScorer(Scorable scorer) throws IOException {
+            if (scorer instanceof HybridBulkScorer.HybridCombinedSubQueryScorer) {
+                compoundQueryScorer = (HybridBulkScorer.HybridCombinedSubQueryScorer) scorer;
             } else {
                 compoundQueryScorer = getHybridQueryScorer(scorer);
                 if (Objects.isNull(compoundQueryScorer)) {
@@ -158,15 +157,15 @@ public abstract class HybridTopFieldDocSortCollector implements HybridSearchColl
             }
         }
 
-        private HybridQueryScorer getHybridQueryScorer(final Scorable scorer) throws IOException {
+        private HybridBulkScorer.HybridCombinedSubQueryScorer getHybridQueryScorer(final Scorable scorer) throws IOException {
             if (scorer == null) {
                 return null;
             }
-            if (scorer instanceof HybridQueryScorer) {
-                return (HybridQueryScorer) scorer;
+            if (scorer instanceof HybridBulkScorer.HybridCombinedSubQueryScorer) {
+                return (HybridBulkScorer.HybridCombinedSubQueryScorer) scorer;
             }
             for (Scorable.ChildScorable childScorable : scorer.getChildren()) {
-                HybridQueryScorer hybridQueryScorer = getHybridQueryScorer(childScorable.child());
+                HybridBulkScorer.HybridCombinedSubQueryScorer hybridQueryScorer = getHybridQueryScorer(childScorable.child());
                 if (Objects.nonNull(hybridQueryScorer)) {
                     log.debug(
                         String.format(
