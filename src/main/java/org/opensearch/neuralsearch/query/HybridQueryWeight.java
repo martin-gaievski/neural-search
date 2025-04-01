@@ -38,7 +38,6 @@ public final class HybridQueryWeight extends Weight {
     // The Weights for our subqueries, in 1-1 correspondence
     @Getter(AccessLevel.PACKAGE)
     private final List<Weight> weights;
-
     private final ScoreMode scoreMode;
 
     /**
@@ -184,16 +183,13 @@ public final class HybridQueryWeight extends Weight {
                     throw new RuntimeException(e);
                 }
             };*/
-
-            HybridQueryScorer scorer = (HybridQueryScorer) get(Long.MAX_VALUE);
-            List<BulkScorer> scorers = this.weight.getWeights().stream().map(w -> {
-                try {
-                    return w.bulkScorer(context);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
-            }).toList();
-            return new HybridBulkScorer(scorer, Integer.MAX_VALUE, this.scorerSuppliers, scorers);
+            List<Scorer> scorers = new ArrayList<>();
+            for (Weight weight : weight.getWeights()) {
+                Scorer scorer = weight.scorer(context);
+                scorers.add(scorer);
+            }
+            // return new HybridBulkScorer(scorer, Integer.MAX_VALUE);
+            return new HybridBulkScorer(scorers);
             // return new HybridBulkScorer(scorer, Integer.MAX_VALUE);
         }
 

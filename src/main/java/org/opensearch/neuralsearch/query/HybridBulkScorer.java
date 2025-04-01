@@ -12,7 +12,6 @@ import org.apache.lucene.search.DocIdStream;
 import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.Scorer;
-import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.PriorityQueue;
 
@@ -30,25 +29,19 @@ public class HybridBulkScorer extends BulkScorer {
 
     Map<Integer, float[]> scoresByDoc = new HashMap<>();
 
-    public HybridBulkScorer(HybridQueryScorer scorers, int maxDoc, List<ScorerSupplier> scorerSuppliers, List<BulkScorer> bulkScorers) {
-        // Size of the block to process in bulk
+    HybridBulkScorer(List<Scorer> scorers) {
         long cost = 0;
-        for (Scorer scorer : scorers.getSubScorers()) {
-            if (Objects.isNull(scorer)) {
-                continue;
-            }
-            cost += scorer.iterator().cost();
-        }
-        this.cost = cost;
-        this.disiWrappers = new Scorer[scorers.getSubScorers().size()];
         int i = 0;
-        for (Scorer scorer : scorers.getSubScorers()) {
-            if (scorer == null) {
+        this.disiWrappers = new Scorer[scorers.size()];
+        for (Scorer scorer : scorers) {
+            if (Objects.isNull(scorer)) {
                 i++;
                 continue;
             }
+            cost += scorer.iterator().cost();
             disiWrappers[i++] = scorer;
         }
+        this.cost = cost;
     }
 
     private static long cost(Collection<BulkScorer> scorers) {
