@@ -43,7 +43,6 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
     @Getter
     private float maxScore = 0.0f;
 
-
     public HybridTopScoreDocCollector(int numHits, HitsThresholdChecker hitsThresholdChecker) {
         numOfHits = numHits;
         this.hitsThresholdChecker = hitsThresholdChecker;
