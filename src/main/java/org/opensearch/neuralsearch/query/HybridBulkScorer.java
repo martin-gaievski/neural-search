@@ -94,8 +94,8 @@ public class HybridBulkScorer extends BulkScorer {
                     getScore(i, doc, disiWrappers[i], disiWrappers.length);
                 }
             }
-            if (it.docID() != DocIdSetIterator.NO_MORE_DOCS) {
-                nextDoc = Math.max(nextDoc, it.docID());
+            if (doc != DocIdSetIterator.NO_MORE_DOCS) {
+                nextDoc = Math.max(nextDoc, doc);
             }
         }
 
@@ -107,20 +107,14 @@ public class HybridBulkScorer extends BulkScorer {
 
     private void getScore(int i, int doc, Scorer scorer, int numOfQueries) throws IOException {
         // scoresByDoc.computeIfAbsent(doc, k -> new float[numOfQueries])[i] = scorer.score();
-        if (Objects.isNull(scoresByDoc.get(doc))) {
-            scoresByDoc.put(doc, new float[numOfQueries]);
+        float score = scorer.score();
+        if (scoresByDoc.containsKey(doc) == false) {
+            float[] scores = new float[numOfQueries];
+            scores[i] = score;
+            scoresByDoc.put(doc, scores);
+        } else {
+            scoresByDoc.get(doc)[i] = score;
         }
-        float[] scores = scoresByDoc.get(doc);
-        scores[i] = scorer.score();
-        /*scoresByDoc.compute(doc, (key, existingArray) -> {
-            float[] scores = existingArray != null ? existingArray : new float[numOfQueries];
-            try {
-                scores[i] = scorer.score();
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-            return scores;
-        });*/
     }
 
     @Override
