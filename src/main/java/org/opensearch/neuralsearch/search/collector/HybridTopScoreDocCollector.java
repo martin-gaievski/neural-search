@@ -175,39 +175,14 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
             // Increment total hit count which represents unique doc found on the shard
             totalHits++;
 
-            /*float score = subQueryScorer.score();
-            // if score is 0.0 there is no hits for that sub-query
-            if (score == 0) {
-                return;
-            }
-            int docWithBase = doc + docBase;
-            totalHits.add(docWithBase);
-
-            if (score < minScoreThreshold) {
-                return;
-            }
-
-            if (hitsThresholdChecker.isThresholdReached() && totalHitsRelation == TotalHits.Relation.EQUAL_TO) {
-                totalHitsRelation = TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO;
-            }
-            collectedHitsPerSubQuery[subQueryScorer.getIndex()]++;
-            PriorityQueue<ScoreDoc> pq = compoundScores[subQueryScorer.getIndex()];
-            ScoreDoc currentDoc = new ScoreDoc(docWithBase, score);
-            maxScore = Math.max(currentDoc.score, maxScore);
-            // this way we're inserting into heap and do nothing else unless we reach the capacity
-            // after that we pull out the lowest score element on each insert
-            ScoreDoc popedScoreDoc = pq.insertWithOverflow(currentDoc);
-            if (Objects.nonNull(popedScoreDoc)) {
-                minScoreThreshold = popedScoreDoc.score;
-            }*/
             float[] scores = compoundQueryScorer.getScoresByDoc().get(doc);
+            int docWithBase = doc + docBase;
             for (int i = 0; i < scores.length; i++) {
                 float score = scores[i];
                 // if score is 0.0 there is no hits for that sub-query
                 if (score <= 0) {
                     continue;
                 }
-                int docWithBase = doc + docBase;
 
                 if (score < minScoreThreshold) {
                     continue;
