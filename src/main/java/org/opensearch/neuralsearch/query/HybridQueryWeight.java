@@ -189,7 +189,7 @@ public final class HybridQueryWeight extends Weight {
                 scorers.add(scorer);
             }
             // return new HybridBulkScorer(scorer, Integer.MAX_VALUE);
-            return new HybridBulkScorer(scorers);
+            return new HybridBulkScorer(scorers, scoreMode.needsScores());
             // return new HybridBulkScorer(scorer, Integer.MAX_VALUE);
         }
 
