@@ -25,7 +25,7 @@ import java.util.Objects;
 public class HybridBulkScorer extends BulkScorer {
     final long cost;
     final Scorer[] disiWrappers;
-    HybridCombinedSubQueryScorer hybridCombinedSubQueryScorer = new HybridCombinedSubQueryScorer();
+    HybridCombinedSubQueryScorer hybridCombinedSubQueryScorer;
 
     Map<Integer, float[]> scoresByDoc = new HashMap<>();
 
@@ -42,6 +42,8 @@ public class HybridBulkScorer extends BulkScorer {
             disiWrappers[i++] = scorer;
         }
         this.cost = cost;
+        hybridCombinedSubQueryScorer = new HybridCombinedSubQueryScorer(scorers.size());
+        hybridCombinedSubQueryScorer.setScoresByDoc(scoresByDoc);
     }
 
     private static long cost(Collection<BulkScorer> scorers) {
@@ -65,11 +67,8 @@ public class HybridBulkScorer extends BulkScorer {
     public int score(LeafCollector collector, Bits acceptDocs, int min, int max) throws IOException {
         scoresByDoc.clear();
 
-        hybridCombinedSubQueryScorer.setScoresByDoc(scoresByDoc);
-        hybridCombinedSubQueryScorer.setNumOfSubQueries(disiWrappers.length);
         collector.setScorer(hybridCombinedSubQueryScorer);
 
-        // List<Scorer> scorers = new ArrayList<>(this.scorers.getSubScorers());
         int nextDoc = -1;
         for (int i = 0; i < disiWrappers.length; i++) {
             if (disiWrappers[i] == null) {
@@ -84,7 +83,8 @@ public class HybridBulkScorer extends BulkScorer {
                 if (acceptDocs == null || acceptDocs.get(doc)) {
                     // scoresByDoc.computeIfAbsent(doc, k -> new float[disiWrappers.length])[i] = scorer.score();
                     // Atomic operation to ensure thread-safe array creation and update
-                    getScore(i, doc, disiWrappers[i], disiWrappers.length);
+                    float score = disiWrappers[i].score();
+                    collectScore(i, doc, score, disiWrappers.length);
                 }
             }
             if (doc != DocIdSetIterator.NO_MORE_DOCS) {
@@ -98,9 +98,10 @@ public class HybridBulkScorer extends BulkScorer {
         return nextDoc == -1 ? DocIdSetIterator.NO_MORE_DOCS : nextDoc;
     }
 
-    private void getScore(int i, int doc, Scorer scorer, int numOfQueries) throws IOException {
-        // scoresByDoc.computeIfAbsent(doc, k -> new float[numOfQueries])[i] = scorer.score();
-        float score = scorer.score();
+    private void collectScore(int i, int doc, float score, int numOfQueries) throws IOException {
+        if (score < hybridCombinedSubQueryScorer.getMinScores()[i]) {
+            return;
+        }
         if (scoresByDoc.containsKey(doc) == false) {
             float[] scores = new float[numOfQueries];
             scores[i] = score;
@@ -143,6 +144,12 @@ public class HybridBulkScorer extends BulkScorer {
         Map<Integer, float[]> scoresByDoc;
         int numOfSubQueries;
         float score;
+        float[] minScores;
+
+        HybridCombinedSubQueryScorer(int numOfSubQueries) {
+            this.numOfSubQueries = numOfSubQueries;
+            this.minScores = new float[numOfSubQueries];
+        }
 
         @Override
         public float score() throws IOException {

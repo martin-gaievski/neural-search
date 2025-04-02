@@ -6,6 +6,7 @@ package org.opensearch.neuralsearch.search.collector;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -118,7 +119,7 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
 
     public class HybridTopScoreLeafCollector implements LeafCollector {
         HybridBulkScorer.HybridCombinedSubQueryScorer compoundQueryScorer;
-        float minScoreThreshold;
+        float[] minScoreThresholds;
 
         @Override
         public void setScorer(Scorable scorer) throws IOException {
@@ -132,7 +133,10 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
                     );
                 }
             }
-            minScoreThreshold = Float.MIN_VALUE;
+            if (Objects.isNull(minScoreThresholds)) {
+                minScoreThresholds = new float[compoundQueryScorer.getNumOfSubQueries()];
+                Arrays.fill(minScoreThresholds, Float.MIN_VALUE);
+            }
         }
 
         private HybridBulkScorer.HybridCombinedSubQueryScorer getHybridQueryScorer(final Scorable scorer) throws IOException {
@@ -184,7 +188,7 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
                     continue;
                 }
 
-                if (score < minScoreThreshold) {
+                if (score < minScoreThresholds[i]) {
                     continue;
                 }
 
@@ -199,7 +203,9 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
                 // after that we pull out the lowest score element on each insert
                 ScoreDoc popedScoreDoc = pq.insertWithOverflow(currentDoc);
                 if (Objects.nonNull(popedScoreDoc)) {
-                    minScoreThreshold = popedScoreDoc.score;
+                    float newThresholdScore = popedScoreDoc.score;
+                    minScoreThresholds[i] = newThresholdScore;
+                    compoundQueryScorer.getMinScores()[i] = newThresholdScore;
                 }
             }
         }
