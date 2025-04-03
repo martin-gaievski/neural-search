@@ -6,11 +6,10 @@ package org.opensearch.neuralsearch.search.collector;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
-import java.util.Set;
 
 import lombok.Getter;
 import org.apache.lucene.index.LeafReaderContext;
@@ -39,7 +38,6 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
 
     @Getter
     private int totalHits;
-    private Set<Integer> docIds = new HashSet<>();
     private int[] collectedHitsPerSubQuery;
     private final int numOfHits;
     private PriorityQueue<ScoreDoc>[] compoundScores;
@@ -50,10 +48,6 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
         numOfHits = numHits;
         this.hitsThresholdChecker = hitsThresholdChecker;
     }
-
-    /*public int getTotalHits() {
-        return docIds.size();
-    }*/
 
     @Override
     public LeafCollector getLeafCollector(LeafReaderContext context) {
@@ -125,7 +119,7 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
 
     public class HybridTopScoreLeafCollector implements LeafCollector {
         HybridBulkScorer.HybridCombinedSubQueryScorer compoundQueryScorer;
-        // float[] minScoreThresholds;
+        float[] minScoreThresholds;
 
         @Override
         public void setScorer(Scorable scorer) throws IOException {
@@ -139,10 +133,10 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
                     );
                 }
             }
-            /*if (Objects.isNull(minScoreThresholds)) {
+            if (Objects.isNull(minScoreThresholds)) {
                 minScoreThresholds = new float[compoundQueryScorer.getNumOfSubQueries()];
                 Arrays.fill(minScoreThresholds, Float.MIN_VALUE);
-            }*/
+            }
         }
 
         private HybridBulkScorer.HybridCombinedSubQueryScorer getHybridQueryScorer(final Scorable scorer) throws IOException {
@@ -184,7 +178,6 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
             }
             // Increment total hit count which represents unique doc found on the shard
             totalHits++;
-            // docIds.add(doc);
 
             float[] scores = compoundQueryScorer.getScoresByDoc();
             int docWithBase = doc + docBase;
@@ -195,9 +188,9 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
                     continue;
                 }
 
-                /*if (score < minScoreThresholds[i]) {
+                if (score < minScoreThresholds[i]) {
                     continue;
-                }*/
+                }
 
                 if (hitsThresholdChecker.isThresholdReached() && totalHitsRelation == TotalHits.Relation.EQUAL_TO) {
                     totalHitsRelation = TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO;
@@ -211,7 +204,7 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
                 ScoreDoc popedScoreDoc = pq.insertWithOverflow(currentDoc);
                 if (Objects.nonNull(popedScoreDoc)) {
                     float newThresholdScore = popedScoreDoc.score;
-                    // minScoreThresholds[i] = newThresholdScore;
+                    minScoreThresholds[i] = newThresholdScore;
                     compoundQueryScorer.getMinScores()[i] = newThresholdScore;
                 }
             }
