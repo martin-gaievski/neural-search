@@ -16,6 +16,7 @@ import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 
@@ -32,11 +33,13 @@ public class HybridBulkScorer extends BulkScorer {
     FixedBitSet matching;
     float[][] windowScores;
     DocIdStreamView docIdStreamView = new DocIdStreamView();
+    private final int[] docIds;
 
     HybridBulkScorer(List<Scorer> scorers, boolean needsScores) {
+        int numberOfSubQueries = scorers.size();
         long cost = 0;
         int i = 0;
-        this.disiWrappers = new Scorer[scorers.size()];
+        this.disiWrappers = new Scorer[numberOfSubQueries];
         for (Scorer scorer : scorers) {
             if (Objects.isNull(scorer)) {
                 i++;
@@ -46,21 +49,22 @@ public class HybridBulkScorer extends BulkScorer {
             disiWrappers[i++] = scorer;
         }
         this.cost = cost;
-        hybridCombinedSubQueryScorer = new HybridCombinedSubQueryScorer(scorers.size());
+        hybridCombinedSubQueryScorer = new HybridCombinedSubQueryScorer(numberOfSubQueries);
         this.needsScores = needsScores;
         matching = new FixedBitSet(SIZE);
-        windowScores = new float[disiWrappers.length][SIZE];
+        windowScores = new float[numberOfSubQueries][SIZE];
+        docIds = new int[numberOfSubQueries];
     }
 
     @Override
     public int score(LeafCollector collector, Bits acceptDocs, int min, int max) throws IOException {
         collector.setScorer(hybridCombinedSubQueryScorer);
 
-        int[] docsIds = advance(min, disiWrappers);
+        advance(min, disiWrappers);
         int nextDoc = -1;
-        while (allDocIdsUsed(docsIds, max) == false) {
+        while (allDocIdsUsed(docIds, max) == false) {
             int topDoc = -1;
-            for (int docsId : docsIds) {
+            for (int docsId : docIds) {
                 if (docsId < max) {
                     topDoc = docsId;
                     break;
@@ -72,30 +76,28 @@ public class HybridBulkScorer extends BulkScorer {
             final int windowMax = Math.min(max, windowBase + SIZE);
 
             for (int i = 0; i < disiWrappers.length; i++) {
-                if (disiWrappers[i] == null || docsIds[i] >= max) {
+                if (disiWrappers[i] == null || docIds[i] >= max) {
                     continue;
                 }
                 DocIdSetIterator it = disiWrappers[i].iterator();
-                // int doc = it.docID();
-                int doc = docsIds[i];
-                // if (doc < min) {
+                int doc = docIds[i];
                 if (doc < windowMin) {
                     doc = it.advance(windowMin);
                 }
                 for (; doc < windowMax; doc = it.nextDoc()) {
                     if (acceptDocs == null || acceptDocs.get(doc)) {
-                        // scoresByDoc.computeIfAbsent(doc, k -> new float[disiWrappers.length])[i] = scorer.score();
                         // Atomic operation to ensure thread-safe array creation and update
                         int d = doc & MASK;
                         matching.set(d);
                         if (needsScores) {
                             float score = disiWrappers[i].score();
-                            windowScores[i][d] = score;
+                            if (score >= 0) {
+                                windowScores[i][d] = score;
+                            }
                         }
-                        // collectScore(i, doc, score, disiWrappers.length);
                     }
                 }
-                docsIds[i] = doc;
+                docIds[i] = doc;
             }
 
             docIdStreamView.base = windowBase;
@@ -103,12 +105,11 @@ public class HybridBulkScorer extends BulkScorer {
 
             matching.clear();
 
-            for (int i = 0; i < windowScores.length; i++) {
-                windowScores[i] = new float[SIZE];
+            for (float[] windowScore : windowScores) {
+                Arrays.fill(windowScore, 0);
             }
-
         }
-        for (int doc : docsIds) {
+        for (int doc : docIds) {
             if (doc != DocIdSetIterator.NO_MORE_DOCS) {
                 nextDoc = Math.max(nextDoc, doc);
             }
@@ -117,7 +118,6 @@ public class HybridBulkScorer extends BulkScorer {
     }
 
     private int[] advance(int min, Scorer[] scorers) throws IOException {
-        int[] docIds = new int[scorers.length];
         for (int i = 0; i < scorers.length; i++) {
             if (scorers[i] == null) {
                 docIds[i] = DocIdSetIterator.NO_MORE_DOCS;
@@ -184,11 +184,11 @@ public class HybridBulkScorer extends BulkScorer {
         float[] scoresByDoc;
         int numOfSubQueries;
         float score;
-        float[] minScores;
+        // float[] minScores;
 
         HybridCombinedSubQueryScorer(int numOfSubQueries) {
             this.numOfSubQueries = numOfSubQueries;
-            this.minScores = new float[numOfSubQueries];
+            // this.minScores = new float[numOfSubQueries];
             scoresByDoc = new float[numOfSubQueries];
         }
 
