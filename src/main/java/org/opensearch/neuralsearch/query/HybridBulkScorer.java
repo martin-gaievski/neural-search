@@ -24,7 +24,7 @@ public class HybridBulkScorer extends BulkScorer {
     final Scorer[] disiWrappers;
     HybridCombinedSubQueryScorer hybridCombinedSubQueryScorer;
 
-    static final int SHIFT = 12;
+    static final int SHIFT = 10;
     static final int SIZE = 1 << SHIFT;
     static final int MASK = SIZE - 1;
 
@@ -86,10 +86,12 @@ public class HybridBulkScorer extends BulkScorer {
                     if (acceptDocs == null || acceptDocs.get(doc)) {
                         // scoresByDoc.computeIfAbsent(doc, k -> new float[disiWrappers.length])[i] = scorer.score();
                         // Atomic operation to ensure thread-safe array creation and update
-                        float score = disiWrappers[i].score();
                         int d = doc & MASK;
                         matching.set(d);
-                        windowScores[i][d] = score;
+                        if (needsScores) {
+                            float score = disiWrappers[i].score();
+                            windowScores[i][d] = score;
+                        }
                         // collectScore(i, doc, score, disiWrappers.length);
                     }
                 }
