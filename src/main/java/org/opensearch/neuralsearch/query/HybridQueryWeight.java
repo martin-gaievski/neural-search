@@ -164,33 +164,12 @@ public final class HybridQueryWeight extends Weight {
 
         @Override
         public BulkScorer bulkScorer() throws IOException {
-            /*if (hybridQueryWeight.parentQuery.s == null) {
-                return new HybridTopScoreDocCollector(numHits, hitsThresholdChecker);
-            } else {
-                // Sorting is applied
-                if (after == null) {
-                    return new SimpleFieldCollector(numHits, hitsThresholdChecker, sortAndFormats.sort);
-                } else {
-                    // search_after is applied
-                    validateSearchAfterFieldAndSortFormats();
-                    return new PagingFieldCollector(numHits, hitsThresholdChecker, sortAndFormats.sort, after);
-                }
-            }*/
-            /*Supplier<BulkScorer> supplier = () -> {
-                try {
-                    return super.bulkScorer();
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
-            };*/
             List<Scorer> scorers = new ArrayList<>();
             for (Weight weight : weight.getWeights()) {
                 Scorer scorer = weight.scorer(context);
                 scorers.add(scorer);
             }
-            // return new HybridBulkScorer(scorer, Integer.MAX_VALUE);
             return new HybridBulkScorer(scorers, scoreMode.needsScores());
-            // return new HybridBulkScorer(scorer, Integer.MAX_VALUE);
         }
 
         private long cost = -1;
