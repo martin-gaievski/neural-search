@@ -169,7 +169,7 @@ public final class HybridQueryWeight extends Weight {
                 Scorer scorer = weight.scorer(context);
                 scorers.add(scorer);
             }
-            return new HybridBulkScorer(scorers, scoreMode.needsScores());
+            return new HybridBulkScorer(scorers, scoreMode.needsScores(), context.reader().maxDoc());
         }
 
         private long cost = -1;

@@ -205,7 +205,7 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
                 if (Objects.nonNull(popedScoreDoc)) {
                     float newThresholdScore = popedScoreDoc.score;
                     minScoreThresholds[i] = newThresholdScore;
-                    // compoundQueryScorer.getMinScores()[i] = newThresholdScore;
+                    compoundQueryScorer.getMinScores()[i] = newThresholdScore;
                 }
             }
         }
