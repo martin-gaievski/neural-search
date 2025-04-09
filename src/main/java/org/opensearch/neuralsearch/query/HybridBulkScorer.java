@@ -4,13 +4,10 @@
  */
 package org.opensearch.neuralsearch.query;
 
-import lombok.Data;
+import lombok.Getter;
 import org.apache.lucene.search.BulkScorer;
-import org.apache.lucene.search.CheckedIntConsumer;
 import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.search.DocIdStream;
 import org.apache.lucene.search.LeafCollector;
-import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
@@ -23,21 +20,23 @@ import java.util.Objects;
 public class HybridBulkScorer extends BulkScorer {
     final long cost;
     final Scorer[] disiWrappers;
-    HybridCombinedSubQueryScorer hybridCombinedSubQueryScorer;
+    @Getter
+    private final HybridSubQueryScorer hybridSubQueryScorer;
 
     static final int SHIFT = 10;
     static final int SIZE = 1 << SHIFT;
     static final int MASK = SIZE - 1;
 
-    private boolean needsScores;
-    FixedBitSet matching;
-    float[][] windowScores;
-    DocIdStreamView docIdStreamView = new DocIdStreamView();
+    private final boolean needsScores;
+    @Getter
+    private final FixedBitSet matching;
+    @Getter
+    private final float[][] windowScores;
+    DocIdStreamView docIdStreamView = new DocIdStreamView(this);
 
-    int maxDoc;
+    private final int maxDoc;
 
     HybridBulkScorer(List<Scorer> scorers, boolean needsScores, int maxDoc) {
-
         long cost = 0;
         int i = 0;
         this.disiWrappers = new Scorer[scorers.size()];
@@ -50,7 +49,7 @@ public class HybridBulkScorer extends BulkScorer {
             disiWrappers[i++] = scorer;
         }
         this.cost = cost;
-        hybridCombinedSubQueryScorer = new HybridCombinedSubQueryScorer(scorers.size());
+        hybridSubQueryScorer = new HybridSubQueryScorer(scorers.size());
         this.needsScores = needsScores;
         matching = new FixedBitSet(SIZE);
         windowScores = new float[disiWrappers.length][SIZE];
@@ -59,7 +58,7 @@ public class HybridBulkScorer extends BulkScorer {
 
     @Override
     public int score(LeafCollector collector, Bits acceptDocs, int min, int max) throws IOException {
-        collector.setScorer(hybridCombinedSubQueryScorer);
+        collector.setScorer(hybridSubQueryScorer);
 
         max = Math.min(max, maxDoc);
 
@@ -83,39 +82,34 @@ public class HybridBulkScorer extends BulkScorer {
                     continue;
                 }
                 DocIdSetIterator it = disiWrappers[i].iterator();
-                // int doc = it.docID();
                 int doc = docsIds[i];
-                // if (doc < min) {
                 if (doc < windowMin) {
                     doc = it.advance(windowMin);
                 }
                 for (; doc < windowMax; doc = it.nextDoc()) {
                     if (acceptDocs == null || acceptDocs.get(doc)) {
-                        // scoresByDoc.computeIfAbsent(doc, k -> new float[disiWrappers.length])[i] = scorer.score();
-                        // Atomic operation to ensure thread-safe array creation and update
                         int d = doc & MASK;
-                        if (needsScores == false) {
-                            matching.set(d);
-                        } else {
+                        if (needsScores) {
                             float score = disiWrappers[i].score();
-                            if (score > hybridCombinedSubQueryScorer.getMinScores()[i]) {
+                            if (score > hybridSubQueryScorer.getMinScores()[i]) {
                                 matching.set(d);
                                 windowScores[i][d] = score;
                             }
+                        } else {
+                            matching.set(d);
                         }
-                        // collectScore(i, doc, score, disiWrappers.length);
                     }
                 }
                 docsIds[i] = doc;
             }
 
-            docIdStreamView.base = windowBase;
+            docIdStreamView.setBase(windowBase);
             collector.collect(docIdStreamView);
 
             matching.clear();
 
-            for (int i = 0; i < windowScores.length; i++) {
-                windowScores[i] = new float[SIZE];
+            for (float[] windowScore : windowScores) {
+                Arrays.fill(windowScore, 0.0f);
             }
 
         }
@@ -158,62 +152,4 @@ public class HybridBulkScorer extends BulkScorer {
         return cost;
     }
 
-    class DocIdStreamView extends DocIdStream {
-        int base;
-
-        @Override
-        public void forEach(CheckedIntConsumer<IOException> consumer) throws IOException {
-            FixedBitSet matchingBitSet = matching;
-            long[] bitArray = matchingBitSet.getBits();
-            for (int idx = 0; idx < bitArray.length; idx++) {
-                long bits = bitArray[idx];
-                while (bits != 0L) {
-                    int ntz = Long.numberOfTrailingZeros(bits);
-                    final int indexInWindow = (idx << 6) | ntz;
-                    for (int i = 0; i < windowScores.length; i++) {
-                        if (Objects.isNull(windowScores[i])) {
-                            continue;
-                        }
-                        float score = windowScores[i][indexInWindow];
-                        hybridCombinedSubQueryScorer.getScoresByDoc()[i] = score;
-                    }
-                    consumer.accept(base | indexInWindow);
-                    hybridCombinedSubQueryScorer.resetScores();
-                    bits ^= 1L << ntz;
-                }
-            }
-        }
-
-        @Override
-        public int count() throws IOException {
-            return super.count();
-        }
-    }
-
-    @Data
-    public static class HybridCombinedSubQueryScorer extends Scorable {
-        float[] scoresByDoc;
-        int numOfSubQueries;
-        float score;
-        float[] minScores;
-
-        HybridCombinedSubQueryScorer(int numOfSubQueries) {
-            this.numOfSubQueries = numOfSubQueries;
-            this.minScores = new float[numOfSubQueries];
-            scoresByDoc = new float[numOfSubQueries];
-        }
-
-        @Override
-        public float score() throws IOException {
-            float score = 0.0f;
-            for (float scoreByDoc : scoresByDoc) {
-                score += scoreByDoc;
-            }
-            return score;
-        }
-
-        public void resetScores() {
-            Arrays.fill(scoresByDoc, 0.0f);
-        }
-    }
 }

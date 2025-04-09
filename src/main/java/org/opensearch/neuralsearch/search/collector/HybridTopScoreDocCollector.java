@@ -23,7 +23,6 @@ import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.util.PriorityQueue;
 
 import lombok.extern.log4j.Log4j2;
-import org.opensearch.neuralsearch.query.HybridBulkScorer;
 import org.opensearch.neuralsearch.search.HitsThresholdChecker;
 
 /**
@@ -117,96 +116,64 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
         }
     }
 
-    public class HybridTopScoreLeafCollector implements LeafCollector {
-        HybridBulkScorer.HybridCombinedSubQueryScorer compoundQueryScorer;
+    public class HybridTopScoreLeafCollector extends HybridLeafCollector {
         float[] minScoreThresholds;
 
         @Override
         public void setScorer(Scorable scorer) throws IOException {
-            if (scorer instanceof HybridBulkScorer.HybridCombinedSubQueryScorer) {
-                compoundQueryScorer = (HybridBulkScorer.HybridCombinedSubQueryScorer) scorer;
-            } else {
-                compoundQueryScorer = getHybridQueryScorer(scorer);
-                if (Objects.isNull(compoundQueryScorer)) {
-                    log.error(
-                        String.format(Locale.ROOT, "cannot find scorer of type HybridQueryScorer in a hierarchy of scorer %s", scorer)
-                    );
-                }
-            }
+            super.setScorer(scorer);
             if (Objects.isNull(minScoreThresholds)) {
-                minScoreThresholds = new float[compoundQueryScorer.getNumOfSubQueries()];
+                minScoreThresholds = new float[getCompoundQueryScorer().getNumOfSubQueries()];
                 Arrays.fill(minScoreThresholds, Float.MIN_VALUE);
             }
         }
 
-        private HybridBulkScorer.HybridCombinedSubQueryScorer getHybridQueryScorer(final Scorable scorer) throws IOException {
-            if (scorer == null) {
-                return null;
-            }
-            if (scorer instanceof HybridBulkScorer.HybridCombinedSubQueryScorer) {
-                return (HybridBulkScorer.HybridCombinedSubQueryScorer) scorer;
-            }
-            for (Scorable.ChildScorable childScorable : scorer.getChildren()) {
-                HybridBulkScorer.HybridCombinedSubQueryScorer hybridQueryScorer = getHybridQueryScorer(childScorable.child());
-                if (Objects.nonNull(hybridQueryScorer)) {
-                    log.debug(
-                        String.format(
-                            Locale.ROOT,
-                            "found hybrid query scorer, it's child of scorer %s",
-                            childScorable.child().getClass().getSimpleName()
-                        )
-                    );
-                    return hybridQueryScorer;
-                }
-            }
-            return null;
-        }
-
         @Override
         public void collect(int doc) throws IOException {
-            if (Objects.isNull(compoundQueryScorer)) {
+            if (Objects.isNull(getCompoundQueryScorer())) {
                 return;
             }
-            // iterate over results for each query
-            if (compoundScores == null) {
-                // compoundScores = new PriorityQueue[subScoresByQuery.length];
-                compoundScores = new PriorityQueue[compoundQueryScorer.getNumOfSubQueries()];
-                for (int i = 0; i < compoundQueryScorer.getNumOfSubQueries(); i++) {
-                    compoundScores[i] = new HitQueue(numOfHits, false);
-                }
-                collectedHitsPerSubQuery = new int[compoundQueryScorer.getNumOfSubQueries()];
-            }
+            ensureSubQueryScoreQueues();
             // Increment total hit count which represents unique doc found on the shard
             totalHits++;
-
-            float[] scores = compoundQueryScorer.getScoresByDoc();
+            float[] scores = getCompoundQueryScorer().getSubQueryScores();
             int docWithBase = doc + docBase;
-            for (int i = 0; i < scores.length; i++) {
-                float score = scores[i];
+            for (int subQueryIndex = 0; subQueryIndex < scores.length; subQueryIndex++) {
+                float score = scores[subQueryIndex];
                 // if score is 0.0 there is no hits for that sub-query
                 if (score <= 0) {
                     continue;
                 }
 
-                if (score < minScoreThresholds[i]) {
+                if (score < minScoreThresholds[subQueryIndex]) {
                     continue;
                 }
 
                 if (hitsThresholdChecker.isThresholdReached() && totalHitsRelation == TotalHits.Relation.EQUAL_TO) {
                     totalHitsRelation = TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO;
                 }
-                collectedHitsPerSubQuery[i]++;
-                PriorityQueue<ScoreDoc> pq = compoundScores[i];
+                collectedHitsPerSubQuery[subQueryIndex]++;
+                PriorityQueue<ScoreDoc> pq = compoundScores[subQueryIndex];
                 ScoreDoc currentDoc = new ScoreDoc(docWithBase, score);
                 maxScore = Math.max(currentDoc.score, maxScore);
                 // this way we're inserting into heap and do nothing else unless we reach the capacity
                 // after that we pull out the lowest score element on each insert
-                ScoreDoc popedScoreDoc = pq.insertWithOverflow(currentDoc);
-                if (Objects.nonNull(popedScoreDoc)) {
-                    float newThresholdScore = popedScoreDoc.score;
-                    minScoreThresholds[i] = newThresholdScore;
-                    compoundQueryScorer.getMinScores()[i] = newThresholdScore;
+                ScoreDoc evictedScoreDoc = pq.insertWithOverflow(currentDoc);
+                if (Objects.nonNull(evictedScoreDoc)) {
+                    float newThresholdScore = evictedScoreDoc.score;
+                    minScoreThresholds[subQueryIndex] = newThresholdScore;
+                    compoundQueryScorer.getMinScores()[subQueryIndex] = newThresholdScore;
                 }
+            }
+        }
+
+        private void ensureSubQueryScoreQueues() {
+            if (Objects.isNull(compoundScores)) {
+                compoundScores = new PriorityQueue[compoundQueryScorer.getNumOfSubQueries()];
+                for (int i = 0; i < compoundQueryScorer.getNumOfSubQueries(); i++) {
+                    compoundScores[i] = new HitQueue(numOfHits, false);
+                }
+                collectedHitsPerSubQuery = new int[compoundQueryScorer.getNumOfSubQueries()];
             }
         }
     };
