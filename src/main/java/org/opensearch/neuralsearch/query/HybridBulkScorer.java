@@ -11,11 +11,14 @@ import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
+import org.opensearch.neuralsearch.executors.HybridQueryExecutor;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.Callable;
 
 /**
  * Bulk scorer for hybrid query
@@ -113,33 +116,48 @@ public class HybridBulkScorer extends BulkScorer {
         int windowMax,
         int windowBase
     ) throws IOException {
+        List<Callable<Void>> tasks = new ArrayList<>();
+
         for (int subQueryIndex = 0; subQueryIndex < scorers.length; subQueryIndex++) {
             if (Objects.isNull(scorers[subQueryIndex]) || docIds[subQueryIndex] >= max) {
                 continue;
             }
-            DocIdSetIterator it = scorers[subQueryIndex].iterator();
-            int doc = docIds[subQueryIndex];
-            if (doc < windowMin) {
-                doc = it.advance(windowMin);
-            }
-            while (doc < windowMax) {
-                if (Objects.isNull(acceptDocs) || acceptDocs.get(doc)) {
-                    int d = doc & MASK;
-                    if (needsScores) {
-                        float score = scorers[subQueryIndex].score();
-                        // collect score only in case it's gt competitive score
-                        if (score > hybridSubQueryScorer.getMinScores()[subQueryIndex]) {
-                            matching.set(d);
-                            windowScores[subQueryIndex][d] = score;
-                        }
-                    } else {
-                        matching.set(d);
+            final int currentIndex = subQueryIndex;
+            tasks.add(() -> {
+                try {
+                    DocIdSetIterator it = scorers[currentIndex].iterator();
+                    int doc = docIds[currentIndex];
+                    if (doc < windowMin) {
+                        doc = it.advance(windowMin);
                     }
+                    while (doc < windowMax) {
+                        if (Objects.isNull(acceptDocs) || acceptDocs.get(doc)) {
+                            int d = doc & MASK;
+                            if (needsScores) {
+                                float score = scorers[currentIndex].score();
+                                // collect score only in case it's gt competitive score
+                                if (score > hybridSubQueryScorer.getMinScores()[currentIndex]) {
+                                    synchronized (matching) {
+                                        matching.set(d);
+                                    }
+                                    windowScores[currentIndex][d] = score;
+                                }
+                            } else {
+                                synchronized (matching) {
+                                    matching.set(d);
+                                }
+                            }
+                        }
+                        doc = it.nextDoc();
+                    }
+                    docIds[currentIndex] = doc;
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
                 }
-                doc = it.nextDoc();
-            }
-            docIds[subQueryIndex] = doc;
+                return null;
+            });
         }
+        HybridQueryExecutor.getExecutor().invokeAll(tasks);
 
         hybridQueryDocIdStream.setBase(windowBase);
         collector.collect(hybridQueryDocIdStream);
