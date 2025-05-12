@@ -21,7 +21,7 @@ import java.util.Objects;
  * Bulk scorer for hybrid query
  */
 public class HybridBulkScorer extends BulkScorer {
-    private static final int SHIFT = 8;
+    private static final int SHIFT = 14;
     private static final int WINDOW_SIZE = 1 << SHIFT;
     private static final int MASK = WINDOW_SIZE - 1;
 
