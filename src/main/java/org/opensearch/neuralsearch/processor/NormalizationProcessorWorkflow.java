@@ -82,6 +82,9 @@ public class NormalizationProcessorWorkflow {
         log.debug("Do score normalization");
         scoreNormalizer.normalizeScores(normalizeScoresDTO);
 
+        // Check for dynamic weights from pipeline context
+        List<Float> dynamicWeights = getDynamicWeights(request.getPipelineProcessingContext());
+
         CombineScoresDto combineScoresDTO = CombineScoresDto.builder()
             .queryTopDocs(queryTopDocs)
             .scoreCombinationTechnique(request.getCombinationTechnique())
@@ -89,6 +92,7 @@ public class NormalizationProcessorWorkflow {
             .sort(evaluateSortCriteria(querySearchResults, queryTopDocs))
             .fromValueForSingleShard(getFromValueIfSingleShard(request))
             .isSingleShard(getIsSingleShard(request))
+            .dynamicWeights(dynamicWeights)
             .build();
 
         // combine
@@ -375,5 +379,30 @@ public class NormalizationProcessorWorkflow {
                 .map(scoreDoc -> scoreDoc.doc)
                 .collect(Collectors.toList());
         return docIds;
+    }
+
+    /**
+     * Retrieves dynamic weights from pipeline context if available
+     */
+    @SuppressWarnings("unchecked")
+    private List<Float> getDynamicWeights(PipelineProcessingContext pipelineContext) {
+        if (pipelineContext == null) {
+            return null;
+        }
+
+        try {
+            Object weights = pipelineContext.getAttribute("dynamic_hybrid_weights");
+            if (weights instanceof List) {
+                List<?> weightList = (List<?>) weights;
+                if (!weightList.isEmpty() && weightList.get(0) instanceof Float) {
+                    log.debug("Using dynamic weights from pipeline context: {}", weightList);
+                    return (List<Float>) weightList;
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Failed to retrieve dynamic weights from pipeline context", e);
+        }
+
+        return null;
     }
 }

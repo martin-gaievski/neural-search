@@ -74,15 +74,25 @@ public class ScoreCombiner {
         ScoreCombinationTechnique scoreCombinationTechnique = combineScoresDTO.getScoreCombinationTechnique();
         Sort sort = combineScoresDTO.getSort();
         boolean isSingleShard = combineScoresDTO.isSingleShard();
+        List<Float> dynamicWeights = combineScoresDTO.getDynamicWeights();
         combineScoresDTO.getQueryTopDocs()
-            .forEach(compoundQueryTopDocs -> combineShardScores(scoreCombinationTechnique, compoundQueryTopDocs, sort, isSingleShard));
+            .forEach(
+                compoundQueryTopDocs -> combineShardScores(
+                    scoreCombinationTechnique,
+                    compoundQueryTopDocs,
+                    sort,
+                    isSingleShard,
+                    dynamicWeights
+                )
+            );
     }
 
     private void combineShardScores(
         final ScoreCombinationTechnique scoreCombinationTechnique,
         final CompoundTopDocs compoundQueryTopDocs,
         final Sort sort,
-        final boolean isSingleShard
+        final boolean isSingleShard,
+        final List<Float> dynamicWeights
     ) {
         if (Objects.isNull(compoundQueryTopDocs) || compoundQueryTopDocs.getTotalHits().value() == 0) {
             return;
@@ -92,10 +102,11 @@ public class ScoreCombiner {
         // - create map of normalized scores results returned from the single shard
         Map<Integer, float[]> normalizedScoresPerDoc = getNormalizedScoresPerDocument(topDocsPerSubQuery);
 
-        // - create map of combined scores per doc id
+        // - create map of combined scores per doc id using dynamic weights if available
         Map<Integer, Float> combinedNormalizedScoresByDocId = combineScoresAndGetCombinedNormalizedScoresPerDocument(
             normalizedScoresPerDoc,
-            scoreCombinationTechnique
+            scoreCombinationTechnique,
+            dynamicWeights
         );
 
         // - sort documents by scores and take first "max number" of docs
@@ -311,6 +322,39 @@ public class ScoreCombiner {
         return normalizedScoresPerDocument.entrySet()
             .stream()
             .collect(Collectors.toMap(Map.Entry::getKey, entry -> scoreCombinationTechnique.combine(entry.getValue())));
+    }
+
+    private Map<Integer, Float> combineScoresAndGetCombinedNormalizedScoresPerDocument(
+        final Map<Integer, float[]> normalizedScoresPerDocument,
+        final ScoreCombinationTechnique scoreCombinationTechnique,
+        final List<Float> dynamicWeights
+    ) {
+        if (dynamicWeights != null && !dynamicWeights.isEmpty()) {
+            log.debug("Applying dynamic weights to score combination: {}", dynamicWeights);
+            return normalizedScoresPerDocument.entrySet()
+                .stream()
+                .collect(Collectors.toMap(Map.Entry::getKey, entry -> applyDynamicWeights(entry.getValue(), dynamicWeights)));
+        } else {
+            return combineScoresAndGetCombinedNormalizedScoresPerDocument(normalizedScoresPerDocument, scoreCombinationTechnique);
+        }
+    }
+
+    /**
+     * Apply dynamic weights to normalized scores per sub-query
+     */
+    private float applyDynamicWeights(final float[] normalizedScores, final List<Float> dynamicWeights) {
+        float combinedScore = 0.0f;
+        int validScores = 0;
+
+        for (int i = 0; i < normalizedScores.length && i < dynamicWeights.size(); i++) {
+            if (normalizedScores[i] > 0.0f) { // Only apply weight to non-zero scores
+                combinedScore += normalizedScores[i] * dynamicWeights.get(i);
+                validScores++;
+            }
+        }
+
+        // Return 0 if no valid scores found, otherwise return the weighted combination
+        return validScores > 0 ? combinedScore : 0.0f;
     }
 
     private void updateQueryTopDocsWithCombinedScores(

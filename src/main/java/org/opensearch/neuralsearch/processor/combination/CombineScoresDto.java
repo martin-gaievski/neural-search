@@ -31,4 +31,6 @@ public class CombineScoresDto {
     private Sort sort;
     private int fromValueForSingleShard;
     private boolean isSingleShard;
+    @Nullable
+    private List<Float> dynamicWeights;
 }

@@ -32,7 +32,10 @@ import org.opensearch.neuralsearch.mappingtransformer.SemanticMappingTransformer
 import org.opensearch.neuralsearch.processor.factory.SemanticFieldProcessorFactory;
 import org.opensearch.plugins.MapperPlugin;
 import org.opensearch.transport.client.Client;
+import org.opensearch.plugins.ClusterPlugin;
+import org.opensearch.core.ParseField;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.ClusterSettings;
@@ -68,6 +71,7 @@ import org.opensearch.neuralsearch.processor.factory.TextEmbeddingProcessorFacto
 import org.opensearch.neuralsearch.processor.factory.TextImageEmbeddingProcessorFactory;
 import org.opensearch.neuralsearch.processor.factory.RRFProcessorFactory;
 import org.opensearch.neuralsearch.processor.factory.NormalizationProcessorFactory;
+import org.opensearch.neuralsearch.processor.factory.DynamicWeightsProcessorFactory;
 import org.opensearch.neuralsearch.processor.normalization.ScoreNormalizationFactory;
 import org.opensearch.neuralsearch.processor.normalization.ScoreNormalizer;
 import org.opensearch.neuralsearch.processor.rerank.RerankProcessor;
@@ -77,9 +81,13 @@ import org.opensearch.neuralsearch.query.NeuralSparseQueryBuilder;
 import org.opensearch.neuralsearch.query.NeuralKNNQueryBuilder;
 import org.opensearch.neuralsearch.query.ext.RerankSearchExtBuilder;
 import org.opensearch.neuralsearch.rest.RestNeuralStatsAction;
+import org.opensearch.neuralsearch.rest.RestDynamicWeightsAction;
 import org.opensearch.neuralsearch.search.query.HybridQueryPhaseSearcher;
 import org.opensearch.neuralsearch.transport.NeuralStatsAction;
 import org.opensearch.neuralsearch.transport.NeuralStatsTransportAction;
+import org.opensearch.neuralsearch.transport.DynamicWeightsAction;
+import org.opensearch.neuralsearch.transport.DynamicWeightsTransportAction;
+import org.opensearch.neuralsearch.transport.DynamicWeightsMetadata;
 import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
 import org.opensearch.neuralsearch.util.PipelineServiceUtil;
 import org.opensearch.plugins.ActionPlugin;
@@ -114,13 +122,15 @@ public class NeuralSearch extends Plugin
         SearchPlugin,
         IngestPlugin,
         ExtensiblePlugin,
-        SearchPipelinePlugin {
+        SearchPipelinePlugin,
+        ClusterPlugin {
     private MLCommonsClientAccessor clientAccessor;
     private NamedXContentRegistry xContentRegistry;
     private NormalizationProcessorWorkflow normalizationProcessorWorkflow;
     private NeuralSearchSettingsAccessor settingsAccessor;
     private PipelineServiceUtil pipelineServiceUtil;
     private InfoStatsManager infoStatsManager;
+    private ClusterService clusterService;
     private final ScoreNormalizationFactory scoreNormalizationFactory = new ScoreNormalizationFactory();
     private final ScoreCombinationFactory scoreCombinationFactory = new ScoreCombinationFactory();
     private final SemanticHighlighter semanticHighlighter;
@@ -161,6 +171,7 @@ public class NeuralSearch extends Plugin
         infoStatsManager = new InfoStatsManager(NeuralSearchClusterUtil.instance(), settingsAccessor, pipelineServiceUtil);
         EventStatsManager.instance().initialize(settingsAccessor);
         this.xContentRegistry = xContentRegistry;
+        this.clusterService = clusterService;
         return List.of(clientAccessor, EventStatsManager.instance(), infoStatsManager);
     }
 
@@ -185,12 +196,16 @@ public class NeuralSearch extends Plugin
         Supplier<DiscoveryNodes> nodesInCluster
     ) {
         RestNeuralStatsAction restNeuralStatsAction = new RestNeuralStatsAction(settingsAccessor, NeuralSearchClusterUtil.instance());
-        return ImmutableList.of(restNeuralStatsAction);
+        RestDynamicWeightsAction restDynamicWeightsAction = new RestDynamicWeightsAction(clusterService);
+        return ImmutableList.of(restNeuralStatsAction, restDynamicWeightsAction);
     }
 
     @Override
     public List<ActionHandler<? extends ActionRequest, ? extends ActionResponse>> getActions() {
-        return Arrays.asList(new ActionHandler<>(NeuralStatsAction.INSTANCE, NeuralStatsTransportAction.class));
+        return Arrays.asList(
+            new ActionHandler<>(NeuralStatsAction.INSTANCE, NeuralStatsTransportAction.class),
+            new ActionHandler<>(DynamicWeightsAction.INSTANCE, DynamicWeightsTransportAction.class)
+        );
     }
 
     @Override
@@ -241,7 +256,9 @@ public class NeuralSearch extends Plugin
             NormalizationProcessor.TYPE,
             new NormalizationProcessorFactory(normalizationProcessorWorkflow, scoreNormalizationFactory, scoreCombinationFactory),
             RRFProcessor.TYPE,
-            new RRFProcessorFactory(normalizationProcessorWorkflow, scoreNormalizationFactory, scoreCombinationFactory)
+            new RRFProcessorFactory(normalizationProcessorWorkflow, scoreNormalizationFactory, scoreCombinationFactory),
+            "dynamic-weights-processor",
+            new DynamicWeightsProcessorFactory(clusterService)
         );
     }
 
@@ -313,6 +330,22 @@ public class NeuralSearch extends Plugin
                 parameters.ingestService.getClusterService(),
                 parameters.analysisRegistry,
                 parameters.client
+            )
+        );
+    }
+
+    @Override
+    public List<NamedWriteableRegistry.Entry> getNamedWriteables() {
+        return List.of(new NamedWriteableRegistry.Entry(Metadata.Custom.class, DynamicWeightsMetadata.TYPE, DynamicWeightsMetadata::new));
+    }
+
+    @Override
+    public List<NamedXContentRegistry.Entry> getNamedXContent() {
+        return List.of(
+            new NamedXContentRegistry.Entry(
+                Metadata.Custom.class,
+                new ParseField(DynamicWeightsMetadata.TYPE),
+                DynamicWeightsMetadata::fromXContent
             )
         );
     }
