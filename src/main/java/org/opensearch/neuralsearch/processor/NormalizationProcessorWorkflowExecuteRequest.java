@@ -10,6 +10,7 @@ import lombok.Getter;
 import org.opensearch.action.search.SearchPhaseContext;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationTechnique;
 import org.opensearch.neuralsearch.processor.normalization.ScoreNormalizationTechnique;
+import org.opensearch.neuralsearch.processor.resultboost.ResultBoostConfig;
 import org.opensearch.search.fetch.FetchSearchResult;
 import org.opensearch.search.pipeline.PipelineProcessingContext;
 import org.opensearch.search.query.QuerySearchResult;
@@ -31,4 +32,9 @@ public class NormalizationProcessorWorkflowExecuteRequest {
     boolean explain;
     final PipelineProcessingContext pipelineProcessingContext;
     final SearchPhaseContext searchPhaseContext;
+    /**
+     * Optional result boost configuration parsed from the search request's "ext" section.
+     * When present, boosts will be applied to matching documents after score combination.
+     */
+    final ResultBoostConfig resultBoostConfig;
 }

@@ -24,9 +24,13 @@ import org.opensearch.neuralsearch.processor.normalization.L2ScoreNormalizationT
 import org.opensearch.neuralsearch.processor.normalization.MinMaxScoreNormalizationTechnique;
 import org.opensearch.neuralsearch.processor.normalization.ScoreNormalizationTechnique;
 import org.opensearch.neuralsearch.processor.normalization.ZScoreNormalizationTechnique;
+import org.opensearch.neuralsearch.processor.resultboost.ResultBoostConfig;
+import org.opensearch.neuralsearch.query.ext.ResultBoostSearchExtBuilder;
+import org.opensearch.search.SearchExtBuilder;
 import org.opensearch.neuralsearch.stats.events.EventStatName;
 import org.opensearch.neuralsearch.stats.events.EventStatsManager;
 import org.opensearch.search.SearchPhaseResult;
+import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.fetch.FetchSearchResult;
 import org.opensearch.search.pipeline.PipelineProcessingContext;
 import org.opensearch.search.query.QuerySearchResult;
@@ -82,6 +86,10 @@ public class NormalizationProcessor extends AbstractScoreHybridizationProcessor 
         boolean explain = Objects.nonNull(searchPhaseContext.getRequest().source().explain())
             && searchPhaseContext.getRequest().source().explain();
         recordStats(normalizationTechnique, combinationTechnique);
+
+        // Parse result boost config from request ext section
+        ResultBoostConfig resultBoostConfig = extractResultBoostConfig(searchPhaseContext);
+
         NormalizationProcessorWorkflowExecuteRequest request = NormalizationProcessorWorkflowExecuteRequest.builder()
             .querySearchResults(querySearchResults)
             .fetchSearchResultOptional(fetchSearchResult)
@@ -90,6 +98,7 @@ public class NormalizationProcessor extends AbstractScoreHybridizationProcessor 
             .explain(explain)
             .pipelineProcessingContext(requestContextOptional.orElse(null))
             .searchPhaseContext(searchPhaseContext)
+            .resultBoostConfig(resultBoostConfig)
             .build();
         normalizationWorkflow.execute(request);
     }
@@ -168,5 +177,59 @@ public class NormalizationProcessor extends AbstractScoreHybridizationProcessor 
         EventStatsManager.increment(EventStatName.NORMALIZATION_PROCESSOR_EXECUTIONS);
         Optional.ofNullable(normTechniqueIncrementers.get(normalizationTechnique.techniqueName())).ifPresent(Runnable::run);
         Optional.ofNullable(combTechniqueIncrementers.get(combinationTechnique.techniqueName())).ifPresent(Runnable::run);
+    }
+
+    /**
+     * Extract result boost configuration from the search request's "ext" section.
+     *
+     * Expected format:
+     * <pre>
+     * {
+     *   "ext": {
+     *     "result_boost": {
+     *       "boosts": [
+     *         { "document_id": "PROMO-12345", "factor": 3.0 },
+     *         { "document_id": "FEATURED-789", "factor": 2.5, "type": "additive" }
+     *       ]
+     *     }
+     *   }
+     * }
+     * </pre>
+     *
+     * @param searchPhaseContext The search phase context containing the request
+     * @return ResultBoostConfig if present, null otherwise
+     */
+    private ResultBoostConfig extractResultBoostConfig(SearchPhaseContext searchPhaseContext) {
+        try {
+            SearchSourceBuilder source = searchPhaseContext.getRequest().source();
+            if (source == null) {
+                return null;
+            }
+
+            // Get parsed ext builders from the search request
+            List<SearchExtBuilder> extBuilders = source.ext();
+            if (extBuilders == null || extBuilders.isEmpty()) {
+                return null;
+            }
+
+            // Find ResultBoostSearchExtBuilder in the ext list
+            ResultBoostSearchExtBuilder resultBoostExt = ResultBoostSearchExtBuilder.fromExtBuilderList(extBuilders);
+            if (resultBoostExt == null) {
+                return null;
+            }
+
+            // Get the params from the SearchExtBuilder and convert to ResultBoostConfig
+            Map<String, Object> params = resultBoostExt.getParams();
+            if (params == null || params.isEmpty()) {
+                return null;
+            }
+
+            // Wrap params in ext structure expected by ResultBoostConfig.fromExtContent
+            Map<String, Object> extContent = Map.of(ResultBoostSearchExtBuilder.PARAM_FIELD_NAME, params);
+            return ResultBoostConfig.fromExtContent(extContent);
+        } catch (Exception e) {
+            log.warn("Failed to extract result_boost config from ext section: {}", e.getMessage());
+            return null;
+        }
     }
 }

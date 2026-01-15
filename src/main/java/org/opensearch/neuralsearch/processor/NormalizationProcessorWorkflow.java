@@ -32,13 +32,15 @@ import org.opensearch.neuralsearch.processor.explain.ExplanationDetails;
 import org.opensearch.neuralsearch.processor.explain.ExplainableTechnique;
 import org.opensearch.neuralsearch.processor.explain.ExplanationPayload;
 import org.opensearch.neuralsearch.processor.normalization.ScoreNormalizer;
+import org.opensearch.neuralsearch.processor.resultboost.DocumentBoost;
+import org.opensearch.neuralsearch.processor.resultboost.ResultBoostConfig;
+import org.opensearch.neuralsearch.processor.resultboost.ResultBooster;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.fetch.FetchSearchResult;
 import org.opensearch.search.pipeline.PipelineProcessingContext;
 import org.opensearch.search.query.QuerySearchResult;
 
-import lombok.AllArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 
 import static org.opensearch.neuralsearch.plugin.NeuralSearch.EXPLANATION_RESPONSE_KEY;
@@ -48,12 +50,18 @@ import static org.opensearch.neuralsearch.search.util.HybridSearchSortUtil.evalu
  * Class abstracts steps required for score normalization and combination, this includes pre-processing of incoming data
  * and post-processing of final results
  */
-@AllArgsConstructor
 @Log4j2
 public class NormalizationProcessorWorkflow {
 
     private final ScoreNormalizer scoreNormalizer;
     private final ScoreCombiner scoreCombiner;
+    private final ResultBooster resultBooster;
+
+    public NormalizationProcessorWorkflow(ScoreNormalizer scoreNormalizer, ScoreCombiner scoreCombiner) {
+        this.scoreNormalizer = scoreNormalizer;
+        this.scoreCombiner = scoreCombiner;
+        this.resultBooster = new ResultBooster();
+    }
 
     /**
      * Start execution of this workflow
@@ -104,6 +112,128 @@ public class NormalizationProcessorWorkflow {
             unprocessedDocIds,
             combineScoresDTO.getFromValueForSingleShard()
         );
+
+        // Apply result boosts after combination (POC: only for single-shard case with fetch results)
+        applyResultBoosts(request, querySearchResults, fetchSearchResultOptional);
+    }
+
+    /**
+     * Apply post-normalization result boosts to documents based on their document IDs.
+     * This method applies boosts AFTER score combination and BEFORE collapse.
+     *
+     * For POC, this works with the single-shard case where fetch results are available,
+     * allowing us to map document IDs to their scores.
+     *
+     * @param request The normalization workflow request containing boost config
+     * @param querySearchResults The query search results to update
+     * @param fetchSearchResultOptional Optional fetch search results with document IDs
+     */
+    private void applyResultBoosts(
+        final NormalizationProcessorWorkflowExecuteRequest request,
+        final List<QuerySearchResult> querySearchResults,
+        final Optional<FetchSearchResult> fetchSearchResultOptional
+    ) {
+
+        ResultBoostConfig boostConfig = request.getResultBoostConfig();
+        if (boostConfig == null || !boostConfig.hasBoosts()) {
+            return;
+        }
+
+        if (fetchSearchResultOptional.isEmpty()) {
+            log.debug("Result boosts configured but no fetch results available - boosts will be applied after fetch phase");
+            return;
+        }
+
+        log.info("Applying {} result boosts to search results", boostConfig.getBoosts().size());
+
+        Map<String, DocumentBoost> boostMap = boostConfig.toBoostMap();
+        FetchSearchResult fetchSearchResult = fetchSearchResultOptional.get();
+        SearchHits searchHits = fetchSearchResult.hits();
+
+        if (searchHits == null || searchHits.getHits() == null || searchHits.getHits().length == 0) {
+            log.debug("No search hits to apply boosts to");
+            return;
+        }
+
+        SearchHit[] hits = searchHits.getHits();
+
+        // Create a map of lucene doc id to string doc id for boost lookup
+        Map<Integer, String> luceneDocIdToStringId = new HashMap<>();
+        Map<Integer, Float> docIdToBoostedScore = new HashMap<>();
+
+        // First pass: apply boosts and build maps
+        float newMaxScore = 0.0f;
+        int boostsApplied = 0;
+
+        for (SearchHit hit : hits) {
+            if (hit == null) {
+                continue;
+            }
+
+            String stringDocId = hit.getId();
+            int luceneDocId = hit.docId();
+
+            if (stringDocId != null) {
+                luceneDocIdToStringId.put(luceneDocId, stringDocId);
+
+                DocumentBoost boost = boostMap.get(stringDocId);
+                if (boost != null) {
+                    float originalScore = hit.getScore();
+                    float boostedScore = resultBooster.applyBoost(originalScore, boost);
+                    hit.score(boostedScore);
+                    docIdToBoostedScore.put(luceneDocId, boostedScore);
+                    boostsApplied++;
+
+                    log.debug(
+                        "Boosted document '{}': {} -> {} (factor={}, type={})",
+                        stringDocId,
+                        originalScore,
+                        boostedScore,
+                        boost.getFactor(),
+                        boost.getType()
+                    );
+                } else {
+                    docIdToBoostedScore.put(luceneDocId, hit.getScore());
+                }
+            }
+
+            if (!Float.isNaN(hit.getScore()) && hit.getScore() > newMaxScore) {
+                newMaxScore = hit.getScore();
+            }
+        }
+
+        if (boostsApplied == 0) {
+            log.debug("No documents matched boost configuration");
+            return;
+        }
+
+        log.info("Applied {} boosts, new max score: {}", boostsApplied, newMaxScore);
+
+        // Update the TopDocs scores to reflect the boosted values
+        if (!querySearchResults.isEmpty()) {
+            QuerySearchResult querySearchResult = querySearchResults.get(0);
+            if (querySearchResult.topDocs() != null && querySearchResult.topDocs().topDocs != null) {
+                TopDocs topDocs = querySearchResult.topDocs().topDocs;
+                for (ScoreDoc scoreDoc : topDocs.scoreDocs) {
+                    Float boostedScore = docIdToBoostedScore.get(scoreDoc.doc);
+                    if (boostedScore != null) {
+                        scoreDoc.score = boostedScore;
+                    }
+                }
+
+                // Update max score in TopDocsAndMaxScore
+                TopDocsAndMaxScore updatedTopDocsAndMaxScore = new TopDocsAndMaxScore(topDocs, newMaxScore);
+                querySearchResult.topDocs(updatedTopDocsAndMaxScore, querySearchResult.sortValueFormats());
+            }
+        }
+
+        // Re-sort the search hits by boosted score if needed
+        // Note: For POC, we're keeping the order as-is and just updating scores
+        // Full implementation would re-sort based on new scores
+
+        // Update SearchHits with new max score
+        SearchHits updatedSearchHits = new SearchHits(hits, searchHits.getTotalHits(), newMaxScore);
+        fetchSearchResult.hits(updatedSearchHits);
     }
 
     private boolean getIsSingleShard(final NormalizationProcessorWorkflowExecuteRequest request) {

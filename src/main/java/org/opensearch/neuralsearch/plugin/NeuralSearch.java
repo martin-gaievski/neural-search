@@ -127,6 +127,7 @@ import org.opensearch.neuralsearch.processor.normalization.ScoreNormalizer;
 import org.opensearch.neuralsearch.processor.rerank.RerankProcessor;
 import org.opensearch.neuralsearch.query.ext.RerankSearchExtBuilder;
 import org.opensearch.neuralsearch.query.ext.AgentStepsSearchExtBuilder;
+import org.opensearch.neuralsearch.query.ext.ResultBoostSearchExtBuilder;
 import org.opensearch.neuralsearch.rest.RestNeuralStatsAction;
 import org.opensearch.neuralsearch.settings.NeuralSearchSettings;
 import org.opensearch.neuralsearch.sparse.SparseIndexEventListener;
@@ -423,7 +424,12 @@ public class NeuralSearch extends Plugin
             ),
             new SearchExtSpec<>(AgentStepsSearchExtBuilder.AGENT_STEPS_FIELD_NAME, in -> new AgentStepsSearchExtBuilder(in), parser -> {
                 throw new UnsupportedOperationException("AgentStepsSearchExtBuilder should not be parsed from request");
-            })
+            }),
+            new SearchExtSpec<>(
+                ResultBoostSearchExtBuilder.PARAM_FIELD_NAME,
+                in -> new ResultBoostSearchExtBuilder(in),
+                parser -> ResultBoostSearchExtBuilder.parse(parser)
+            )
         );
     }
 
