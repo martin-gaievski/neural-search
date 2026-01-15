@@ -106,6 +106,7 @@ import org.opensearch.neuralsearch.processor.NeuralSparseTwoPhaseProcessor;
 import org.opensearch.neuralsearch.processor.NormalizationProcessor;
 import org.opensearch.neuralsearch.processor.NormalizationProcessorWorkflow;
 import org.opensearch.neuralsearch.processor.RRFProcessor;
+import org.opensearch.neuralsearch.processor.ResultBoostResponseProcessor;
 import org.opensearch.neuralsearch.processor.SparseEncodingProcessor;
 import org.opensearch.neuralsearch.processor.TextChunkingProcessor;
 import org.opensearch.neuralsearch.processor.TextEmbeddingProcessor;
@@ -400,7 +401,9 @@ public class NeuralSearch extends Plugin
             ExplanationResponseProcessor.TYPE,
             new ExplanationResponseProcessorFactory(),
             AgenticContextResponseProcessor.TYPE,
-            new AgenticContextResponseProcessor.Factory()
+            new AgenticContextResponseProcessor.Factory(),
+            ResultBoostResponseProcessor.TYPE,
+            new ResultBoostResponseProcessor.Factory()
         );
     }
 

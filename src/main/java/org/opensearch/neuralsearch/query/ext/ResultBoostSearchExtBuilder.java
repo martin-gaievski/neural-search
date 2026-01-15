@@ -5,10 +5,14 @@
 package org.opensearch.neuralsearch.query.ext;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+
+import org.opensearch.neuralsearch.processor.resultboost.DocumentBoost;
+import org.opensearch.neuralsearch.processor.resultboost.ResultBoostConfig;
 
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -104,5 +108,41 @@ public class ResultBoostSearchExtBuilder extends SearchExtBuilder {
      */
     public static ResultBoostSearchExtBuilder parse(XContentParser parser) throws IOException {
         return new ResultBoostSearchExtBuilder(parser.map());
+    }
+
+    /**
+     * Convert the raw params map to a typed ResultBoostConfig.
+     * @return ResultBoostConfig parsed from params, or null if parsing fails
+     */
+    @SuppressWarnings("unchecked")
+    public ResultBoostConfig getResultBoostConfig() {
+        if (params == null || !params.containsKey(BOOSTS_FIELD)) {
+            return null;
+        }
+
+        try {
+            List<Map<String, Object>> boostsList = (List<Map<String, Object>>) params.get(BOOSTS_FIELD);
+            if (boostsList == null || boostsList.isEmpty()) {
+                return null;
+            }
+
+            List<DocumentBoost> boosts = new ArrayList<>();
+            for (Map<String, Object> boostMap : boostsList) {
+                String docId = (String) boostMap.get(DOCUMENT_ID_FIELD);
+                Number factorNum = (Number) boostMap.getOrDefault(FACTOR_FIELD, 1.0);
+                float factor = factorNum.floatValue();
+                String typeStr = (String) boostMap.getOrDefault(TYPE_FIELD, "multiplicative");
+
+                DocumentBoost.BoostType type = "additive".equalsIgnoreCase(typeStr)
+                    ? DocumentBoost.BoostType.ADDITIVE
+                    : DocumentBoost.BoostType.MULTIPLICATIVE;
+
+                boosts.add(DocumentBoost.builder().documentId(docId).factor(factor).type(type).build());
+            }
+
+            return new ResultBoostConfig(boosts);
+        } catch (Exception e) {
+            return null;
+        }
     }
 }

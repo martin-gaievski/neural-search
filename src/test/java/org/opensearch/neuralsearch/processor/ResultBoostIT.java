@@ -23,17 +23,24 @@ import org.opensearch.neuralsearch.BaseNeuralSearchIT;
 import lombok.SneakyThrows;
 
 /**
- * Integration test for the Result Boost feature.
+ * Integration test for the Result Boost feature using SearchResponseProcessor.
  *
- * Tests the happy path scenario where:
- * 1. A hybrid search is executed without boost - observe natural ranking
- * 2. Same hybrid search is executed with a boost on a specific document
- * 3. Verify the boosted document has a higher score than before
+ * This test validates that result boost works correctly in multi-node clusters
+ * by using a SearchResponseProcessor that applies boosts AFTER the fetch phase
+ * when document IDs are available.
+ *
+ * Tests:
+ * 1. Hybrid search without boost - observe natural ranking
+ * 2. Hybrid search with multiplicative boost on a specific document
+ * 3. Hybrid search with additive boost on a specific document
+ * 4. Multi-shard test to verify it works in distributed environments
  */
 public class ResultBoostIT extends BaseNeuralSearchIT {
 
     private static final String TEST_INDEX = "test-result-boost-index";
+    private static final String MULTI_SHARD_INDEX = "test-result-boost-multi-shard";
     private static final String SEARCH_PIPELINE = "result-boost-test-pipeline";
+    private static final String RESPONSE_PROCESSOR_PIPELINE = "result-boost-response-pipeline";
     private static final String TEXT_FIELD = "text";
 
     @Before
@@ -60,10 +67,10 @@ public class ResultBoostIT extends BaseNeuralSearchIT {
         // Initialize test index
         initializeTestIndex();
 
-        // Create search pipeline with normalization processor
-        createSearchPipeline(SEARCH_PIPELINE, DEFAULT_NORMALIZATION_METHOD, DEFAULT_COMBINATION_METHOD, Collections.emptyMap());
+        // Create search pipeline with normalization processor and response boost processor
+        createPipelineWithResultBoostResponseProcessor(RESPONSE_PROCESSOR_PIPELINE);
 
-        // Query 1: Hybrid search WITHOUT result boost
+        // Query 1: Hybrid search WITHOUT result boost (no ext parameter)
         String queryWithoutBoost = """
             {
                 "query": {
@@ -77,7 +84,7 @@ public class ResultBoostIT extends BaseNeuralSearchIT {
             }
             """;
 
-        Map<String, Object> resultsWithoutBoost = searchWithPipeline(TEST_INDEX, queryWithoutBoost, 5, SEARCH_PIPELINE);
+        Map<String, Object> resultsWithoutBoost = searchWithPipeline(TEST_INDEX, queryWithoutBoost, 5, RESPONSE_PROCESSOR_PIPELINE);
 
         // Verify we have results
         List<Map<String, Object>> hitsWithoutBoost = getHits(resultsWithoutBoost);
@@ -118,7 +125,7 @@ public class ResultBoostIT extends BaseNeuralSearchIT {
             }
             """;
 
-        Map<String, Object> resultsWithBoost = searchWithPipeline(TEST_INDEX, queryWithBoost, 5, SEARCH_PIPELINE);
+        Map<String, Object> resultsWithBoost = searchWithPipeline(TEST_INDEX, queryWithBoost, 5, RESPONSE_PROCESSOR_PIPELINE);
 
         // Verify we have results
         List<Map<String, Object>> hitsWithBoost = getHits(resultsWithBoost);
@@ -152,7 +159,7 @@ public class ResultBoostIT extends BaseNeuralSearchIT {
     public void testResultBoost_whenAdditiveBoost_thenScoreIncreasedByFactor() {
         initializeTestIndex();
 
-        createSearchPipeline(SEARCH_PIPELINE, DEFAULT_NORMALIZATION_METHOD, DEFAULT_COMBINATION_METHOD, Collections.emptyMap());
+        createPipelineWithResultBoostResponseProcessor(RESPONSE_PROCESSOR_PIPELINE);
 
         // First get baseline score
         String queryWithoutBoost = """
@@ -168,7 +175,7 @@ public class ResultBoostIT extends BaseNeuralSearchIT {
             }
             """;
 
-        Map<String, Object> resultsWithoutBoost = searchWithPipeline(TEST_INDEX, queryWithoutBoost, 5, SEARCH_PIPELINE);
+        Map<String, Object> resultsWithoutBoost = searchWithPipeline(TEST_INDEX, queryWithoutBoost, 5, RESPONSE_PROCESSOR_PIPELINE);
         List<Map<String, Object>> hitsWithoutBoost = getHits(resultsWithoutBoost);
         Float doc3ScoreWithoutBoost = getDocumentScore(hitsWithoutBoost, "3");
 
@@ -193,7 +200,7 @@ public class ResultBoostIT extends BaseNeuralSearchIT {
             }
             """;
 
-        Map<String, Object> results = searchWithPipeline(TEST_INDEX, queryWithAdditiveBoost, 5, SEARCH_PIPELINE);
+        Map<String, Object> results = searchWithPipeline(TEST_INDEX, queryWithAdditiveBoost, 5, RESPONSE_PROCESSOR_PIPELINE);
 
         List<Map<String, Object>> hits = getHits(results);
         assertFalse("Should have search results", hits.isEmpty());
@@ -212,13 +219,93 @@ public class ResultBoostIT extends BaseNeuralSearchIT {
         );
     }
 
+    /**
+     * Test that result boost works correctly in multi-shard environments.
+     * This is the key test that validates the SearchResponseProcessor approach.
+     */
+    @SneakyThrows
+    public void testResultBoost_whenMultipleShards_thenBoostAppliedCorrectly() {
+        // Create a multi-shard index
+        initializeMultiShardIndex();
+
+        // Create pipeline with response processor
+        createPipelineWithResultBoostResponseProcessor(RESPONSE_PROCESSOR_PIPELINE);
+
+        // Get baseline scores
+        String queryWithoutBoost = """
+            {
+                "query": {
+                    "hybrid": {
+                        "queries": [
+                            { "term": { "text": "hello" } },
+                            { "term": { "text": "test" } }
+                        ]
+                    }
+                }
+            }
+            """;
+
+        Map<String, Object> resultsWithoutBoost = searchWithPipeline(MULTI_SHARD_INDEX, queryWithoutBoost, 10, RESPONSE_PROCESSOR_PIPELINE);
+        List<Map<String, Object>> hitsWithoutBoost = getHits(resultsWithoutBoost);
+
+        assertFalse("Should have results in multi-shard index", hitsWithoutBoost.isEmpty());
+
+        // Find any document that matches
+        Float doc1ScoreWithoutBoost = getDocumentScore(hitsWithoutBoost, "1");
+        assertNotNull("Document 1 should be in results", doc1ScoreWithoutBoost);
+
+        logger.info("Multi-shard without boost - Doc 1 score: {}", doc1ScoreWithoutBoost);
+
+        // Now search with boost
+        String queryWithBoost = """
+            {
+                "query": {
+                    "hybrid": {
+                        "queries": [
+                            { "term": { "text": "hello" } },
+                            { "term": { "text": "test" } }
+                        ]
+                    }
+                },
+                "ext": {
+                    "result_boost": {
+                        "boosts": [
+                            { "document_id": "1", "factor": 5.0 }
+                        ]
+                    }
+                }
+            }
+            """;
+
+        Map<String, Object> resultsWithBoost = searchWithPipeline(MULTI_SHARD_INDEX, queryWithBoost, 10, RESPONSE_PROCESSOR_PIPELINE);
+        List<Map<String, Object>> hitsWithBoost = getHits(resultsWithBoost);
+
+        Float doc1ScoreWithBoost = getDocumentScore(hitsWithBoost, "1");
+        assertNotNull("Document 1 should be in results with boost", doc1ScoreWithBoost);
+
+        logger.info("Multi-shard with boost - Doc 1 score: {} (was: {})", doc1ScoreWithBoost, doc1ScoreWithoutBoost);
+
+        // Verify boost was applied
+        assertTrue(
+            "Document 1 score with boost (" + doc1ScoreWithBoost + ") should be greater than without boost (" + doc1ScoreWithoutBoost + ")",
+            doc1ScoreWithBoost > doc1ScoreWithoutBoost
+        );
+
+        // Verify multiplicative factor was applied correctly
+        float expectedBoostedScore = doc1ScoreWithoutBoost * 5.0f;
+        assertTrue(
+            "Boosted score (" + doc1ScoreWithBoost + ") should be approximately 5x original (" + expectedBoostedScore + ")",
+            Math.abs(doc1ScoreWithBoost - expectedBoostedScore) < 0.01f
+        );
+    }
+
     @SneakyThrows
     private void initializeTestIndex() {
         if (indexExists(TEST_INDEX)) {
             return;
         }
 
-        // Create simple text index with 1 shard (for POC simplicity)
+        // Create simple text index with 1 shard
         String indexMapping = """
             {
                 "settings": {
@@ -246,6 +333,92 @@ public class ResultBoostIT extends BaseNeuralSearchIT {
         int docCount = getDocCount(TEST_INDEX);
         logger.info("Document count after indexing: {}", docCount);
         assertEquals("Expected 5 documents in index", 5, docCount);
+    }
+
+    @SneakyThrows
+    private void initializeMultiShardIndex() {
+        if (indexExists(MULTI_SHARD_INDEX)) {
+            return;
+        }
+
+        // Create index with multiple shards to test distributed behavior
+        String indexMapping = """
+            {
+                "settings": {
+                    "number_of_shards": 3,
+                    "number_of_replicas": 0
+                },
+                "mappings": {
+                    "properties": {
+                        "text": { "type": "text" }
+                    }
+                }
+            }
+            """;
+
+        createIndexWithConfiguration(MULTI_SHARD_INDEX, indexMapping, "");
+
+        // Add test documents - distributed across shards
+        addDocument(MULTI_SHARD_INDEX, "1", Map.of(TEXT_FIELD, "hello world test"));
+        addDocument(MULTI_SHARD_INDEX, "2", Map.of(TEXT_FIELD, "hello there friend"));
+        addDocument(MULTI_SHARD_INDEX, "3", Map.of(TEXT_FIELD, "test document example"));
+        addDocument(MULTI_SHARD_INDEX, "4", Map.of(TEXT_FIELD, "hello test sample"));
+        addDocument(MULTI_SHARD_INDEX, "5", Map.of(TEXT_FIELD, "world peace hello"));
+        addDocument(MULTI_SHARD_INDEX, "6", Map.of(TEXT_FIELD, "test hello world sample"));
+        addDocument(MULTI_SHARD_INDEX, "7", Map.of(TEXT_FIELD, "another test document"));
+        addDocument(MULTI_SHARD_INDEX, "8", Map.of(TEXT_FIELD, "hello goodbye test"));
+
+        // Verify documents are indexed
+        int docCount = getDocCount(MULTI_SHARD_INDEX);
+        logger.info("Multi-shard document count after indexing: {}", docCount);
+        assertEquals("Expected 8 documents in multi-shard index", 8, docCount);
+    }
+
+    /**
+     * Create a search pipeline with normalization processor and result_boost response processor.
+     */
+    @SneakyThrows
+    private void createPipelineWithResultBoostResponseProcessor(String pipelineName) {
+        // Check if pipeline already exists
+        try {
+            Request getRequest = new Request("GET", "/_search/pipeline/" + pipelineName);
+            client().performRequest(getRequest);
+            // Pipeline exists, return
+            return;
+        } catch (Exception e) {
+            // Pipeline doesn't exist, create it
+        }
+
+        String pipelineConfig = """
+            {
+                "description": "Pipeline with normalization and result boost response processor",
+                "phase_results_processors": [
+                    {
+                        "normalization-processor": {
+                            "normalization": {
+                                "technique": "%s"
+                            },
+                            "combination": {
+                                "technique": "%s"
+                            }
+                        }
+                    }
+                ],
+                "response_processors": [
+                    {
+                        "result_boost": {}
+                    }
+                ]
+            }
+            """.formatted(DEFAULT_NORMALIZATION_METHOD, DEFAULT_COMBINATION_METHOD);
+
+        Request request = new Request("PUT", "/_search/pipeline/" + pipelineName);
+        request.setJsonEntity(pipelineConfig);
+
+        Response response = client().performRequest(request);
+        assertEquals(RestStatus.OK, RestStatus.fromCode(response.getStatusLine().getStatusCode()));
+
+        logger.info("Created search pipeline '{}' with result_boost response processor", pipelineName);
     }
 
     @SneakyThrows
