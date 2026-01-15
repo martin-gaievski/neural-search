@@ -25,6 +25,7 @@ import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.pipeline.PipelineProcessingContext;
 import org.opensearch.search.pipeline.Processor;
 import org.opensearch.search.pipeline.SearchResponseProcessor;
+import org.opensearch.search.pipeline.SystemGeneratedProcessor;
 import org.opensearch.search.profile.SearchProfileShardResults;
 
 import lombok.Getter;
@@ -34,6 +35,12 @@ import lombok.extern.log4j.Log4j2;
  * A SearchResponseProcessor that applies boost factors to specific documents
  * based on their document IDs (_id field). This processor runs AFTER the fetch
  * phase when document IDs are available, making it work in multi-node clusters.
+ *
+ * <p>This processor can be used in two ways:
+ * <ul>
+ *     <li>Manual: Add to a search pipeline configuration</li>
+ *     <li>Auto: System-generated when ext.result_boost is present in query (via ResultBoostSystemFactory)</li>
+ * </ul>
  *
  * <p>The processor can receive boost configuration from:
  * <ul>
@@ -74,7 +81,7 @@ import lombok.extern.log4j.Log4j2;
  * </pre>
  */
 @Log4j2
-public class ResultBoostResponseProcessor implements SearchResponseProcessor {
+public class ResultBoostResponseProcessor implements SearchResponseProcessor, SystemGeneratedProcessor {
 
     public static final String TYPE = "result_boost";
 

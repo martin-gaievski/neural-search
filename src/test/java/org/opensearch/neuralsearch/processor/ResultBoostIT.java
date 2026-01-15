@@ -23,16 +23,16 @@ import org.opensearch.neuralsearch.BaseNeuralSearchIT;
 import lombok.SneakyThrows;
 
 /**
- * Integration test for the Result Boost feature using SearchResponseProcessor.
+ * Integration test for the Result Boost feature using SystemGeneratedProcessor (zero-config).
  *
- * This test validates that result boost works correctly in multi-node clusters
- * by using a SearchResponseProcessor that applies boosts AFTER the fetch phase
- * when document IDs are available.
+ * This test validates that result boost works correctly via automatic processor attachment
+ * when ext.result_boost is present in the search request. No explicit result_boost
+ * response processor needs to be configured in the pipeline.
  *
  * Tests:
  * 1. Hybrid search without boost - observe natural ranking
- * 2. Hybrid search with multiplicative boost on a specific document
- * 3. Hybrid search with additive boost on a specific document
+ * 2. Hybrid search with multiplicative boost on a specific document (auto-attached)
+ * 3. Hybrid search with additive boost on a specific document (auto-attached)
  * 4. Multi-shard test to verify it works in distributed environments
  */
 public class ResultBoostIT extends BaseNeuralSearchIT {
@@ -47,6 +47,20 @@ public class ResultBoostIT extends BaseNeuralSearchIT {
     public void setUp() throws Exception {
         super.setUp();
         updateClusterSettings();
+        // Enable the result-boost system-generated processor factory
+        enableResultBoostSystemFactory();
+    }
+
+    /**
+     * Enable the ResultBoostSystemFactory so that it auto-attaches when ext.result_boost is present.
+     * This is required because SystemGeneratedProcessors are disabled by default.
+     */
+    @SneakyThrows
+    private void enableResultBoostSystemFactory() {
+        updateClusterSettings(
+            "cluster.search.enabled_system_generated_factories",
+            java.util.Collections.singletonList("result_boost_auto")
+        );
     }
 
     /**
@@ -375,7 +389,11 @@ public class ResultBoostIT extends BaseNeuralSearchIT {
     }
 
     /**
-     * Create a search pipeline with normalization processor and result_boost response processor.
+     * Create a search pipeline with only normalization processor.
+     *
+     * Note: NO explicit result_boost response processor is configured here!
+     * The ResultBoostSystemFactory will auto-attach the processor when ext.result_boost
+     * is present in the search request (zero-config pattern).
      */
     @SneakyThrows
     private void createPipelineWithResultBoostResponseProcessor(String pipelineName) {
@@ -389,9 +407,11 @@ public class ResultBoostIT extends BaseNeuralSearchIT {
             // Pipeline doesn't exist, create it
         }
 
+        // Pipeline with ONLY normalization processor - no result_boost response processor!
+        // Result boost will be auto-attached via SystemGeneratedProcessor when ext.result_boost is present
         String pipelineConfig = """
             {
-                "description": "Pipeline with normalization and result boost response processor",
+                "description": "Pipeline with normalization only - result boost auto-attached via SystemGeneratedProcessor",
                 "phase_results_processors": [
                     {
                         "normalization-processor": {
@@ -403,11 +423,6 @@ public class ResultBoostIT extends BaseNeuralSearchIT {
                             }
                         }
                     }
-                ],
-                "response_processors": [
-                    {
-                        "result_boost": {}
-                    }
                 ]
             }
             """.formatted(DEFAULT_NORMALIZATION_METHOD, DEFAULT_COMBINATION_METHOD);
@@ -418,7 +433,7 @@ public class ResultBoostIT extends BaseNeuralSearchIT {
         Response response = client().performRequest(request);
         assertEquals(RestStatus.OK, RestStatus.fromCode(response.getStatusLine().getStatusCode()));
 
-        logger.info("Created search pipeline '{}' with result_boost response processor", pipelineName);
+        logger.info("Created search pipeline '{}' with normalization only (result boost auto-attached)", pipelineName);
     }
 
     @SneakyThrows

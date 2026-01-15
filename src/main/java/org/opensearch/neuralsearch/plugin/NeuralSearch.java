@@ -107,6 +107,7 @@ import org.opensearch.neuralsearch.processor.NormalizationProcessor;
 import org.opensearch.neuralsearch.processor.NormalizationProcessorWorkflow;
 import org.opensearch.neuralsearch.processor.RRFProcessor;
 import org.opensearch.neuralsearch.processor.ResultBoostResponseProcessor;
+import org.opensearch.neuralsearch.processor.resultboost.ResultBoostSystemFactory;
 import org.opensearch.neuralsearch.processor.SparseEncodingProcessor;
 import org.opensearch.neuralsearch.processor.TextChunkingProcessor;
 import org.opensearch.neuralsearch.processor.TextEmbeddingProcessor;
@@ -413,8 +414,15 @@ public class NeuralSearch extends Plugin
     ) {
         NeuralSearchClusterUtil.instance().setSearchPipelineService(parameters.searchPipelineService);
 
-        // System-generated semantic highlighting processor that automatically applies when semantic highlighting is detected
-        return Map.of(SemanticHighlightingConstants.SYSTEM_FACTORY_TYPE, new SemanticHighlightingFactory(clientAccessor));
+        // System-generated processors that automatically apply based on search request content:
+        // - SemanticHighlightingFactory: when semantic highlighting is detected
+        // - ResultBoostSystemFactory: when ext.result_boost is present in query
+        return Map.of(
+            SemanticHighlightingConstants.SYSTEM_FACTORY_TYPE,
+            new SemanticHighlightingFactory(clientAccessor),
+            ResultBoostSystemFactory.SYSTEM_FACTORY_TYPE,
+            new ResultBoostSystemFactory()
+        );
     }
 
     @Override
