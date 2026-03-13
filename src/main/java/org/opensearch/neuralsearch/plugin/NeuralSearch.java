@@ -33,6 +33,7 @@ import com.google.common.collect.ImmutableList;
 import lombok.extern.log4j.Log4j2;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.neuralsearch.query.NeuralQueryBuilder;
+import org.opensearch.neuralsearch.query.FusionQueryBuilder;
 import org.opensearch.neuralsearch.query.HybridQueryBuilder;
 import org.opensearch.neuralsearch.query.NeuralSparseQueryBuilder;
 import org.opensearch.neuralsearch.query.NeuralKNNQueryBuilder;
@@ -257,7 +258,8 @@ public class NeuralSearch extends Plugin
             new QuerySpec<>(HybridQueryBuilder.NAME, HybridQueryBuilder::new, HybridQueryBuilder::fromXContent),
             new QuerySpec<>(NeuralSparseQueryBuilder.NAME, NeuralSparseQueryBuilder::new, NeuralSparseQueryBuilder::fromXContent),
             new QuerySpec<>(NeuralKNNQueryBuilder.NAME, NeuralKNNQueryBuilder::new, NeuralKNNQueryBuilder::fromXContent),
-            new QuerySpec<>(AgenticSearchQueryBuilder.NAME, AgenticSearchQueryBuilder::new, AgenticSearchQueryBuilder::fromXContent)
+            new QuerySpec<>(AgenticSearchQueryBuilder.NAME, AgenticSearchQueryBuilder::new, AgenticSearchQueryBuilder::fromXContent),
+            new QuerySpec<>(FusionQueryBuilder.NAME, FusionQueryBuilder::new, FusionQueryBuilder::fromXContent)
         );
     }
 
