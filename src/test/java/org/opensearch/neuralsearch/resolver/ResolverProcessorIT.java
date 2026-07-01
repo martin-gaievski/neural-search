@@ -284,6 +284,25 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
         assertEquals(score, explainValue, 0.0001d);
     }
 
+    /**
+     * CLAIM: conditional Tail — a plain top-K query with track_total_hits:false skips the Tail
+     * (returns only the fused window), while the default keeps the Tail (all leg matches present).
+     * window=1: legs match r1,r2,r3; RRF leader is r1.
+     */
+    @SneakyThrows
+    public void testRankDocs_conditionalTail_plainTopKSkipsTail() {
+        initRankDocsIndexIfNeeded();
+        createResolverPipeline(PIPELINE);
+        // Default (no aggs/explain/highlight, default track_total_hits) -> Tail ON -> all 3 leg matches.
+        String withTail = "{\"size\":10,\"query\":{" + resolverFragment(1) + "}}";
+        // track_total_hits:false + plain top-K -> Tail OFF -> only the single windowed doc.
+        String noTail = "{\"size\":10,\"track_total_hits\":false,\"query\":{" + resolverFragment(1) + "}}";
+        int tailOn = readHits(searchRaw(RANKDOCS_INDEX, withTail)).size();
+        int tailOff = readHits(searchRaw(RANKDOCS_INDEX, noTail)).size();
+        assertEquals("Tail ON: all leg matches present", 3, tailOn);
+        assertEquals("Tail OFF: only the fused window", 1, tailOff);
+    }
+
     private String resolverFragment(final int rankWindowSize) {
         return "\"resolver\":{\"queries\":[{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
             + "\"technique\":\"rrf\",\"rank_constant\":60,\"rank_window_size\":"

@@ -159,8 +159,35 @@ public class ResolverProcessor extends AbstractProcessor implements SearchReques
         }
 
         // RankDocsQuery: Top (ranked docs with RRF scores) + Tail (source-query matches as a
-        // non-scoring filter) so total-hits and aggregations cover the full match set.
-        source.query(new RankDocsQueryBuilder(rankedIds, rankedScores, legs));
+        // non-scoring filter). The Tail RE-RUNS the legs, so add it ONLY when the request needs it
+        // (aggregations / explain / highlight / accurate total hits). Plain top-K skips the Tail,
+        // avoiding re-execution of possibly expensive legs (e.g. kNN).
+        List<QueryBuilder> tail = needsTail(source, rankedIds.length) ? legs : List.of();
+        source.query(new RankDocsQueryBuilder(rankedIds, rankedScores, tail));
+    }
+
+    /**
+     * The Tail (re-running the source legs as a non-scoring filter) is only needed when the request
+     * aggregates, explains, highlights, or wants accurate total hits beyond the fused window.
+     * Skipping it for plain top-K avoids re-executing possibly expensive legs.
+     */
+    private static boolean needsTail(SearchSourceBuilder source, int numRankedDocs) {
+        if (source.aggregations() != null) {
+            return true;
+        }
+        if (Boolean.TRUE.equals(source.explain())) {
+            return true;
+        }
+        if (source.profile()) {
+            return true;
+        }
+        if (source.highlighter() != null) {
+            return true;
+        }
+        Integer trackTotalHitsUpTo = source.trackTotalHitsUpTo();
+        // null = default (track up to 10k) -> keep the Tail for accurate totals; a value above the
+        // window also needs it. track_total_hits:false lets a plain top-K query skip the Tail.
+        return trackTotalHitsUpTo == null || trackTotalHitsUpTo > numRankedDocs;
     }
 
     @Override
