@@ -378,7 +378,8 @@ public class NeuralSearchTests extends OpenSearchQueryTestCase {
         List<ActionFilter> actionFilters = plugin.getActionFilters();
 
         assertNotNull(actionFilters);
-        assertEquals(1, actionFilters.size());
-        assertTrue(actionFilters.get(0) instanceof HybridQuerySearchRequestFilter);
+        assertEquals(2, actionFilters.size());
+        assertTrue(actionFilters.stream().anyMatch(f -> f instanceof HybridQuerySearchRequestFilter));
+        assertTrue(actionFilters.stream().anyMatch(f -> f instanceof org.opensearch.neuralsearch.resolver.ResolverActionFilter));
     }
 }

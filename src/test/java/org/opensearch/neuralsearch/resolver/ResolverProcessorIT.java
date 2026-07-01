@@ -74,6 +74,28 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
         }
     }
 
+    /**
+     * CLAIM (pipeline-free): a resolver query works with NO search pipeline — the ActionFilter
+     * (`ResolverActionFilter`) intercepts and orchestrates it. Same fusion result as the pipeline path.
+     */
+    @SneakyThrows
+    public void testResolver_worksWithoutSearchPipeline() {
+        initIndexIfNeeded();
+        // Intentionally do NOT create or reference any search pipeline.
+        ResolverQueryBuilder resolver = new ResolverQueryBuilder(
+            List.of(new MatchQueryBuilder(TITLE, "apple"), new MatchQueryBuilder(BODY, "banana")),
+            ResolverQueryBuilder.TECHNIQUE_RRF,
+            60,
+            100
+        );
+        // Empty request params => no search_pipeline. The ActionFilter handles the resolver query.
+        Map<String, Object> response = search(INDEX, resolver, null, 10, Map.of(), null);
+        List<String> ids = ids(response);
+        assertEquals(3, ids.size());
+        assertEquals("d_both", ids.get(0));
+        assertFalse(ids.contains("d_none"));
+    }
+
     @SneakyThrows
     private void initIndexIfNeeded() {
         if (indexExists(INDEX)) {

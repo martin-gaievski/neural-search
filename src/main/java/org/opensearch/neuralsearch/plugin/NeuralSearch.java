@@ -102,6 +102,7 @@ import org.opensearch.neuralsearch.ml.MLCommonsClientAccessor;
 import org.opensearch.neuralsearch.processor.AgenticQueryTranslatorProcessor;
 import org.opensearch.neuralsearch.processor.AgenticContextResponseProcessor;
 import org.opensearch.neuralsearch.resolver.RankDocsQueryBuilder;
+import org.opensearch.neuralsearch.resolver.ResolverActionFilter;
 import org.opensearch.neuralsearch.resolver.ResolverProcessor;
 import org.opensearch.neuralsearch.resolver.ResolverQueryBuilder;
 import org.opensearch.neuralsearch.processor.ExplanationResponseProcessor;
@@ -522,6 +523,7 @@ public class NeuralSearch extends Plugin
      */
     @Override
     public List<ActionFilter> getActionFilters() {
-        return List.of(new HybridQuerySearchRequestFilter());
+        // ResolverActionFilter makes the resolver query work pipeline-free (no search_pipeline needed).
+        return List.of(new HybridQuerySearchRequestFilter(), new ResolverActionFilter(() -> client));
     }
 }
