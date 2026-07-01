@@ -101,6 +101,7 @@ import org.opensearch.neuralsearch.highlight.SemanticHighlighter;
 import org.opensearch.neuralsearch.ml.MLCommonsClientAccessor;
 import org.opensearch.neuralsearch.processor.AgenticQueryTranslatorProcessor;
 import org.opensearch.neuralsearch.processor.AgenticContextResponseProcessor;
+import org.opensearch.neuralsearch.resolver.RankDocsQueryBuilder;
 import org.opensearch.neuralsearch.resolver.ResolverProcessor;
 import org.opensearch.neuralsearch.resolver.ResolverQueryBuilder;
 import org.opensearch.neuralsearch.processor.ExplanationResponseProcessor;
@@ -262,7 +263,8 @@ public class NeuralSearch extends Plugin
             new QuerySpec<>(NeuralSparseQueryBuilder.NAME, NeuralSparseQueryBuilder::new, NeuralSparseQueryBuilder::fromXContent),
             new QuerySpec<>(NeuralKNNQueryBuilder.NAME, NeuralKNNQueryBuilder::new, NeuralKNNQueryBuilder::fromXContent),
             new QuerySpec<>(AgenticSearchQueryBuilder.NAME, AgenticSearchQueryBuilder::new, AgenticSearchQueryBuilder::fromXContent),
-            new QuerySpec<>(ResolverQueryBuilder.NAME, ResolverQueryBuilder::new, ResolverQueryBuilder::fromXContent)
+            new QuerySpec<>(ResolverQueryBuilder.NAME, ResolverQueryBuilder::new, ResolverQueryBuilder::fromXContent),
+            new QuerySpec<>(RankDocsQueryBuilder.NAME, RankDocsQueryBuilder::new, RankDocsQueryBuilder::fromXContent)
         );
     }
 

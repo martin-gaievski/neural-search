@@ -9,9 +9,6 @@ import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.core.action.ActionListener;
-import org.opensearch.index.query.BoolQueryBuilder;
-import org.opensearch.index.query.ConstantScoreQueryBuilder;
-import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.search.SearchHit;
@@ -39,20 +36,19 @@ import java.util.Map;
  *   <li>fuses the per-leg results with Reciprocal Rank Fusion at the coordinator
  *       ({@code score(d) = sum_i 1 / (k + rank_i(d))}) &mdash; this is the coordinator-level RRF
  *       that preserves multi-shard relevance quality;</li>
- *   <li>rewrites the request into a standard query that matches the fused docs with their RRF
- *       scores ({@code bool{ should: constant_score(ids: [id])^rrfScore }}), and removes the
- *       resolver marker. The resolver has now "self-erased" &mdash; the query phase runs a standard
- *       query, so explain / profile / aggregations work natively.</li>
+ *   <li>rewrites the request into a standard {@link RankDocsQueryBuilder} — a <b>Top</b> (ranked
+ *       docs with RRF scores) + <b>Tail</b> (source-query matches as a non-scoring filter) query —
+ *       and removes the resolver marker. The resolver has now "self-erased"; the query phase runs a
+ *       standard query, so explain / profile / aggregations / total-hits work natively.</li>
  * </ol>
  *
  * <p>POC simplifications vs. the production design:
  * <ul>
  *   <li>fusion legs are matched back by {@code _id} (no point-in-time snapshot), so results can
  *       drift if the index changes between legs; production uses PIT + {@code _shard_doc};</li>
- *   <li>the injected query uses {@code constant_score} per id, so explain shows the constant score
- *       rather than a per-leg RRF breakdown (rich explain is a Phase-2 follow-up);</li>
- *   <li>{@code total hits} reflects the fused window, not all matching docs (production adds a
- *       tail query for accurate totals and aggregations).</li>
+ *   <li>the Tail filter makes total-hits and aggregations cover the full match set, but explain
+ *       shows the {@code constant_score} plus the source-query details rather than a per-leg RRF
+ *       rank breakdown (a clean breakdown needs a custom Top query — a follow-up).</li>
  * </ul>
  */
 public class ResolverProcessor extends AbstractProcessor implements SearchRequestProcessor {
@@ -98,7 +94,7 @@ public class ResolverProcessor extends AbstractProcessor implements SearchReques
 
         client.multiSearch(multiSearchRequest, ActionListener.wrap(multiSearchResponse -> {
             try {
-                rewriteWithFusedResults(request, source, multiSearchResponse, rankConstant, rankWindowSize);
+                rewriteWithFusedResults(request, source, multiSearchResponse, rankConstant, rankWindowSize, legs);
                 requestListener.onResponse(request);
             } catch (Exception e) {
                 requestListener.onFailure(e);
@@ -115,7 +111,8 @@ public class ResolverProcessor extends AbstractProcessor implements SearchReques
         SearchSourceBuilder source,
         MultiSearchResponse multiSearchResponse,
         int rankConstant,
-        int rankWindowSize
+        int rankWindowSize,
+        List<QueryBuilder> legs
     ) {
         MultiSearchResponse.Item[] items = multiSearchResponse.getResponses();
 
@@ -154,13 +151,16 @@ public class ResolverProcessor extends AbstractProcessor implements SearchReques
             ranked = ranked.subList(0, rankWindowSize);
         }
 
-        // Standard query: each fused doc matched by _id with its RRF score as a constant score.
-        // A document matches exactly one clause, so its bool score equals its RRF score.
-        BoolQueryBuilder fused = new BoolQueryBuilder();
-        for (Map.Entry<String, Float> entry : ranked) {
-            fused.should(new ConstantScoreQueryBuilder(new IdsQueryBuilder().addIds(entry.getKey())).boost(entry.getValue()));
+        String[] rankedIds = new String[ranked.size()];
+        float[] rankedScores = new float[ranked.size()];
+        for (int i = 0; i < ranked.size(); i++) {
+            rankedIds[i] = ranked.get(i).getKey();
+            rankedScores[i] = ranked.get(i).getValue();
         }
-        source.query(fused);
+
+        // RankDocsQuery: Top (ranked docs with RRF scores) + Tail (source-query matches as a
+        // non-scoring filter) so total-hits and aggregations cover the full match set.
+        source.query(new RankDocsQueryBuilder(rankedIds, rankedScores, legs));
     }
 
     @Override

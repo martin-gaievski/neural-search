@@ -39,19 +39,22 @@ Flow (all on the coordinator, before the query phase):
 3. It fuses the per-leg results with **Reciprocal Rank Fusion** at the coordinator
    (`score(d) = Σ 1 / (k + rank_i(d))`) — this is the coordinator-level RRF that keeps
    multi-shard relevance quality.
-4. It **rewrites the request** into a standard query carrying the fused scores
-   (`bool { should: constant_score(ids: [id])^rrfScore }`) and removes the resolver.
-   The query phase now runs a standard query — explain/profile/aggregations work natively.
+4. It **rewrites the request** into a standard `RankDocsQuery` — **Top** (ranked docs with RRF
+   scores) + **Tail** (source legs as a non-scoring filter) — and removes the resolver.
+   The query phase now runs a standard query, so explain/profile work natively and
+   total-hits/aggregations cover the full match set (via the Tail).
 
 ## What's implemented
 
 | File | Role |
 |---|---|
 | `src/main/java/org/opensearch/neuralsearch/resolver/ResolverQueryBuilder.java` | `resolver` marker query — carries sub-queries + RRF params; throws if it reaches a shard unprocessed |
-| `src/main/java/org/opensearch/neuralsearch/resolver/ResolverProcessor.java` | async search request processor — MultiSearch + coordinator RRF + self-erasing rewrite |
-| `src/main/java/org/opensearch/neuralsearch/plugin/NeuralSearch.java` | registers the query + processor; captures the node `Client` |
-| `src/test/java/org/opensearch/neuralsearch/resolver/ResolverQueryBuilderTests.java` | unit tests: parsing, validation, serialization, shard-guard |
-| `src/test/java/org/opensearch/neuralsearch/resolver/ResolverProcessorIT.java` | end-to-end ITs: (1) 3-shard fusion — the doc matching both legs ranks first; (2) combined rescore — a standard top-level `rescore` reranks the *fused* results (single shard, deterministic) |
+| `src/main/java/org/opensearch/neuralsearch/resolver/ResolverProcessor.java` | async search request processor — MultiSearch + coordinator RRF + self-erasing rewrite into a `RankDocsQuery` |
+| `src/main/java/org/opensearch/neuralsearch/resolver/RankDocsQueryBuilder.java` | the injected standard query — **Top** (ranked docs w/ RRF scores) + **Tail** (source legs as a non-scoring filter for total-hits/aggregations/highlight) |
+| `src/main/java/org/opensearch/neuralsearch/plugin/NeuralSearch.java` | registers the `resolver` + `rank_docs` queries and the `resolver` processor; captures the node `Client` |
+| `src/test/java/org/opensearch/neuralsearch/resolver/ResolverQueryBuilderTests.java` | unit: parsing, validation, serialization, shard-guard |
+| `src/test/java/org/opensearch/neuralsearch/resolver/RankDocsQueryBuilderTests.java` | unit: serialization roundtrip, non-parseable guard |
+| `src/test/java/org/opensearch/neuralsearch/resolver/ResolverProcessorIT.java` | end-to-end ITs (6): fusion (3-shard), combined rescore, + RankDocsQuery total-hits / aggregations / highlight / explain |
 
 ## Build & test
 
@@ -131,6 +134,22 @@ POST /demo/_search?search_pipeline=resolver_pipeline
 
 Verified by `ResolverProcessorIT.testResolverRrf_withStandardRescore_thenFusedRankingIsRescored`: without rescore the RRF leader ranks first; with the rescore above, the only document containing the phrase is lifted to #1 — i.e. the rescore blends with the combined RRF score. Caveat: RRF scores are small (~0.01–0.05), so `query_weight`/`rescore_query_weight` must be tuned or the rescore query dominates. Per-leg rescore (rescore inside a leg) is **not** supported in this POC — that's the Phase-2 `rescorer` resolver.
 
+## RankDocsQuery — verified improvements (and what still needs work)
+
+The injected query is a `RankDocsQuery` (Top + Tail). ITs verify which improvements the composite actually delivers:
+
+| Claim | Result | Test |
+|---|---|---|
+| Total hits cover ALL matches (not just the fused window) | ✅ achieved | `testRankDocs_totalHits_coversAllMatchesNotJustWindow` (window=1 → total_hits=3) |
+| Aggregations cover ALL matches | ✅ achieved | `testRankDocs_aggregations_coverAllMatchesNotJustWindow` (buckets A=2, B=1) |
+| Highlighting on sub-query terms | ✅ achieved | `testRankDocs_highlightOnSubQueryTerms` (title → `<em>apple</em>`) |
+| Explain present & score-consistent | ✅ achieved | `testRankDocs_explainIsPresentAndConsistent` |
+| Rich per-leg RRF rank breakdown in explain | ❌ not achieved | explain shows `ConstantScore(_id)^rrf` + source query as a 0-contribution filter, not per-leg ranks — needs a custom Top query |
+| Inner hits / nested | ❌ not implemented | would need a custom Top query / propagation |
+| Collapse completeness, global field sort, deep pagination | ❌ still window-bounded | fundamental to fusion, not fixable here |
+
+Net: the Tail recovers **total-hits, aggregations, and highlighting** (over all matches); explain **works but is not a per-leg breakdown**; inner-hits and the window-bounded items remain.
+
 ## POC simplifications vs. the production design
 
 - **Entry point:** plugin-only `resolver` **query** + request processor, instead of the core
@@ -138,11 +157,12 @@ Verified by `ResolverProcessorIT.testResolverRrf_withStandardRescore_thenFusedRa
   core change). Same architecture (coordinator orchestration + self-erasing rewrite).
 - **Snapshot consistency:** legs are matched back by `_id` (no PIT). Production uses PIT +
   `_shard_doc` so all legs see the same snapshot.
-- **Explain depth:** the injected query uses `constant_score` per id, so explain shows the
-  fused score, not a per-leg RRF breakdown. Rich explain (per-leg rank/score) is a Phase-2
-  follow-up via a custom combine / `RankDocsQuery`.
-- **Total hits / aggregations scope:** reflects the fused window; production adds a tail query
-  for exact totals.
+- **Explain depth:** explain works and is score-consistent, but shows `ConstantScore(_id)^rrf`
+  plus the source query as a 0-contribution filter match — not a per-leg RRF rank breakdown.
+  The clean breakdown needs a custom Top query (`RRFRankDoc` with per-leg positions).
+- **Inner hits / nested:** not produced by the Top+Tail composite — would need the custom Top query.
+- **Tail cost:** the Tail re-runs the source legs on the main search (for all-match total-hits/aggs);
+  production makes the Tail conditional (only when aggs/total-hits/explain need it).
 - **Techniques:** only `rrf`. `linear` (the direct hybrid+NormalizationProcessor replacement),
   `rescorer`, weighted RRF, and rerankers are Phase 2/3.
 - **Stats:** no `EventStatsManager` counters wired yet (follow-up).

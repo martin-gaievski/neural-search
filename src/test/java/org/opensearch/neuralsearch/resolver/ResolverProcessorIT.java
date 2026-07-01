@@ -36,6 +36,7 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     private static final String TITLE = "title";
     private static final String BODY = "body";
     private static final String RESCORE_INDEX = "resolver-poc-rescore-index";
+    private static final String RANKDOCS_INDEX = "resolver-poc-rankdocs-index";
 
     @SneakyThrows
     public void testResolverRrf_whenDocMatchesBothLegs_thenRanksFirst() {
@@ -188,5 +189,143 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
 
     private List<String> ids(final Map<String, Object> response) {
         return readHits(response).stream().map(hit -> (String) hit.get("_id")).toList();
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // RankDocsQuery (Top + Tail) verification: which claimed improvements actually land.
+    // Legs = match(title:apple) + match(body:banana). Leg-matching docs = r1, r2, r3 (r4 matches
+    // neither). Single shard for deterministic RRF. rank_window_size=1 makes the fused window (1
+    // doc) smaller than the match set (3) so the Tail's effect is observable.
+    // ---------------------------------------------------------------------------------------------
+
+    /** CLAIM: total hits cover ALL matches (via the Tail), not just the fused window. */
+    @SneakyThrows
+    public void testRankDocs_totalHits_coversAllMatchesNotJustWindow() {
+        initRankDocsIndexIfNeeded();
+        createResolverPipeline(PIPELINE);
+        // rank_window_size=1 -> fused window is a single doc; the Tail should still surface all 3 matches.
+        String body = "{\"size\":1,\"query\":{" + resolverFragment(1) + "}}";
+        Map<String, Object> response = searchRaw(RANKDOCS_INDEX, body);
+        assertEquals(3, totalHits(response)); // r1, r2, r3 (r4 excluded); NOT 1 (the window)
+        assertEquals("r1", ids(response).get(0)); // the RRF leader (matches both legs) is returned/top
+    }
+
+    /** CLAIM: aggregations run over ALL matches (via the Tail), not just the fused window. */
+    @SneakyThrows
+    public void testRankDocs_aggregations_coverAllMatchesNotJustWindow() {
+        initRankDocsIndexIfNeeded();
+        createResolverPipeline(PIPELINE);
+        String body = "{\"size\":1,\"query\":{"
+            + resolverFragment(1)
+            + "},\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\"}}}}";
+        Map<String, Object> response = searchRaw(RANKDOCS_INDEX, body);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> aggs = (Map<String, Object>) response.get("aggregations");
+        assertNotNull(aggs);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> byCategory = (Map<String, Object>) aggs.get("by_category");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> buckets = (List<Map<String, Object>>) byCategory.get("buckets");
+        int total = 0;
+        int a = 0;
+        int b = 0;
+        for (Map<String, Object> bucket : buckets) {
+            int docCount = ((Number) bucket.get("doc_count")).intValue();
+            total += docCount;
+            if ("A".equals(bucket.get("key"))) {
+                a = docCount;
+            } else if ("B".equals(bucket.get("key"))) {
+                b = docCount;
+            }
+        }
+        // All 3 matches are aggregated even though the fused window was 1: A={r1,r2}=2, B={r3}=1.
+        assertEquals(3, total);
+        assertEquals(2, a);
+        assertEquals(1, b);
+    }
+
+    /** CLAIM: highlighting works because the Tail exposes the sub-queries' terms. */
+    @SneakyThrows
+    public void testRankDocs_highlightOnSubQueryTerms() {
+        initRankDocsIndexIfNeeded();
+        createResolverPipeline(PIPELINE);
+        String body = "{\"size\":10,\"query\":{" + resolverFragment(10) + "},\"highlight\":{\"fields\":{\"title\":{}}}}";
+        Map<String, Object> response = searchRaw(RANKDOCS_INDEX, body);
+
+        Map<String, Object> topHit = readHits(response).get(0);
+        assertEquals("r1", topHit.get("_id"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> highlight = (Map<String, Object>) topHit.get("highlight");
+        assertNotNull("expected a highlight section for the top hit", highlight);
+        @SuppressWarnings("unchecked")
+        List<String> titleHighlights = (List<String>) highlight.get("title");
+        assertNotNull("expected title highlights", titleHighlights);
+        assertFalse(titleHighlights.isEmpty());
+        assertTrue("expected the 'apple' term highlighted", titleHighlights.get(0).contains("<em>apple</em>"));
+    }
+
+    /** CLAIM: explain works; capture what the breakdown actually contains. */
+    @SneakyThrows
+    public void testRankDocs_explainIsPresentAndConsistent() {
+        initRankDocsIndexIfNeeded();
+        createResolverPipeline(PIPELINE);
+        String body = "{\"size\":3,\"explain\":true,\"query\":{" + resolverFragment(10) + "}}";
+        Map<String, Object> response = searchRaw(RANKDOCS_INDEX, body);
+
+        Map<String, Object> topHit = readHits(response).get(0);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> explanation = (Map<String, Object>) topHit.get("_explanation");
+        assertNotNull("explain must be present", explanation);
+        // Log the full structure so we can report exactly how rich the breakdown is.
+        logger.info("RANKDOCS_EXPLAIN {}", explanation);
+        double explainValue = ((Number) explanation.get("value")).doubleValue();
+        double score = ((Number) topHit.get("_score")).doubleValue();
+        assertEquals(score, explainValue, 0.0001d);
+    }
+
+    private String resolverFragment(final int rankWindowSize) {
+        return "\"resolver\":{\"queries\":[{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
+            + "\"technique\":\"rrf\",\"rank_constant\":60,\"rank_window_size\":"
+            + rankWindowSize
+            + "}";
+    }
+
+    @SneakyThrows
+    private void initRankDocsIndexIfNeeded() {
+        if (indexExists(RANKDOCS_INDEX)) {
+            return;
+        }
+        String mapping = "{"
+            + "\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}},"
+            + "\"mappings\":{\"properties\":{"
+            + "\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"},"
+            + "\"content\":{\"type\":\"text\"},\"category\":{\"type\":\"keyword\"}}}"
+            + "}";
+        createIndex(RANKDOCS_INDEX, mapping);
+        // r1 matches both legs (RRF leader); r2 leg1 only; r3 leg2 only; r4 neither.
+        ingestDocument(
+            RANKDOCS_INDEX,
+            "{\"title\":\"apple\",\"body\":\"banana\",\"content\":\"open source search\",\"category\":\"A\"}",
+            "r1"
+        );
+        ingestDocument(
+            RANKDOCS_INDEX,
+            "{\"title\":\"apple pie\",\"body\":\"grape\",\"content\":\"cooking notes\",\"category\":\"A\"}",
+            "r2"
+        );
+        ingestDocument(
+            RANKDOCS_INDEX,
+            "{\"title\":\"cherry\",\"body\":\"banana split\",\"content\":\"dessert menu\",\"category\":\"B\"}",
+            "r3"
+        );
+        ingestDocument(RANKDOCS_INDEX, "{\"title\":\"durian\",\"body\":\"kiwi\",\"content\":\"tropical fruit\",\"category\":\"B\"}", "r4");
+    }
+
+    @SuppressWarnings("unchecked")
+    private int totalHits(final Map<String, Object> response) {
+        Map<String, Object> hits = (Map<String, Object>) response.get("hits");
+        Map<String, Object> total = (Map<String, Object>) hits.get("total");
+        return ((Number) total.get("value")).intValue();
     }
 }
