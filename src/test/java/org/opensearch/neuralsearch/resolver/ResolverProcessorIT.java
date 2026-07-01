@@ -7,7 +7,11 @@ package org.opensearch.neuralsearch.resolver;
 import com.google.common.collect.ImmutableList;
 import lombok.SneakyThrows;
 import org.apache.hc.core5.http.HttpHeaders;
+import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.hc.core5.http.message.BasicHeader;
+import org.opensearch.client.Response;
+import org.opensearch.common.xcontent.XContentHelper;
+import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.neuralsearch.BaseNeuralSearchIT;
 
@@ -31,6 +35,7 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     private static final String PIPELINE = "resolver-poc-pipeline";
     private static final String TITLE = "title";
     private static final String BODY = "body";
+    private static final String RESCORE_INDEX = "resolver-poc-rescore-index";
 
     @SneakyThrows
     public void testResolverRrf_whenDocMatchesBothLegs_thenRanksFirst() {
@@ -99,5 +104,89 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     private List<Map<String, Object>> readHits(final Map<String, Object> response) {
         Map<String, Object> hitsMap = (Map<String, Object>) response.get("hits");
         return (List<Map<String, Object>>) hitsMap.get("hits");
+    }
+
+    /**
+     * Verifies the claim that the resolver supports COMBINED rescore via the standard OpenSearch
+     * top-level {@code rescore} element: after the resolver self-erases into a standard query, core
+     * applies the rescore to the fused (RRF) scores. Uses a single shard so the baseline RRF order
+     * is deterministic.
+     */
+    @SneakyThrows
+    public void testResolverRrf_withStandardRescore_thenFusedRankingIsRescored() {
+        initRescoreIndexIfNeeded();
+        createResolverPipeline(PIPELINE);
+
+        // Same resolver in both requests: RRF over match(title:apple) + match(body:banana).
+        String resolver = "\"resolver\":{\"queries\":[{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
+            + "\"technique\":\"rrf\",\"rank_constant\":60,\"rank_window_size\":100}";
+
+        // Baseline (no rescore): d_rrf_leader is top of both legs -> highest RRF -> ranks first.
+        String baselineBody = "{\"size\":10,\"query\":{" + resolver + "}}";
+        List<String> baselineIds = ids(searchRaw(RESCORE_INDEX, baselineBody));
+        assertFalse(baselineIds.isEmpty());
+        assertEquals("d_rrf_leader", baselineIds.get(0));
+
+        // Same resolver + STANDARD OpenSearch top-level rescore (match_phrase on content).
+        // Only d_phrase_winner contains the phrase, so the combined rescore should lift it to #1.
+        String rescoreBody = "{\"size\":10,\"query\":{"
+            + resolver
+            + "},\"rescore\":{\"window_size\":50,\"query\":{"
+            + "\"rescore_query\":{\"match_phrase\":{\"content\":\"open source search\"}},"
+            + "\"query_weight\":0.6,\"rescore_query_weight\":1.4,\"score_mode\":\"total\"}}}";
+        List<String> rescoredIds = ids(searchRaw(RESCORE_INDEX, rescoreBody));
+        assertFalse(rescoredIds.isEmpty());
+
+        // Combined rescore altered the fused ranking: the phrase doc is now first.
+        assertEquals("d_phrase_winner", rescoredIds.get(0));
+        assertNotEquals(baselineIds.get(0), rescoredIds.get(0));
+    }
+
+    @SneakyThrows
+    private void initRescoreIndexIfNeeded() {
+        if (indexExists(RESCORE_INDEX)) {
+            return;
+        }
+        // Single shard so RRF ranks (and thus the baseline order) are deterministic.
+        String mapping = "{"
+            + "\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}},"
+            + "\"mappings\":{\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"},\"content\":{\"type\":\"text\"}}}"
+            + "}";
+        createIndex(RESCORE_INDEX, mapping);
+        // Strongest in both legs -> RRF #1 without rescore. No rescore phrase.
+        ingestDocument(
+            RESCORE_INDEX,
+            "{\"title\":\"apple apple apple\",\"body\":\"banana banana banana\",\"content\":\"reference notes about databases and indexes\"}",
+            "d_rrf_leader"
+        );
+        // In both legs but weaker (RRF #2), and the only doc containing the rescore phrase.
+        ingestDocument(
+            RESCORE_INDEX,
+            "{\"title\":\"apple\",\"body\":\"banana\",\"content\":\"a practical guide to open source search engines\"}",
+            "d_phrase_winner"
+        );
+        // Leg 1 only, no phrase.
+        ingestDocument(
+            RESCORE_INDEX,
+            "{\"title\":\"apple pie\",\"body\":\"grape jelly\",\"content\":\"unrelated cooking notes\"}",
+            "d_filler"
+        );
+    }
+
+    @SneakyThrows
+    private Map<String, Object> searchRaw(final String index, final String body) {
+        Response response = makeRequest(
+            client(),
+            "POST",
+            "/" + index + "/_search",
+            Map.of("search_pipeline", PIPELINE),
+            toHttpEntity(body),
+            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+        );
+        return XContentHelper.convertToMap(XContentType.JSON.xContent(), EntityUtils.toString(response.getEntity()), false);
+    }
+
+    private List<String> ids(final Map<String, Object> response) {
+        return readHits(response).stream().map(hit -> (String) hit.get("_id")).toList();
     }
 }

@@ -51,7 +51,7 @@ Flow (all on the coordinator, before the query phase):
 | `src/main/java/org/opensearch/neuralsearch/resolver/ResolverProcessor.java` | async search request processor — MultiSearch + coordinator RRF + self-erasing rewrite |
 | `src/main/java/org/opensearch/neuralsearch/plugin/NeuralSearch.java` | registers the query + processor; captures the node `Client` |
 | `src/test/java/org/opensearch/neuralsearch/resolver/ResolverQueryBuilderTests.java` | unit tests: parsing, validation, serialization, shard-guard |
-| `src/test/java/org/opensearch/neuralsearch/resolver/ResolverProcessorIT.java` | end-to-end IT: 3-shard index, verifies the doc matching both legs ranks first |
+| `src/test/java/org/opensearch/neuralsearch/resolver/ResolverProcessorIT.java` | end-to-end ITs: (1) 3-shard fusion — the doc matching both legs ranks first; (2) combined rescore — a standard top-level `rescore` reranks the *fused* results (single shard, deterministic) |
 
 ## Build & test
 
@@ -109,6 +109,27 @@ curl -s -XPOST "localhost:9200/demo/_search?search_pipeline=resolver_pipeline" -
 
 Running the `resolver` query **without** the pipeline surfaces a clear error (the marker query
 is coordinator-only and must be processed by the `resolver` request processor).
+
+## Combined rescore (standard syntax, verified)
+
+Because the resolver self-erases into a standard query, the **standard OpenSearch top-level `rescore`** element works and is applied to the **fused (combined) scores** — the plugin does not parse `rescore`; core does, and the `ResolverProcessor` leaves it untouched. This is the mode hybrid query cannot do (its rescore is per-leg, pre-normalization, capped by leg weight).
+
+```json
+POST /demo/_search?search_pipeline=resolver_pipeline
+{
+  "query": { "resolver": { "queries": [ { "match": { "title": "apple" } }, { "match": { "body": "banana" } } ],
+                           "technique": "rrf", "rank_constant": 60, "rank_window_size": 100 } },
+  "rescore": {
+    "window_size": 50,
+    "query": {
+      "rescore_query": { "match_phrase": { "content": "open source search" } },
+      "query_weight": 0.6, "rescore_query_weight": 1.4, "score_mode": "total"
+    }
+  }
+}
+```
+
+Verified by `ResolverProcessorIT.testResolverRrf_withStandardRescore_thenFusedRankingIsRescored`: without rescore the RRF leader ranks first; with the rescore above, the only document containing the phrase is lifted to #1 — i.e. the rescore blends with the combined RRF score. Caveat: RRF scores are small (~0.01–0.05), so `query_weight`/`rescore_query_weight` must be tuned or the rescore query dominates. Per-leg rescore (rescore inside a leg) is **not** supported in this POC — that's the Phase-2 `rescorer` resolver.
 
 ## POC simplifications vs. the production design
 
