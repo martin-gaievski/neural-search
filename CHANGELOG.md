@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased 3.x](https://github.com/opensearch-project/neural-search/compare/main...HEAD)
 
 ### Features
+* [Hybrid][POC] Resolver framework (Phase 1): self-contained RRF hybrid search via a coordinator-level `resolver` query + request processor that fires sub-queries as a parallel MultiSearch and self-erases into a standard query, so explain/profile/aggregations work natively ([#XXXX](https://github.com/opensearch-project/neural-search/pull/XXXX))
 
 ### Enhancements
 * Improve error messages for misconfigured remote model connectors to provide actionable guidance on post_process_function configuration ([#1825](https://github.com/opensearch-project/neural-search/pull/1825))

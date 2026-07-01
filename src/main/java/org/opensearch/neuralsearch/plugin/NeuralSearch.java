@@ -101,6 +101,8 @@ import org.opensearch.neuralsearch.highlight.SemanticHighlighter;
 import org.opensearch.neuralsearch.ml.MLCommonsClientAccessor;
 import org.opensearch.neuralsearch.processor.AgenticQueryTranslatorProcessor;
 import org.opensearch.neuralsearch.processor.AgenticContextResponseProcessor;
+import org.opensearch.neuralsearch.resolver.ResolverProcessor;
+import org.opensearch.neuralsearch.resolver.ResolverQueryBuilder;
 import org.opensearch.neuralsearch.processor.ExplanationResponseProcessor;
 import org.opensearch.neuralsearch.processor.NeuralQueryEnricherProcessor;
 import org.opensearch.neuralsearch.processor.NeuralSparseTwoPhaseProcessor;
@@ -188,6 +190,7 @@ public class NeuralSearch extends Plugin
         EnginePlugin,
         CircuitBreakerPlugin {
     private MLCommonsClientAccessor clientAccessor;
+    private Client client;
     private NamedXContentRegistry xContentRegistry;
     private NormalizationProcessorWorkflow normalizationProcessorWorkflow;
     private NeuralSearchSettingsAccessor settingsAccessor;
@@ -219,6 +222,7 @@ public class NeuralSearch extends Plugin
         final Supplier<RepositoriesService> repositoriesServiceSupplier
     ) {
         this.clusterService = clusterService;
+        this.client = client;
         // Create clientAccessor first as it's needed by other components
         clientAccessor = new MLCommonsClientAccessor(new MachineLearningNodeClient(client));
 
@@ -257,7 +261,8 @@ public class NeuralSearch extends Plugin
             new QuerySpec<>(HybridQueryBuilder.NAME, HybridQueryBuilder::new, HybridQueryBuilder::fromXContent),
             new QuerySpec<>(NeuralSparseQueryBuilder.NAME, NeuralSparseQueryBuilder::new, NeuralSparseQueryBuilder::fromXContent),
             new QuerySpec<>(NeuralKNNQueryBuilder.NAME, NeuralKNNQueryBuilder::new, NeuralKNNQueryBuilder::fromXContent),
-            new QuerySpec<>(AgenticSearchQueryBuilder.NAME, AgenticSearchQueryBuilder::new, AgenticSearchQueryBuilder::fromXContent)
+            new QuerySpec<>(AgenticSearchQueryBuilder.NAME, AgenticSearchQueryBuilder::new, AgenticSearchQueryBuilder::fromXContent),
+            new QuerySpec<>(ResolverQueryBuilder.NAME, ResolverQueryBuilder::new, ResolverQueryBuilder::fromXContent)
         );
     }
 
@@ -391,7 +396,9 @@ public class NeuralSearch extends Plugin
             NeuralSparseTwoPhaseProcessor.TYPE,
             new NeuralSparseTwoPhaseProcessor.Factory(),
             AgenticQueryTranslatorProcessor.TYPE,
-            new AgenticQueryTranslatorProcessor.Factory(clientAccessor, xContentRegistry, settingsAccessor)
+            new AgenticQueryTranslatorProcessor.Factory(clientAccessor, xContentRegistry, settingsAccessor),
+            ResolverProcessor.TYPE,
+            new ResolverProcessor.Factory(client)
         );
     }
 
