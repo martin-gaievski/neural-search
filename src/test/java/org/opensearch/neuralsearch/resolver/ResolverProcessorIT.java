@@ -37,6 +37,7 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     private static final String BODY = "body";
     private static final String RESCORE_INDEX = "resolver-poc-rescore-index";
     private static final String RANKDOCS_INDEX = "resolver-poc-rankdocs-index";
+    private static final String NESTED_INDEX = "resolver-poc-nested-index";
 
     @SneakyThrows
     public void testResolverRrf_whenDocMatchesBothLegs_thenRanksFirst() {
@@ -368,5 +369,82 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
         Map<String, Object> hits = (Map<String, Object>) response.get("hits");
         Map<String, Object> total = (Map<String, Object>) hits.get("total");
         return ((Number) total.get("value")).intValue();
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Nested placement: a resolver marker inside a bool tree, resolved by the ActionFilter via
+    // recursive search-and-replace + filter push-down. Possible because the resolver self-erases into
+    // a standard query — the hybrid query, which must be top-level, cannot be nested like this.
+    // ---------------------------------------------------------------------------------------------
+
+    /** CLAIM: a resolver nested inside bool.must works with NO pipeline and fusion is preserved. */
+    @SneakyThrows
+    public void testResolver_nestedInBoolMust_noFilter_thenFuses() {
+        initNestedIndexIfNeeded();
+        // bool { must: [ resolver ] } -- no search pipeline; the ActionFilter resolves the nested marker.
+        String body = "{\"size\":10,\"query\":{\"bool\":{\"must\":[{" + resolverFragment(100) + "}]}}}";
+        List<String> ids = ids(searchNoPipeline(NESTED_INDEX, body));
+        // Union of the legs = {n_both_y, n_both_x, n_title_x}; both-legs docs outrank the title-only doc.
+        assertEquals(3, ids.size());
+        assertEquals("n_both_y", ids.get(0));
+        assertTrue(ids.contains("n_both_x"));
+        assertTrue(ids.contains("n_title_x"));
+    }
+
+    /**
+     * CLAIM: an enclosing bool filter is PUSHED DOWN into each leg, so fusion runs over the filtered
+     * candidate set (not a global fuse-then-filter). Decisive setup: rank_window_size=1 and the
+     * globally strongest doc (n_both_y, higher term frequency) is category=y.
+     * <ul>
+     *   <li>With push-down (implemented): legs are filtered to category=x first, so the size-1 fused
+     *       window is n_both_x -> result is [n_both_x].</li>
+     *   <li>Without push-down (fuse-then-filter): the global size-1 window would be n_both_y, which the
+     *       outer category=x filter then removes -> result would be EMPTY.</li>
+     * </ul>
+     * A non-empty [n_both_x] therefore proves the filter reached the legs.
+     */
+    @SneakyThrows
+    public void testResolver_nestedInBool_pushesFilterIntoLegs() {
+        initNestedIndexIfNeeded();
+        String body = "{\"size\":10,\"query\":{\"bool\":{"
+            + "\"must\":[{"
+            + resolverFragment(1)
+            + "}],"
+            + "\"filter\":[{\"term\":{\"category\":\"x\"}}]}}}";
+        List<String> ids = ids(searchNoPipeline(NESTED_INDEX, body));
+        assertEquals(List.of("n_both_x"), ids);
+    }
+
+    @SneakyThrows
+    private void initNestedIndexIfNeeded() {
+        if (indexExists(NESTED_INDEX)) {
+            return;
+        }
+        // Single shard for deterministic RRF ranks.
+        String mapping = "{"
+            + "\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}},"
+            + "\"mappings\":{\"properties\":{"
+            + "\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"},\"category\":{\"type\":\"keyword\"}}}"
+            + "}";
+        createIndex(NESTED_INDEX, mapping);
+        // Matches BOTH legs strongly (higher term frequency) but is category=y -> the global leader.
+        ingestDocument(NESTED_INDEX, "{\"title\":\"apple apple\",\"body\":\"banana banana\",\"category\":\"y\"}", "n_both_y");
+        // Matches BOTH legs (weaker) and is category=x.
+        ingestDocument(NESTED_INDEX, "{\"title\":\"apple\",\"body\":\"banana\",\"category\":\"x\"}", "n_both_x");
+        // Matches leg 1 (title) only, category=x.
+        ingestDocument(NESTED_INDEX, "{\"title\":\"apple\",\"body\":\"grape\",\"category\":\"x\"}", "n_title_x");
+    }
+
+    @SneakyThrows
+    private Map<String, Object> searchNoPipeline(final String index, final String body) {
+        Response response = makeRequest(
+            client(),
+            "POST",
+            "/" + index + "/_search",
+            Map.of(),
+            toHttpEntity(body),
+            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+        );
+        return XContentHelper.convertToMap(XContentType.JSON.xContent(), EntityUtils.toString(response.getEntity()), false);
     }
 }

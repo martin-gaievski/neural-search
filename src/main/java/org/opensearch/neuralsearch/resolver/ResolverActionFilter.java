@@ -11,10 +11,12 @@ import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.client.Client;
 
+import java.util.List;
 import java.util.function.Supplier;
 
 /**
@@ -59,21 +61,47 @@ public class ResolverActionFilter implements ActionFilter {
     ) {
         if (SearchAction.NAME.equals(action) && request instanceof SearchRequest searchRequest) {
             SearchSourceBuilder source = searchRequest.source();
-            if (source != null && source.query() instanceof ResolverQueryBuilder resolver) {
+            if (source != null && source.query() != null) {
+                QueryBuilder query = source.query();
                 Client client = clientSupplier.get();
-                client.multiSearch(
-                    ResolverOrchestrator.buildLegMultiSearch(searchRequest, resolver),
-                    ActionListener.wrap(multiSearchResponse -> {
-                        try {
-                            // Rewrites searchRequest.source().query() in place; proceed with the mutated request.
-                            ResolverOrchestrator.applyFusedResults(source, multiSearchResponse, resolver);
-                            chain.proceed(task, action, request, listener);
-                        } catch (Exception e) {
-                            listener.onFailure(e);
-                        }
-                    }, listener::onFailure)
-                );
-                return; // defer: proceed only after fusion completes
+
+                // Case 1: top-level resolver — rewrite the whole query (conditional Tail).
+                if (query instanceof ResolverQueryBuilder resolver) {
+                    client.multiSearch(
+                        ResolverOrchestrator.buildLegMultiSearch(searchRequest, resolver),
+                        ActionListener.wrap(multiSearchResponse -> {
+                            try {
+                                ResolverOrchestrator.applyFusedResults(source, multiSearchResponse, resolver);
+                                chain.proceed(task, action, request, listener);
+                            } catch (Exception e) {
+                                listener.onFailure(e);
+                            }
+                        }, listener::onFailure)
+                    );
+                    return; // defer
+                }
+
+                // Case 2: one or more resolver markers nested inside a bool tree — resolve each in place.
+                List<ResolverOrchestrator.MarkerContext> markers = ResolverOrchestrator.collectMarkers(query);
+                if (markers.isEmpty() == false) {
+                    client.multiSearch(
+                        ResolverOrchestrator.buildMarkerMultiSearch(searchRequest, markers),
+                        ActionListener.wrap(multiSearchResponse -> {
+                            try {
+                                source.query(
+                                    ResolverOrchestrator.replaceMarkers(
+                                        query,
+                                        ResolverOrchestrator.resolveMarkers(markers, multiSearchResponse)
+                                    )
+                                );
+                                chain.proceed(task, action, request, listener);
+                            } catch (Exception e) {
+                                listener.onFailure(e);
+                            }
+                        }, listener::onFailure)
+                    );
+                    return; // defer
+                }
             }
         }
         chain.proceed(task, action, request, listener);
