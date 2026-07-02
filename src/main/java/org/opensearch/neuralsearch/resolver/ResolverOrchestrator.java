@@ -207,28 +207,92 @@ public final class ResolverOrchestrator {
     }
 
     private static RankedDocs computeRankedDocs(MultiSearchResponse.Item[] items, ResolverQueryBuilder resolver) {
-        Map<String, Float> rrfScores = new LinkedHashMap<>();
+        Map<String, Float> combined = ResolverQueryBuilder.TECHNIQUE_ARITHMETIC_MEAN.equals(resolver.technique())
+            ? minMaxArithmeticMean(items, resolver)
+            : rrf(items, resolver);
+        return toRankedDocs(combined, resolver.rankWindowSize());
+    }
+
+    /** Rank-based Reciprocal Rank Fusion: score(d) = Σ 1 / (rank_constant + rank_i(d) + 1). */
+    private static Map<String, Float> rrf(MultiSearchResponse.Item[] items, ResolverQueryBuilder resolver) {
+        Map<String, Float> scores = new LinkedHashMap<>();
         for (int legIndex = 0; legIndex < items.length; legIndex++) {
-            MultiSearchResponse.Item item = items[legIndex];
-            if (item.isFailure()) {
-                throw new IllegalStateException(
-                    String.format(Locale.ROOT, "[resolver] sub-query %d failed: %s", legIndex, item.getFailureMessage()),
-                    item.getFailure()
-                );
-            }
-            SearchHit[] hits = item.getResponse().getHits().getHits();
+            SearchHit[] hits = hitsOrThrow(items[legIndex], legIndex);
             for (int rank = 0; rank < hits.length; rank++) {
                 String id = hits[rank].getId();
                 if (id == null) {
                     continue;
                 }
-                rrfScores.merge(id, 1.0f / (resolver.rankConstant() + rank + 1), Float::sum);
+                scores.merge(id, 1.0f / (resolver.rankConstant() + rank + 1), Float::sum);
             }
         }
-        List<Map.Entry<String, Float>> ranked = new ArrayList<>(rrfScores.entrySet());
+        return scores;
+    }
+
+    /**
+     * Score-based min-max normalization + (weighted) arithmetic mean. Per leg, raw {@code _score}s are
+     * min-max normalized over the returned window; per doc, the combined score is the weighted mean over
+     * the legs it matched. Mirrors hybrid's {@code MinMaxScoreNormalizationTechnique} (degenerate
+     * min==max -> 1.0; normalized 0 -> 0.001 floor so a matched doc is never confused with a non-match)
+     * and {@code ArithmeticMeanScoreCombinationTechnique} (non-matched legs excluded from the denominator).
+     */
+    private static Map<String, Float> minMaxArithmeticMean(MultiSearchResponse.Item[] items, ResolverQueryBuilder resolver) {
+        Map<String, float[]> acc = new LinkedHashMap<>(); // id -> { weightedSum, sumOfMatchedWeights }
+        for (int legIndex = 0; legIndex < items.length; legIndex++) {
+            SearchHit[] hits = hitsOrThrow(items[legIndex], legIndex);
+            float min = Float.MAX_VALUE;
+            float max = -Float.MAX_VALUE;
+            for (SearchHit hit : hits) {
+                min = Math.min(min, hit.getScore());
+                max = Math.max(max, hit.getScore());
+            }
+            float weight = weightForLeg(resolver.weights(), legIndex);
+            for (SearchHit hit : hits) {
+                String id = hit.getId();
+                if (id == null) {
+                    continue;
+                }
+                float normalized = normalizeMinMax(hit.getScore(), min, max);
+                float[] entry = acc.computeIfAbsent(id, k -> new float[2]);
+                entry[0] += weight * normalized;
+                entry[1] += weight;
+            }
+        }
+        Map<String, Float> combined = new LinkedHashMap<>();
+        for (Map.Entry<String, float[]> e : acc.entrySet()) {
+            float sumWeights = e.getValue()[1];
+            combined.put(e.getKey(), sumWeights == 0.0f ? 0.0f : e.getValue()[0] / sumWeights);
+        }
+        return combined;
+    }
+
+    private static float normalizeMinMax(float score, float min, float max) {
+        if (Float.compare(max, min) == 0) {
+            return 1.0f; // single/degenerate leg
+        }
+        float normalized = (score - min) / (max - min);
+        return normalized == 0.0f ? 0.001f : normalized; // floor: matched-with-min != not-matched(0)
+    }
+
+    private static float weightForLeg(float[] weights, int legIndex) {
+        return (weights == null || weights.length == 0) ? 1.0f : weights[legIndex];
+    }
+
+    private static SearchHit[] hitsOrThrow(MultiSearchResponse.Item item, int legIndex) {
+        if (item.isFailure()) {
+            throw new IllegalStateException(
+                String.format(Locale.ROOT, "[resolver] sub-query %d failed: %s", legIndex, item.getFailureMessage()),
+                item.getFailure()
+            );
+        }
+        return item.getResponse().getHits().getHits();
+    }
+
+    private static RankedDocs toRankedDocs(Map<String, Float> scoresById, int rankWindowSize) {
+        List<Map.Entry<String, Float>> ranked = new ArrayList<>(scoresById.entrySet());
         ranked.sort(Comparator.<Map.Entry<String, Float>>comparingDouble(e -> -e.getValue()).thenComparing(Map.Entry::getKey));
-        if (ranked.size() > resolver.rankWindowSize()) {
-            ranked = ranked.subList(0, resolver.rankWindowSize());
+        if (ranked.size() > rankWindowSize) {
+            ranked = ranked.subList(0, rankWindowSize);
         }
         String[] ids = new String[ranked.size()];
         float[] scores = new float[ranked.size()];

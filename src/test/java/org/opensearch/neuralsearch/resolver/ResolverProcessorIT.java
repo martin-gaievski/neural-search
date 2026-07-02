@@ -328,6 +328,38 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
         assertEquals("Tail OFF: only the fused window", 1, tailOff);
     }
 
+    /**
+     * CLAIM (Option B): the resolver also supports **min_max normalization + arithmetic_mean combination**,
+     * selected via the `normalization`/`combination` objects — pipeline-free. Happy path: the doc strongest
+     * in BOTH legs normalizes to ~1.0 in each leg, giving the highest arithmetic mean, so it ranks first.
+     */
+    @SneakyThrows
+    public void testResolver_minMaxArithmeticMean_happyPath() {
+        initRescoreIndexIfNeeded();
+        String body = "{\"size\":10,\"query\":{\"resolver\":{"
+            + "\"queries\":[{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
+            + "\"rank_window_size\":100,"
+            + "\"normalization\":{\"technique\":\"min_max\"},"
+            + "\"combination\":{\"technique\":\"arithmetic_mean\"}"
+            + "}}}";
+        Map<String, Object> response = searchNoPipeline(RESCORE_INDEX, body);
+        List<Map<String, Object>> hits = readHits(response);
+        List<String> ids = hits.stream().map(hit -> (String) hit.get("_id")).toList();
+
+        // d_rrf_leader has the strongest title+body match (highest TF) -> ~1.0 in both legs -> top mean.
+        assertEquals("d_rrf_leader", ids.get(0));
+        assertTrue(ids.contains("d_phrase_winner")); // both legs, weaker
+        assertTrue(ids.contains("d_filler"));         // leg 1 only, still present
+
+        // Self-erased into a standard scored query -> scores are in descending order.
+        double previous = Double.MAX_VALUE;
+        for (Map<String, Object> hit : hits) {
+            double score = ((Number) hit.get("_score")).doubleValue();
+            assertTrue(score <= previous);
+            previous = score;
+        }
+    }
+
     private String resolverFragment(final int rankWindowSize) {
         return "\"resolver\":{\"queries\":[{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
             + "\"technique\":\"rrf\",\"rank_constant\":60,\"rank_window_size\":"
