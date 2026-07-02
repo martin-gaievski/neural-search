@@ -405,6 +405,21 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
             + "}";
     }
 
+    /**
+     * CLAIM: accurate total-hits can be derived from the legs' OWN totals (id set-union) — no Tail — when every
+     * leg's full match set is retrieved. rank_window_size=100 >> the leg match counts (2 each), so the union
+     * {r1,r2,r3}=3 is computed from stage-A alone and patched onto the response (Tail skipped).
+     */
+    @SneakyThrows
+    public void testRankDocs_totalHits_fromLegUnion_whenFullyRetrieved() {
+        initRankDocsIndexIfNeeded();
+        String body = "{\"size\":10,\"query\":{" + resolverFragment(100) + "}}";
+        Map<String, Object> response = searchNoPipeline(RANKDOCS_INDEX, body);
+        assertEquals(3, totalHits(response));      // union {r1,r2,r3} — from the legs, not a Tail re-run
+        assertEquals("r1", ids(response).get(0));  // RRF leader (matches both legs)
+        assertFalse(ids(response).contains("r4")); // matches neither leg
+    }
+
     @SneakyThrows
     private void initRankDocsIndexIfNeeded() {
         if (indexExists(RANKDOCS_INDEX)) {

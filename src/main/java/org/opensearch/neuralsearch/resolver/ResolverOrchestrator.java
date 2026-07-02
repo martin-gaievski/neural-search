@@ -4,6 +4,7 @@
  */
 package org.opensearch.neuralsearch.resolver;
 
+import org.apache.lucene.search.TotalHits;
 import org.opensearch.action.search.MultiSearchRequest;
 import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
@@ -11,16 +12,19 @@ import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.search.SearchHit;
+import org.opensearch.search.SearchHits;
 import org.opensearch.search.builder.SearchSourceBuilder;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Shared coordinator-level orchestration for the resolver, independent of the interception point
@@ -52,26 +56,49 @@ public final class ResolverOrchestrator {
     /** Build one independent search per leg, to be fired together as a parallel MultiSearch. */
     public static MultiSearchRequest buildLegMultiSearch(SearchRequest request, ResolverQueryBuilder resolver) {
         MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
+        int trackTotalHitsUpTo = trackTotalHitsCap(request.source());
         for (QueryBuilder leg : resolver.queries()) {
-            multiSearchRequest.add(legSearch(request, leg, List.of(), resolver.rankWindowSize()));
+            multiSearchRequest.add(legSearch(request, leg, List.of(), resolver.rankWindowSize(), trackTotalHitsUpTo));
         }
         return multiSearchRequest;
     }
 
-    /** Compute coordinator RRF and rewrite {@code source.query()} into a {@link RankDocsQueryBuilder}
-     *  (Top + conditional Tail). */
-    public static void applyFusedResults(
+    /** The main query's effective track_total_hits cap (default 10000 when unset), propagated to the legs so
+     *  the leg-union total reproduces what the main query would report. */
+    private static final int DEFAULT_TRACK_TOTAL_HITS = 10000;
+
+    private static int trackTotalHitsCap(SearchSourceBuilder source) {
+        Integer trackTotalHitsUpTo = source == null ? null : source.trackTotalHitsUpTo();
+        return trackTotalHitsUpTo == null ? DEFAULT_TRACK_TOTAL_HITS : trackTotalHitsUpTo;
+    }
+
+    /** Compute coordinator RRF / min_max+AM and rewrite {@code source.query()} into a {@link RankDocsQueryBuilder}.
+     *  Returns a {@link TotalHits} to patch onto the response when accurate total-hits are derivable from the legs'
+     *  own totals (Tail avoided); null when Top-only (no accurate totals needed) or when the Tail is kept (it carries
+     *  totals / aggregations / explain / highlight). */
+    public static TotalHits applyFusedResults(
         SearchSourceBuilder source,
         MultiSearchResponse multiSearchResponse,
         ResolverQueryBuilder resolver
     ) {
-        RankedDocs ranked = computeRankedDocs(multiSearchResponse.getResponses(), resolver);
+        MultiSearchResponse.Item[] items = multiSearchResponse.getResponses();
+        RankedDocs ranked = computeRankedDocs(items, resolver);
         if (ranked.ids.length == 0) {
             source.query(new MatchNoneQueryBuilder());
-            return;
+            return null;
         }
-        List<QueryBuilder> tail = needsTail(source, ranked.ids.length) ? resolver.queries() : List.of();
-        source.query(new RankDocsQueryBuilder(ranked.ids, ranked.scores, tail));
+        boolean topOnly;
+        TotalHits patchTotal = null;
+        if (needsExecutionTail(source)) {
+            topOnly = false; // aggregations / explain / profile / highlight need the full match set IN the query
+        } else if (wantsTotalsBeyondWindow(source, ranked.ids.length)) {
+            patchTotal = legUnionTotalHits(items); // derive the union total from the legs (no re-run) when exact/capped
+            topOnly = patchTotal != null;          // else fall back to the Tail for an exact count
+        } else {
+            topOnly = true; // track_total_hits:false -> plain top-K, no Tail
+        }
+        source.query(new RankDocsQueryBuilder(ranked.ids, ranked.scores, topOnly ? List.of() : resolver.queries()));
+        return patchTotal;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -121,7 +148,7 @@ public final class ResolverOrchestrator {
         MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
         for (MarkerContext mc : markers) {
             for (QueryBuilder leg : mc.marker().queries()) {
-                multiSearchRequest.add(legSearch(request, leg, mc.pushDownFilters(), mc.marker().rankWindowSize()));
+                multiSearchRequest.add(legSearch(request, leg, mc.pushDownFilters(), mc.marker().rankWindowSize(), 0));
             }
         }
         return multiSearchRequest;
@@ -189,7 +216,13 @@ public final class ResolverOrchestrator {
     // ---------------------------------------------------------------------------------------------
 
     /** A single leg search: the leg query, optionally constrained by pushed-down filters, id-only. */
-    private static SearchRequest legSearch(SearchRequest request, QueryBuilder leg, List<QueryBuilder> pushDownFilters, int size) {
+    private static SearchRequest legSearch(
+        SearchRequest request,
+        QueryBuilder leg,
+        List<QueryBuilder> pushDownFilters,
+        int size,
+        int trackTotalHitsUpTo
+    ) {
         QueryBuilder legQuery = leg;
         if (pushDownFilters.isEmpty() == false) {
             BoolQueryBuilder constrained = new BoolQueryBuilder().must(leg);
@@ -198,11 +231,13 @@ public final class ResolverOrchestrator {
             }
             legQuery = constrained;
         }
-        SearchSourceBuilder legSource = new SearchSourceBuilder().query(legQuery)
-            .size(size)
-            .from(0)
-            .fetchSource(false)
-            .trackTotalHits(false);
+        SearchSourceBuilder legSource = new SearchSourceBuilder().query(legQuery).size(size).from(0).fetchSource(false);
+        if (trackTotalHitsUpTo > 0) {
+            // count matches (up to the cap) so the union total can be derived from the legs without a Tail re-run
+            legSource.trackTotalHitsUpTo(trackTotalHitsUpTo);
+        } else {
+            legSource.trackTotalHits(false);
+        }
         return new SearchRequest(request.indices()).indicesOptions(request.indicesOptions()).source(legSource);
     }
 
@@ -304,23 +339,55 @@ public final class ResolverOrchestrator {
         return new RankedDocs(ids, scores);
     }
 
-    /** The Tail (re-running the source legs as a filter) is only needed for aggregations / explain /
-     *  highlight / accurate total hits; plain top-K skips it. Applies to the top-level path only. */
-    private static boolean needsTail(SearchSourceBuilder source, int numRankedDocs) {
-        if (source.aggregations() != null) {
-            return true;
-        }
-        if (Boolean.TRUE.equals(source.explain())) {
-            return true;
-        }
-        if (source.profile()) {
-            return true;
-        }
-        if (source.highlighter() != null) {
-            return true;
-        }
+    /** Aggregations / explain / profile / highlight require the full match set to be present IN the query
+     *  execution (stage B) — only the Tail provides that. */
+    private static boolean needsExecutionTail(SearchSourceBuilder source) {
+        return source.aggregations() != null || Boolean.TRUE.equals(source.explain()) || source.profile() || source.highlighter() != null;
+    }
+
+    private static boolean wantsTotalsBeyondWindow(SearchSourceBuilder source, int numRankedDocs) {
         Integer trackTotalHitsUpTo = source.trackTotalHitsUpTo();
         return trackTotalHitsUpTo == null || trackTotalHitsUpTo > numRankedDocs;
+    }
+
+    /** Union total-hits derived from the legs' OWN totals + retrieved ids — no leg re-run. Returns:
+     *  - (max leg total, GTE) when a leg hit its track_total_hits cap → union ≥ that; matches what the Tail reports;
+     *  - (id-set-union size, EQUAL_TO) when every leg's full match set was retrieved (leg total ≤ retrieved) → exact;
+     *  - null when neither holds (a moderate uncapped set only partially retrieved) → caller keeps the Tail for an
+     *    exact count. Data (BEIR Quora/TREC-COVID): the capped branch covers the common large-corpus case exactly. */
+    private static TotalHits legUnionTotalHits(MultiSearchResponse.Item[] items) {
+        boolean anyCapped = false;
+        boolean allFullyRetrieved = true;
+        long maxLegTotal = 0;
+        Set<String> unionIds = new HashSet<>();
+        for (MultiSearchResponse.Item item : items) {
+            if (item.isFailure()) {
+                continue;
+            }
+            SearchHits hits = item.getResponse().getHits();
+            TotalHits legTotalHits = hits.getTotalHits();
+            long legTotal = legTotalHits == null ? 0 : legTotalHits.value();
+            maxLegTotal = Math.max(maxLegTotal, legTotal);
+            if (legTotalHits != null && legTotalHits.relation() == TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO) {
+                anyCapped = true;
+            }
+            SearchHit[] legHits = hits.getHits();
+            if (legTotal > legHits.length) {
+                allFullyRetrieved = false;
+            }
+            for (SearchHit hit : legHits) {
+                if (hit.getId() != null) {
+                    unionIds.add(hit.getId());
+                }
+            }
+        }
+        if (anyCapped) {
+            return new TotalHits(maxLegTotal, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+        }
+        if (allFullyRetrieved) {
+            return new TotalHits(unionIds.size(), TotalHits.Relation.EQUAL_TO);
+        }
+        return null;
     }
 
     private record RankedDocs(String[] ids, float[] scores) {
