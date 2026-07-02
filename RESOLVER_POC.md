@@ -13,10 +13,10 @@ Design background: `steering_documents/hybrid query/simplified_hybrid_search/`
 
 ## What this POC does
 
-A single self-contained query (no normalization search pipeline needed):
+A single self-contained query — **no search pipeline required** (the `ResolverActionFilter` intercepts it on the coordinator):
 
 ```json
-POST /my-index/_search?search_pipeline=resolver_pipeline
+POST /my-index/_search
 {
   "query": {
     "resolver": {
@@ -33,7 +33,7 @@ POST /my-index/_search?search_pipeline=resolver_pipeline
 ```
 
 Flow (all on the coordinator, before the query phase):
-1. The `resolver` request processor detects the `resolver` query.
+1. The `ResolverActionFilter` (pipeline-free; or, optionally, the `resolver` request processor) detects the `resolver` query.
 2. It fires each sub-query as an **independent, parallel** search via `MultiSearch`
    (each leg fans out to all shards → globally merged results).
 3. It fuses the per-leg results with **Reciprocal Rank Fusion** at the coordinator
@@ -49,12 +49,40 @@ Flow (all on the coordinator, before the query phase):
 | File | Role |
 |---|---|
 | `src/main/java/org/opensearch/neuralsearch/resolver/ResolverQueryBuilder.java` | `resolver` marker query — carries sub-queries + RRF params; throws if it reaches a shard unprocessed |
-| `src/main/java/org/opensearch/neuralsearch/resolver/ResolverProcessor.java` | async search request processor — MultiSearch + coordinator RRF + self-erasing rewrite into a `RankDocsQuery` |
+| `src/main/java/org/opensearch/neuralsearch/resolver/ResolverOrchestrator.java` | shared orchestration — build parallel-leg MultiSearch + coordinator RRF + rewrite to `RankDocsQuery` (Top + conditional Tail) |
+| `src/main/java/org/opensearch/neuralsearch/resolver/ResolverActionFilter.java` | **pipeline-free** entry — ActionFilter that runs the orchestration for any `resolver` query, no search pipeline needed |
+| `src/main/java/org/opensearch/neuralsearch/resolver/ResolverProcessor.java` | search-pipeline entry (now **optional** — the ActionFilter supersedes it) |
 | `src/main/java/org/opensearch/neuralsearch/resolver/RankDocsQueryBuilder.java` | the injected standard query — **Top** (ranked docs w/ RRF scores) + **Tail** (source legs as a non-scoring filter for total-hits/aggregations/highlight) |
-| `src/main/java/org/opensearch/neuralsearch/plugin/NeuralSearch.java` | registers the `resolver` + `rank_docs` queries and the `resolver` processor; captures the node `Client` |
+| `src/main/java/org/opensearch/neuralsearch/plugin/NeuralSearch.java` | registers the `resolver` + `rank_docs` queries, the `ResolverActionFilter` (pipeline-free), and the optional `resolver` processor; captures the node `Client` |
 | `src/test/java/org/opensearch/neuralsearch/resolver/ResolverQueryBuilderTests.java` | unit: parsing, validation, serialization, shard-guard |
 | `src/test/java/org/opensearch/neuralsearch/resolver/RankDocsQueryBuilderTests.java` | unit: serialization roundtrip, non-parseable guard |
-| `src/test/java/org/opensearch/neuralsearch/resolver/ResolverProcessorIT.java` | end-to-end ITs (6): fusion (3-shard), combined rescore, + RankDocsQuery total-hits / aggregations / highlight / explain |
+| `src/test/java/org/opensearch/neuralsearch/resolver/ResolverProcessorIT.java` | end-to-end ITs (11): fusion (3-shard), pipeline-free, nested-in-`bool` + multi-marker/multi-level (filter push-down), combined rescore, + RankDocsQuery total-hits / aggregations / highlight / explain / conditional-Tail |
+
+## Pipeline-free (no search pipeline required)
+
+The resolver works **without any search pipeline**. `ResolverActionFilter` (registered via `getActionFilters()`) intercepts every search on the coordinator, detects the `resolver` query, and runs the MultiSearch + RRF + rewrite orchestration — mirroring `HybridQuerySearchRequestFilter` (documented as working "transparently without any pipeline"), but async. So this works with **no `?search_pipeline=`**:
+
+```json
+POST /demo/_search
+{ "query": { "resolver": { "queries": [ { "match": { "title": "apple" } }, { "match": { "body": "banana" } } ],
+                           "technique": "rrf", "rank_constant": 60, "rank_window_size": 100 } } }
+```
+
+Verified by `ResolverProcessorIT.testResolver_worksWithoutSearchPipeline`. This removes the "mandatory pipeline" friction (a win for managed/serverless — no pipeline object to create or manage, no pipeline restrictions). The request processor + `?search_pipeline=` path still works but is now optional. Note: dropping the pipeline is an operational/infra win, not a latency win (pipeline execution is cheap).
+
+## Nested placement (resolver inside a bool)
+
+Unlike the hybrid query — which must be the top-level query, because it emits non-standard `CompoundTopDocs` — the resolver can be **nested inside a `bool`**, because it self-erases into a standard `RankDocsQuery`. The `ResolverActionFilter` recursively finds resolver markers in the query tree, resolves each to a Top-only `RankDocsQuery`, and splices it back in place. Enclosing `bool` `filter` clauses are **pushed down into each leg**, so fusion runs over the filtered candidate set:
+
+```json
+POST /demo/_search
+{ "query": { "bool": {
+    "must":   [ { "resolver": { "queries": [ {"match":{"title":"apple"}}, {"match":{"body":"banana"}} ],
+                                "technique": "rrf", "rank_constant": 60, "rank_window_size": 100 } } ],
+    "filter": [ { "term": { "category": "x" } } ] } } }
+```
+
+Verified by `ResolverProcessorIT.testResolver_nestedInBoolMust_noFilter_thenFuses` and `testResolver_nestedInBool_pushesFilterIntoLegs` (a decisive `rank_window_size=1` push-down test: fuse-then-filter would return empty). Scope: `bool` traversal only in this prototype; nested markers use Top-only (no Tail); only `filter` clauses are pushed down (non-scoring), which avoids score-scale mixing with sibling clauses.
 
 ## Build & test
 
@@ -110,8 +138,9 @@ curl -s -XPOST "localhost:9200/demo/_search?search_pipeline=resolver_pipeline" -
 }'
 ```
 
-Running the `resolver` query **without** the pipeline surfaces a clear error (the marker query
-is coordinator-only and must be processed by the `resolver` request processor).
+Steps 4–5 (the pipeline) are **optional**: running the `resolver` query **without** any pipeline
+also works — the `ResolverActionFilter` handles it on the coordinator (see the "Pipeline-free"
+section above).
 
 ## Combined rescore (standard syntax, verified)
 
@@ -152,9 +181,11 @@ Net: the Tail recovers **total-hits, aggregations, and highlighting** (over all 
 
 ## POC simplifications vs. the production design
 
-- **Entry point:** plugin-only `resolver` **query** + request processor, instead of the core
-  top-level `resolver` field + `SearchSourceBuilder.rewrite()` SPI (which needs an OpenSearch
-  core change). Same architecture (coordinator orchestration + self-erasing rewrite).
+- **Entry point:** plugin-only `resolver` **query** processed by an **`ActionFilter`** (pipeline-free),
+  instead of the core top-level `resolver` field + `SearchSourceBuilder.rewrite()` SPI (which needs an
+  OpenSearch core change). Same architecture (coordinator orchestration + self-erasing rewrite). The POC
+  also supports **nested placement** (resolver inside `bool`, multiple markers at different levels,
+  filter push-down) — beyond the original top-level-only design.
 - **Snapshot consistency:** legs are matched back by `_id` (no PIT). Production uses PIT +
   `_shard_doc` so all legs see the same snapshot.
 - **Explain depth:** explain works and is score-consistent, but shows `ConstantScore(_id)^rrf`
