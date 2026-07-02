@@ -15,6 +15,7 @@ import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.neuralsearch.BaseNeuralSearchIT;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -38,6 +39,7 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     private static final String RESCORE_INDEX = "resolver-poc-rescore-index";
     private static final String RANKDOCS_INDEX = "resolver-poc-rankdocs-index";
     private static final String NESTED_INDEX = "resolver-poc-nested-index";
+    private static final String SHOP_INDEX = "resolver-poc-shop-index";
 
     @SneakyThrows
     public void testResolverRrf_whenDocMatchesBothLegs_thenRanksFirst() {
@@ -446,5 +448,106 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
             ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
         );
         return XContentHelper.convertToMap(XContentType.JSON.xContent(), EntityUtils.toString(response.getEntity()), false);
+    }
+
+    /**
+     * CLAIM: a single search query can carry MULTIPLE resolver markers at DIFFERENT nesting levels,
+     * each resolved independently with depth-dependent filter push-down. The hybrid query cannot be
+     * placed in any of these positions.
+     *
+     * <pre>
+     * bool {
+     *   filter:  [ in_stock=true ]                         // (1) applies to BOTH resolvers
+     *   must:    [ R1 ]                                     // R1 at level 2
+     *   should:  [ bool {
+     *                filter: [ category=shoes ]             // (2) applies to R2 only
+     *                must:   [ R2 ]                         // R2 at level 3
+     *              } ]
+     * }
+     * R1 legs = title:running, description:lightweight  -> push-down [in_stock=true]
+     * R2 legs = title:trail,   description:grip         -> push-down [in_stock=true, category=shoes]
+     * </pre>
+     *
+     * Docs: p1 running shoes, p2 trail running shoes (grip sole), p3 running jacket (category=apparel),
+     * p4 trail grip boots (OUT OF STOCK), p5 casual sneakers.
+     */
+    @SneakyThrows
+    public void testResolver_multipleMarkersAtDifferentLevels_withPerLevelPushDown() {
+        initShopIndexIfNeeded();
+        String body = "{"
+            + "\"size\":10,"
+            + "\"query\":{\"bool\":{"
+            + "\"filter\":[{\"term\":{\"in_stock\":true}}],"
+            + "\"must\":[{\"resolver\":{\"queries\":[{\"match\":{\"title\":\"running\"}},{\"match\":{\"description\":\"lightweight\"}}],"
+            + "\"technique\":\"rrf\",\"rank_constant\":60,\"rank_window_size\":100}}],"
+            + "\"should\":[{\"bool\":{"
+            + "\"filter\":[{\"term\":{\"category\":\"shoes\"}}],"
+            + "\"must\":[{\"resolver\":{\"queries\":[{\"match\":{\"title\":\"trail\"}},{\"match\":{\"description\":\"grip\"}}],"
+            + "\"technique\":\"rrf\",\"rank_constant\":60,\"rank_window_size\":100}}]"
+            + "}}]"
+            + "}}}";
+        Map<String, Object> response = searchNoPipeline(SHOP_INDEX, body);
+        List<Map<String, Object>> hits = readHits(response);
+        List<String> hitIds = hits.stream().map(hit -> (String) hit.get("_id")).toList();
+
+        // R1's fused set (in-stock docs matching running/lightweight) = {p1, p2, p3}.
+        assertEquals(3, totalHits(response));
+        assertEquals(3, hitIds.size());
+        assertTrue(hitIds.contains("p1"));
+        assertTrue(hitIds.contains("p2"));
+        assertTrue(hitIds.contains("p3"));
+        assertFalse(hitIds.contains("p4")); // in_stock=true pushed into BOTH resolvers' legs -> excluded
+        assertFalse(hitIds.contains("p5")); // matches neither R1 leg; bool.must requires an R1 match
+
+        // p2 is in BOTH R1's and R2's fused sets, so the must (R1) and should->R2 scores add -> ranks first.
+        assertEquals("p2", hitIds.get(0));
+
+        // The nested R2 (a should clause, constrained to category=shoes) demonstrably boosted p2.
+        Map<String, Double> scoreById = new HashMap<>();
+        for (Map<String, Object> hit : hits) {
+            scoreById.put((String) hit.get("_id"), ((Number) hit.get("_score")).doubleValue());
+        }
+        assertTrue(scoreById.get("p2") > scoreById.get("p1"));
+        assertTrue(scoreById.get("p2") > scoreById.get("p3"));
+    }
+
+    @SneakyThrows
+    private void initShopIndexIfNeeded() {
+        if (indexExists(SHOP_INDEX)) {
+            return;
+        }
+        // Single shard for deterministic RRF ranks.
+        String mapping = "{"
+            + "\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}},"
+            + "\"mappings\":{\"properties\":{"
+            + "\"title\":{\"type\":\"text\"},\"description\":{\"type\":\"text\"},"
+            + "\"brand\":{\"type\":\"keyword\"},\"category\":{\"type\":\"keyword\"},\"in_stock\":{\"type\":\"boolean\"}}}"
+            + "}";
+        createIndex(SHOP_INDEX, mapping);
+        ingestDocument(
+            SHOP_INDEX,
+            "{\"title\":\"running shoes\",\"description\":\"lightweight breathable\",\"brand\":\"acme\",\"category\":\"shoes\",\"in_stock\":true}",
+            "p1"
+        );
+        ingestDocument(
+            SHOP_INDEX,
+            "{\"title\":\"trail running shoes\",\"description\":\"lightweight grip sole\",\"brand\":\"acme\",\"category\":\"shoes\",\"in_stock\":true}",
+            "p2"
+        );
+        ingestDocument(
+            SHOP_INDEX,
+            "{\"title\":\"running jacket\",\"description\":\"lightweight shell\",\"brand\":\"acme\",\"category\":\"apparel\",\"in_stock\":true}",
+            "p3"
+        );
+        ingestDocument(
+            SHOP_INDEX,
+            "{\"title\":\"trail grip boots\",\"description\":\"rugged grip trail\",\"brand\":\"beta\",\"category\":\"shoes\",\"in_stock\":false}",
+            "p4"
+        );
+        ingestDocument(
+            SHOP_INDEX,
+            "{\"title\":\"casual sneakers\",\"description\":\"everyday comfort\",\"brand\":\"beta\",\"category\":\"shoes\",\"in_stock\":true}",
+            "p5"
+        );
     }
 }
