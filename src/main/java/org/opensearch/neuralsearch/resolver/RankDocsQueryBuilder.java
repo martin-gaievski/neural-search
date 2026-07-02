@@ -24,7 +24,7 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * Internal query produced by the {@link ResolverProcessor} after coordinator-level RRF fusion.
+ * Internal query produced by the {@link ResolverActionFilter} after coordinator-level fusion.
  * Realizes the "Top + Tail" pattern (cf. Elasticsearch's {@code RankDocsQuery}) using standard
  * OpenSearch query builders:
  *

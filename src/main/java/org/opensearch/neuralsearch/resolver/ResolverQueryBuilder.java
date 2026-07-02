@@ -26,8 +26,8 @@ import java.util.Objects;
  * POC marker query for the Resolver framework (Phase 1).
  *
  * <p>Coordinator-level marker carrying a hybrid-search intent: a list of sub-queries plus a
- * (normalization, combination) fusion spec. The {@link ResolverActionFilter} (pipeline-free) or the
- * optional {@link ResolverProcessor} detects it on the coordinator, fires the sub-queries as parallel
+ * (normalization, combination) fusion spec. The {@link ResolverActionFilter} detects it on the
+ * coordinator (pipeline-free), fires the sub-queries as parallel
  * independent searches, fuses the globally-merged results, and rewrites the request into a standard
  * query. By the time the query phase runs, this marker is gone.
  *
