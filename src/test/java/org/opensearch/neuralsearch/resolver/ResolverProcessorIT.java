@@ -40,6 +40,7 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     private static final String RANKDOCS_INDEX = "resolver-poc-rankdocs-index";
     private static final String NESTED_INDEX = "resolver-poc-nested-index";
     private static final String SHOP_INDEX = "resolver-poc-shop-index";
+    private static final String DIVERGE_INDEX = "resolver-poc-diverge-index";
 
     @SneakyThrows
     public void testResolverRrf_whenDocMatchesBothLegs_thenRanksFirst() {
@@ -358,6 +359,61 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
             assertTrue(score <= previous);
             previous = score;
         }
+    }
+
+    /**
+     * CLAIM: RRF and min_max+arithmetic_mean are genuinely different techniques (not silently the same).
+     * Decisive setup (single shard), two legs — match(title:apple), match(body:banana) — three docs:
+     * <ul>
+     *   <li>{@code strong_title} — leg-1 top (title apple x3), absent from leg 2</li>
+     *   <li>{@code strong_body}  — leg-2 top (body banana x3), absent from leg 1</li>
+     *   <li>{@code both_mid}     — matches BOTH legs but is the minimum score in each</li>
+     * </ul>
+     * RRF rewards multi-leg presence (sum of reciprocal ranks) -> {@code both_mid} wins. min_max+AM
+     * rewards normalized score (mean over matched legs): a single-leg leader normalizes to 1.0 and beats
+     * {@code both_mid}, whose per-leg scores are the minimum (~0.001) in each leg -> {@code both_mid} last.
+     * The orderings FLIP.
+     */
+    @SneakyThrows
+    public void testResolver_rrfVsMinMaxArithmeticMean_orderingsDiffer() {
+        initDivergeIndexIfNeeded();
+        String legs = "\"queries\":[{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}]";
+        String rrfBody = "{\"size\":10,\"query\":{\"resolver\":{"
+            + legs
+            + ",\"combination\":{\"technique\":\"rrf\",\"parameters\":{\"rank_constant\":60}}}}}";
+        String amBody = "{\"size\":10,\"query\":{\"resolver\":{"
+            + legs
+            + ",\"normalization\":{\"technique\":\"min_max\"},\"combination\":{\"technique\":\"arithmetic_mean\"}}}}";
+
+        List<String> rrfIds = ids(searchNoPipeline(DIVERGE_INDEX, rrfBody));
+        List<String> amIds = ids(searchNoPipeline(DIVERGE_INDEX, amBody));
+
+        // RRF: the both-legs doc wins on summed reciprocal ranks.
+        assertEquals("both_mid", rrfIds.get(0));
+        // min_max+AM: a single-leg leader (normalized 1.0) wins; the both-legs doc is demoted to last.
+        assertNotEquals("both_mid", amIds.get(0));
+        assertEquals("both_mid", amIds.get(amIds.size() - 1));
+        // The two techniques genuinely disagree.
+        assertNotEquals(rrfIds, amIds);
+    }
+
+    @SneakyThrows
+    private void initDivergeIndexIfNeeded() {
+        if (indexExists(DIVERGE_INDEX)) {
+            return;
+        }
+        // Single shard for deterministic BM25/RRF.
+        String mapping = "{"
+            + "\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}},"
+            + "\"mappings\":{\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"}}}"
+            + "}";
+        createIndex(DIVERGE_INDEX, mapping);
+        // leg 1 (title:apple) top, absent from leg 2
+        ingestDocument(DIVERGE_INDEX, "{\"title\":\"apple apple apple\",\"body\":\"grape jam\"}", "strong_title");
+        // leg 2 (body:banana) top, absent from leg 1
+        ingestDocument(DIVERGE_INDEX, "{\"title\":\"cherry pie\",\"body\":\"banana banana banana\"}", "strong_body");
+        // matches BOTH legs but is the minimum score in each
+        ingestDocument(DIVERGE_INDEX, "{\"title\":\"apple\",\"body\":\"banana\"}", "both_mid");
     }
 
     private String resolverFragment(final int rankWindowSize) {
