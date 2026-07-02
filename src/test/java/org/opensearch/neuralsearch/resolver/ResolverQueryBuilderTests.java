@@ -49,7 +49,7 @@ public class ResolverQueryBuilderTests extends OpenSearchTestCase {
         // A resolver must be resolved by the request processor on the coordinator; reaching a shard is an error.
         IllegalStateException e = expectThrows(IllegalStateException.class, () -> builder.doToQuery(null));
         assertTrue(e.getMessage().contains("resolver"));
-        assertTrue(e.getMessage().contains(ResolverProcessor.TYPE));
+        assertTrue(e.getMessage().contains(ResolverQueryBuilder.NAME));
     }
 
     public void testEqualsAndHashCode() {

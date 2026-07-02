@@ -337,9 +337,8 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
             "["
                 + NAME
                 + "] query must be the top-level query (or nested in a bool) so the coordinator can orchestrate "
-                + "its sub-queries before the query phase; it is handled by the '"
-                + ResolverProcessor.TYPE
-                + "' ActionFilter / request processor and must not reach a shard."
+                + "its sub-queries before the query phase; it is handled by the resolver ActionFilter on the "
+                + "coordinator and must not reach a shard."
         );
     }
 

@@ -103,7 +103,6 @@ import org.opensearch.neuralsearch.processor.AgenticQueryTranslatorProcessor;
 import org.opensearch.neuralsearch.processor.AgenticContextResponseProcessor;
 import org.opensearch.neuralsearch.resolver.RankDocsQueryBuilder;
 import org.opensearch.neuralsearch.resolver.ResolverActionFilter;
-import org.opensearch.neuralsearch.resolver.ResolverProcessor;
 import org.opensearch.neuralsearch.resolver.ResolverQueryBuilder;
 import org.opensearch.neuralsearch.processor.ExplanationResponseProcessor;
 import org.opensearch.neuralsearch.processor.NeuralQueryEnricherProcessor;
@@ -399,9 +398,7 @@ public class NeuralSearch extends Plugin
             NeuralSparseTwoPhaseProcessor.TYPE,
             new NeuralSparseTwoPhaseProcessor.Factory(),
             AgenticQueryTranslatorProcessor.TYPE,
-            new AgenticQueryTranslatorProcessor.Factory(clientAccessor, xContentRegistry, settingsAccessor),
-            ResolverProcessor.TYPE,
-            new ResolverProcessor.Factory(client)
+            new AgenticQueryTranslatorProcessor.Factory(clientAccessor, xContentRegistry, settingsAccessor)
         );
     }
 

@@ -33,7 +33,7 @@ POST /my-index/_search
 ```
 
 Flow (all on the coordinator, before the query phase):
-1. The `ResolverActionFilter` (pipeline-free; or, optionally, the `resolver` request processor) detects the `resolver` query.
+1. The `ResolverActionFilter` detects the `resolver` query on the coordinator (no pipeline needed).
 2. It fires each sub-query as an **independent, parallel** search via `MultiSearch`
    (each leg fans out to all shards → globally merged results).
 3. It fuses the per-leg results with **Reciprocal Rank Fusion** at the coordinator
@@ -48,15 +48,14 @@ Flow (all on the coordinator, before the query phase):
 
 | File | Role |
 |---|---|
-| `src/main/java/org/opensearch/neuralsearch/resolver/ResolverQueryBuilder.java` | `resolver` marker query — carries sub-queries + RRF params; throws if it reaches a shard unprocessed |
+| `src/main/java/org/opensearch/neuralsearch/resolver/ResolverQueryBuilder.java` | `resolver` marker query — carries sub-queries + fusion spec (normalization/combination); throws if it reaches a shard unprocessed |
 | `src/main/java/org/opensearch/neuralsearch/resolver/ResolverOrchestrator.java` | shared orchestration — build parallel-leg MultiSearch + coordinator RRF + rewrite to `RankDocsQuery` (Top + conditional Tail) |
-| `src/main/java/org/opensearch/neuralsearch/resolver/ResolverActionFilter.java` | **pipeline-free** entry — ActionFilter that runs the orchestration for any `resolver` query, no search pipeline needed |
-| `src/main/java/org/opensearch/neuralsearch/resolver/ResolverProcessor.java` | search-pipeline entry (now **optional** — the ActionFilter supersedes it) |
+| `src/main/java/org/opensearch/neuralsearch/resolver/ResolverActionFilter.java` | **pipeline-free** entry (sole mechanism) — ActionFilter that runs the orchestration for any `resolver` query, top-level or nested, no search pipeline |
 | `src/main/java/org/opensearch/neuralsearch/resolver/RankDocsQueryBuilder.java` | the injected standard query — **Top** (ranked docs w/ RRF scores) + **Tail** (source legs as a non-scoring filter for total-hits/aggregations/highlight) |
-| `src/main/java/org/opensearch/neuralsearch/plugin/NeuralSearch.java` | registers the `resolver` + `rank_docs` queries, the `ResolverActionFilter` (pipeline-free), and the optional `resolver` processor; captures the node `Client` |
+| `src/main/java/org/opensearch/neuralsearch/plugin/NeuralSearch.java` | registers the `resolver` + `rank_docs` queries and the `ResolverActionFilter` (pipeline-free); captures the node `Client` |
 | `src/test/java/org/opensearch/neuralsearch/resolver/ResolverQueryBuilderTests.java` | unit: parsing, validation, serialization, shard-guard |
 | `src/test/java/org/opensearch/neuralsearch/resolver/RankDocsQueryBuilderTests.java` | unit: serialization roundtrip, non-parseable guard |
-| `src/test/java/org/opensearch/neuralsearch/resolver/ResolverProcessorIT.java` | end-to-end ITs (11): fusion (3-shard), pipeline-free, nested-in-`bool` + multi-marker/multi-level (filter push-down), combined rescore, + RankDocsQuery total-hits / aggregations / highlight / explain / conditional-Tail |
+| `src/test/java/org/opensearch/neuralsearch/resolver/ResolverProcessorIT.java` | end-to-end ITs (13, all pipeline-free): RRF fusion (3-shard), min_max+arithmetic_mean, RRF-vs-min_max divergence, nested-in-`bool` + multi-marker/multi-level (filter push-down), combined rescore, + RankDocsQuery total-hits / aggregations / highlight / explain / conditional-Tail |
 
 ## Pipeline-free (no search pipeline required)
 
@@ -68,7 +67,7 @@ POST /demo/_search
                            "technique": "rrf", "rank_constant": 60, "rank_window_size": 100 } } }
 ```
 
-Verified by `ResolverProcessorIT.testResolver_worksWithoutSearchPipeline`. This removes the "mandatory pipeline" friction (a win for managed/serverless — no pipeline object to create or manage, no pipeline restrictions). The request processor + `?search_pipeline=` path still works but is now optional. Note: dropping the pipeline is an operational/infra win, not a latency win (pipeline execution is cheap).
+Verified by `ResolverProcessorIT.testResolver_worksWithoutSearchPipeline` (and every other IT — all 13 run pipeline-free). This removes the "mandatory pipeline" friction (a win for managed/serverless — no pipeline object to create or manage, no pipeline restrictions). **The ActionFilter is the sole mechanism** — an earlier request-processor path was evaluated as redundant and removed. Note: dropping the pipeline is an operational/infra win, not a latency win (pipeline execution is cheap).
 
 ## Nested placement (resolver inside a bool)
 
@@ -115,13 +114,8 @@ curl -s -XPOST "localhost:9200/demo/_doc/d_title?refresh" -H 'Content-Type: appl
 curl -s -XPOST "localhost:9200/demo/_doc/d_body?refresh"  -H 'Content-Type: application/json' -d '{"title":"classic cherry tart","body":"banana milk smoothie"}'
 curl -s -XPOST "localhost:9200/demo/_doc/d_none?refresh"  -H 'Content-Type: application/json' -d '{"title":"cherry chocolate cake","body":"grape jam jar"}'
 
-# 4) create the search pipeline with the resolver request processor
-curl -s -XPUT "localhost:9200/_search/pipeline/resolver_pipeline" -H 'Content-Type: application/json' -d '{
-  "request_processors": [ { "resolver": {} } ]
-}'
-
-# 5) run one resolver query
-curl -s -XPOST "localhost:9200/demo/_search?search_pipeline=resolver_pipeline" -H 'Content-Type: application/json' -d '{
+# 4) run one resolver query — no search pipeline; the ActionFilter handles it
+curl -s -XPOST "localhost:9200/demo/_search" -H 'Content-Type: application/json' -d '{
   "query": { "resolver": {
     "technique": "rrf",
     "queries": [ { "match": { "title": "apple" } }, { "match": { "body": "banana" } } ],
@@ -131,23 +125,22 @@ curl -s -XPOST "localhost:9200/demo/_search?search_pipeline=resolver_pipeline" -
 }'
 # Expected: d_both first (in both legs), then d_title / d_body; d_none absent.
 
-# 6) explain works natively (the resolver has self-erased into a standard query)
-curl -s -XPOST "localhost:9200/demo/_search?search_pipeline=resolver_pipeline" -H 'Content-Type: application/json' -d '{
+# 5) explain works natively (the resolver has self-erased into a standard query)
+curl -s -XPOST "localhost:9200/demo/_search" -H 'Content-Type: application/json' -d '{
   "explain": true, "size": 3,
   "query": { "resolver": { "queries": [ { "match": { "title": "apple" } }, { "match": { "body": "banana" } } ] } }
 }'
 ```
 
-Steps 4–5 (the pipeline) are **optional**: running the `resolver` query **without** any pipeline
-also works — the `ResolverActionFilter` handles it on the coordinator (see the "Pipeline-free"
-section above).
+Every query above runs **without any search pipeline** — the `ResolverActionFilter` handles the
+`resolver` query on the coordinator.
 
 ## Combined rescore (standard syntax, verified)
 
-Because the resolver self-erases into a standard query, the **standard OpenSearch top-level `rescore`** element works and is applied to the **fused (combined) scores** — the plugin does not parse `rescore`; core does, and the `ResolverProcessor` leaves it untouched. This is the mode hybrid query cannot do (its rescore is per-leg, pre-normalization, capped by leg weight).
+Because the resolver self-erases into a standard query, the **standard OpenSearch top-level `rescore`** element works and is applied to the **fused (combined) scores** — the plugin does not parse `rescore`; core does, and the resolver orchestration leaves it untouched. This is the mode hybrid query cannot do (its rescore is per-leg, pre-normalization, capped by leg weight).
 
 ```json
-POST /demo/_search?search_pipeline=resolver_pipeline
+POST /demo/_search
 {
   "query": { "resolver": { "queries": [ { "match": { "title": "apple" } }, { "match": { "body": "banana" } } ],
                            "technique": "rrf", "rank_constant": 60, "rank_window_size": 100 } },
@@ -194,6 +187,7 @@ Net: the Tail recovers **total-hits, aggregations, and highlighting** (over all 
 - **Inner hits / nested:** not produced by the Top+Tail composite — would need the custom Top query.
 - **Tail cost:** the Tail re-runs the source legs on the main search (for all-match total-hits/aggs);
   production makes the Tail conditional (only when aggs/total-hits/explain need it).
-- **Techniques:** only `rrf`. `linear` (the direct hybrid+NormalizationProcessor replacement),
-  `rescorer`, weighted RRF, and rerankers are Phase 2/3.
+- **Techniques:** `rrf` and `min_max`+`arithmetic_mean` (optionally weighted) are implemented, selected
+  via the `normalization`/`combination` objects. `l2`/`z_score`, `geometric`/`harmonic` mean, `rescorer`,
+  and rerankers are Phase 2/3.
 - **Stats:** no `EventStatsManager` counters wired yet (follow-up).

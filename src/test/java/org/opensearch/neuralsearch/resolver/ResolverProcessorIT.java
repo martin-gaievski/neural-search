@@ -22,18 +22,18 @@ import java.util.Map;
 import static org.opensearch.neuralsearch.util.TestUtils.DEFAULT_USER_AGENT;
 
 /**
- * End-to-end demonstration of the Resolver framework POC (Phase 1, RRF).
+ * End-to-end demonstration of the Resolver framework POC (Phase 1).
  *
- * <p>Runs a single {@code resolver} query over a 3-shard index through a search pipeline containing
- * the {@code resolver} request processor. The processor fires the two legs (match on {@code title},
- * match on {@code body}) as a parallel MultiSearch, fuses them with coordinator-level RRF, and
- * rewrites the request into a standard scored query. Because fusion happens at the coordinator, the
- * document that matches BOTH legs ranks first regardless of shard placement.
+ * <p>Runs {@code resolver} queries with NO search pipeline — the {@code ResolverActionFilter}
+ * intercepts them on the coordinator, fires the legs as a parallel MultiSearch, fuses them (RRF or
+ * min_max + arithmetic_mean), and rewrites the request into a standard scored query. Covers top-level
+ * and nested / multi-marker placement, filter push-down, combined rescore, and the RankDocsQuery
+ * (Top + conditional Tail) recoveries. Because fusion happens at the coordinator, the document that
+ * matches BOTH legs ranks first regardless of shard placement.
  */
 public class ResolverProcessorIT extends BaseNeuralSearchIT {
 
     private static final String INDEX = "resolver-poc-index";
-    private static final String PIPELINE = "resolver-poc-pipeline";
     private static final String TITLE = "title";
     private static final String BODY = "body";
     private static final String RESCORE_INDEX = "resolver-poc-rescore-index";
@@ -45,7 +45,6 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     @SneakyThrows
     public void testResolverRrf_whenDocMatchesBothLegs_thenRanksFirst() {
         initIndexIfNeeded();
-        createResolverPipeline(PIPELINE);
 
         // Two legs: lexical match on title:"apple" and body:"banana".
         // d_both matches both legs; d_title only leg 1; d_body only leg 2; d_none matches neither.
@@ -56,7 +55,7 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
             100
         );
 
-        Map<String, Object> response = search(INDEX, resolver, null, 10, Map.of("search_pipeline", PIPELINE), null);
+        Map<String, Object> response = search(INDEX, resolver, null, 10, Map.of(), null);
 
         List<Map<String, Object>> hits = readHits(response);
         List<String> ids = hits.stream().map(hit -> (String) hit.get("_id")).toList();
@@ -116,17 +115,6 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
         ingestDocument(INDEX, "{\"title\":\"cherry chocolate cake\",\"body\":\"grape jam jar\"}", "d_none");
     }
 
-    private void createResolverPipeline(final String pipelineName) throws Exception {
-        makeRequest(
-            client(),
-            "PUT",
-            "/_search/pipeline/" + pipelineName,
-            null,
-            toHttpEntity("{\"request_processors\":[{\"resolver\":{}}]}"),
-            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
-        );
-    }
-
     @SuppressWarnings("unchecked")
     private List<Map<String, Object>> readHits(final Map<String, Object> response) {
         Map<String, Object> hitsMap = (Map<String, Object>) response.get("hits");
@@ -142,7 +130,6 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     @SneakyThrows
     public void testResolverRrf_withStandardRescore_thenFusedRankingIsRescored() {
         initRescoreIndexIfNeeded();
-        createResolverPipeline(PIPELINE);
 
         // Same resolver in both requests: RRF over match(title:apple) + match(body:banana).
         String resolver = "\"resolver\":{\"queries\":[{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
@@ -206,7 +193,7 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
             client(),
             "POST",
             "/" + index + "/_search",
-            Map.of("search_pipeline", PIPELINE),
+            Map.of(),
             toHttpEntity(body),
             ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
         );
@@ -228,7 +215,6 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     @SneakyThrows
     public void testRankDocs_totalHits_coversAllMatchesNotJustWindow() {
         initRankDocsIndexIfNeeded();
-        createResolverPipeline(PIPELINE);
         // rank_window_size=1 -> fused window is a single doc; the Tail should still surface all 3 matches.
         String body = "{\"size\":1,\"query\":{" + resolverFragment(1) + "}}";
         Map<String, Object> response = searchRaw(RANKDOCS_INDEX, body);
@@ -240,7 +226,6 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     @SneakyThrows
     public void testRankDocs_aggregations_coverAllMatchesNotJustWindow() {
         initRankDocsIndexIfNeeded();
-        createResolverPipeline(PIPELINE);
         String body = "{\"size\":1,\"query\":{"
             + resolverFragment(1)
             + "},\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\"}}}}";
@@ -275,7 +260,6 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     @SneakyThrows
     public void testRankDocs_highlightOnSubQueryTerms() {
         initRankDocsIndexIfNeeded();
-        createResolverPipeline(PIPELINE);
         String body = "{\"size\":10,\"query\":{" + resolverFragment(10) + "},\"highlight\":{\"fields\":{\"title\":{}}}}";
         Map<String, Object> response = searchRaw(RANKDOCS_INDEX, body);
 
@@ -295,7 +279,6 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     @SneakyThrows
     public void testRankDocs_explainIsPresentAndConsistent() {
         initRankDocsIndexIfNeeded();
-        createResolverPipeline(PIPELINE);
         String body = "{\"size\":3,\"explain\":true,\"query\":{" + resolverFragment(10) + "}}";
         Map<String, Object> response = searchRaw(RANKDOCS_INDEX, body);
 
@@ -318,7 +301,6 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     @SneakyThrows
     public void testRankDocs_conditionalTail_plainTopKSkipsTail() {
         initRankDocsIndexIfNeeded();
-        createResolverPipeline(PIPELINE);
         // Default (no aggs/explain/highlight, default track_total_hits) -> Tail ON -> all 3 leg matches.
         String withTail = "{\"size\":10,\"query\":{" + resolverFragment(1) + "}}";
         // track_total_hits:false + plain top-K -> Tail OFF -> only the single windowed doc.
