@@ -232,12 +232,17 @@ public final class ResolverOrchestrator {
     /**
      * Score-based min-max normalization + (weighted) arithmetic mean. Per leg, raw {@code _score}s are
      * min-max normalized over the returned window; per doc, the combined score is the weighted mean over
-     * the legs it matched. Mirrors hybrid's {@code MinMaxScoreNormalizationTechnique} (degenerate
-     * min==max -> 1.0; normalized 0 -> 0.001 floor so a matched doc is never confused with a non-match)
-     * and {@code ArithmeticMeanScoreCombinationTechnique} (non-matched legs excluded from the denominator).
+     * ALL legs (a non-matched leg contributes 0). Mirrors hybrid's {@code MinMaxScoreNormalizationTechnique}
+     * (degenerate min==max -> 1.0; normalized 0 -> 0.001 floor so a matched doc is never confused with a
+     * non-match) and {@code ArithmeticMeanScoreCombinationTechnique} (denominator = sum of ALL leg weights,
+     * so a doc strong in both legs outranks one strong in only a single leg).
      */
     private static Map<String, Float> minMaxArithmeticMean(MultiSearchResponse.Item[] items, ResolverQueryBuilder resolver) {
-        Map<String, float[]> acc = new LinkedHashMap<>(); // id -> { weightedSum, sumOfMatchedWeights }
+        float totalWeight = 0.0f;
+        for (int legIndex = 0; legIndex < items.length; legIndex++) {
+            totalWeight += weightForLeg(resolver.weights(), legIndex);
+        }
+        Map<String, Float> weightedSum = new LinkedHashMap<>(); // id -> Σ weight_leg * normalized_leg
         for (int legIndex = 0; legIndex < items.length; legIndex++) {
             SearchHit[] hits = hitsOrThrow(items[legIndex], legIndex);
             float min = Float.MAX_VALUE;
@@ -252,16 +257,12 @@ public final class ResolverOrchestrator {
                 if (id == null) {
                     continue;
                 }
-                float normalized = normalizeMinMax(hit.getScore(), min, max);
-                float[] entry = acc.computeIfAbsent(id, k -> new float[2]);
-                entry[0] += weight * normalized;
-                entry[1] += weight;
+                weightedSum.merge(id, weight * normalizeMinMax(hit.getScore(), min, max), Float::sum);
             }
         }
         Map<String, Float> combined = new LinkedHashMap<>();
-        for (Map.Entry<String, float[]> e : acc.entrySet()) {
-            float sumWeights = e.getValue()[1];
-            combined.put(e.getKey(), sumWeights == 0.0f ? 0.0f : e.getValue()[0] / sumWeights);
+        for (Map.Entry<String, Float> e : weightedSum.entrySet()) {
+            combined.put(e.getKey(), totalWeight == 0.0f ? 0.0f : e.getValue() / totalWeight);
         }
         return combined;
     }
