@@ -9,6 +9,8 @@ search for OpenSearch that runs **coordinator-level RRF as pre-search orchestrat
 Design background: `steering_documents/hybrid query/simplified_hybrid_search/`
 (`resolver_showcase_and_alternatives_comparison.md`, `resolver_framework_poc_design.md`).
 
+**Flow & component diagrams (Mermaid, render on GitHub):** [`RESOLVER_POC_DIAGRAMS.md`](RESOLVER_POC_DIAGRAMS.md).
+
 ---
 
 ## What this POC does
