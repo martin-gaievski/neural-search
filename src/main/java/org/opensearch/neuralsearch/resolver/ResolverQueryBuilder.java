@@ -62,10 +62,16 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
     // Normalization techniques
     public static final String NORMALIZATION_NONE = "none";
     public static final String NORMALIZATION_MIN_MAX = "min_max";
+    // Candidate-collection strategies (how the legs' results reach the coordinator for fusion)
+    public static final String COLLECTION_COORDINATOR = "coordinator"; // each leg = one standalone search reduced to global top-K (default)
+    public static final String COLLECTION_PER_SHARD = "per_shard";     // each leg collected per shard, fused over num_shards x depth
+                                                                       // (min_max only)
 
     public static final int DEFAULT_RANK_CONSTANT = 60;
     public static final int DEFAULT_RANK_WINDOW_SIZE = 100;
     public static final int MIN_SUB_QUERIES = 2;
+    /** Sentinel: candidate_depth defaults to rank_window_size when unset (mirrors hybrid using size when pagination_depth is unset). */
+    public static final int CANDIDATE_DEPTH_UNSET = -1;
 
     private static final String QUERIES_FIELD = "queries";
     private static final String TECHNIQUE_FIELD = "technique";
@@ -75,6 +81,8 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
     private static final String COMBINATION_FIELD = "combination";
     private static final String PARAMETERS_FIELD = "parameters";
     private static final String WEIGHTS_FIELD = "weights";
+    private static final String COLLECTION_FIELD = "collection";
+    private static final String CANDIDATE_DEPTH_FIELD = "candidate_depth";
 
     private final List<QueryBuilder> queries;
     private final String technique;        // combination technique: rrf | arithmetic_mean
@@ -82,12 +90,15 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
     private final int rankConstant;        // RRF only
     private final int rankWindowSize;
     private final float[] weights;         // arithmetic_mean only; empty => unweighted
+    private final String collection;       // candidate collection: coordinator | per_shard
+    private final int candidateDepth;      // per-shard local top-K depth; CANDIDATE_DEPTH_UNSET => rankWindowSize
 
-    /** Legacy 4-arg constructor (RRF, no normalization, unweighted). */
+    /** Legacy 4-arg constructor (RRF, no normalization, unweighted, coordinator collection). */
     public ResolverQueryBuilder(List<QueryBuilder> queries, String technique, int rankConstant, int rankWindowSize) {
         this(queries, technique, NORMALIZATION_NONE, rankConstant, rankWindowSize, new float[0]);
     }
 
+    /** 6-arg constructor (coordinator collection, default candidate_depth). */
     public ResolverQueryBuilder(
         List<QueryBuilder> queries,
         String technique,
@@ -96,12 +107,27 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         int rankWindowSize,
         float[] weights
     ) {
+        this(queries, technique, normalization, rankConstant, rankWindowSize, weights, COLLECTION_COORDINATOR, CANDIDATE_DEPTH_UNSET);
+    }
+
+    public ResolverQueryBuilder(
+        List<QueryBuilder> queries,
+        String technique,
+        String normalization,
+        int rankConstant,
+        int rankWindowSize,
+        float[] weights,
+        String collection,
+        int candidateDepth
+    ) {
         this.queries = queries == null ? new ArrayList<>() : queries;
         this.technique = technique;
         this.normalization = normalization == null ? NORMALIZATION_NONE : normalization;
         this.rankConstant = rankConstant;
         this.rankWindowSize = rankWindowSize;
         this.weights = weights == null ? new float[0] : weights;
+        this.collection = collection == null ? COLLECTION_COORDINATOR : collection;
+        this.candidateDepth = candidateDepth;
     }
 
     public ResolverQueryBuilder(StreamInput in) throws IOException {
@@ -112,6 +138,8 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         this.rankConstant = in.readVInt();
         this.rankWindowSize = in.readVInt();
         this.weights = in.readFloatArray();
+        this.collection = in.readString();
+        this.candidateDepth = in.readInt();
     }
 
     @Override
@@ -122,6 +150,8 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         out.writeVInt(rankConstant);
         out.writeVInt(rankWindowSize);
         out.writeFloatArray(weights);
+        out.writeString(collection);
+        out.writeInt(candidateDepth);
     }
 
     public List<QueryBuilder> queries() {
@@ -148,6 +178,20 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         return weights;
     }
 
+    public String collection() {
+        return collection;
+    }
+
+    /** Per-shard candidate depth; falls back to {@link #rankWindowSize()} when unset. */
+    public int candidateDepth() {
+        return candidateDepth == CANDIDATE_DEPTH_UNSET ? rankWindowSize : candidateDepth;
+    }
+
+    /** True when this marker requests per-shard candidate collection (only honoured for min_max+arithmetic_mean). */
+    public boolean isPerShardCollection() {
+        return COLLECTION_PER_SHARD.equals(collection) && TECHNIQUE_ARITHMETIC_MEAN.equals(technique);
+    }
+
     @SuppressWarnings("unchecked")
     public static ResolverQueryBuilder fromXContent(XContentParser parser) throws IOException {
         List<QueryBuilder> queries = new ArrayList<>();
@@ -156,6 +200,8 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         int rankConstant = DEFAULT_RANK_CONSTANT;
         int rankWindowSize = DEFAULT_RANK_WINDOW_SIZE;
         float[] weights = new float[0];
+        String collection = COLLECTION_COORDINATOR;
+        int candidateDepth = CANDIDATE_DEPTH_UNSET;
         float boost = DEFAULT_BOOST;
         String queryName = null;
 
@@ -206,6 +252,10 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
                     rankConstant = parser.intValue();
                 } else if (RANK_WINDOW_SIZE_FIELD.equals(currentFieldName)) {
                     rankWindowSize = parser.intValue();
+                } else if (COLLECTION_FIELD.equals(currentFieldName)) {
+                    collection = parser.text();
+                } else if (CANDIDATE_DEPTH_FIELD.equals(currentFieldName)) {
+                    candidateDepth = parser.intValue();
                 } else if (TECHNIQUE_FIELD.equals(currentFieldName)) {
                     combination = parser.text();
                 } else if (BOOST_FIELD.match(currentFieldName, parser.getDeprecationHandler())) {
@@ -229,8 +279,9 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
             normalization = TECHNIQUE_ARITHMETIC_MEAN.equals(combination) ? NORMALIZATION_MIN_MAX : NORMALIZATION_NONE;
         }
         normalization = normalization.toLowerCase(Locale.ROOT);
+        collection = collection == null ? COLLECTION_COORDINATOR : collection.toLowerCase(Locale.ROOT);
 
-        validate(queries, combination, normalization, rankConstant, rankWindowSize, weights, parser);
+        validate(queries, combination, normalization, rankConstant, rankWindowSize, weights, collection, candidateDepth, parser);
 
         ResolverQueryBuilder queryBuilder = new ResolverQueryBuilder(
             queries,
@@ -238,7 +289,9 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
             normalization,
             rankConstant,
             rankWindowSize,
-            weights
+            weights,
+            collection,
+            candidateDepth
         );
         queryBuilder.boost(boost);
         queryBuilder.queryName(queryName);
@@ -252,6 +305,8 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         int rankConstant,
         int rankWindowSize,
         float[] weights,
+        String collection,
+        int candidateDepth,
         XContentParser parser
     ) {
         if (queries.size() < MIN_SUB_QUERIES) {
@@ -301,6 +356,50 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
                 )
             );
         }
+        if (COLLECTION_COORDINATOR.equals(collection) == false && COLLECTION_PER_SHARD.equals(collection) == false) {
+            throw new IllegalArgumentException(
+                String.format(
+                    Locale.ROOT,
+                    "[%s] %s must be one of [%s, %s], got [%s]",
+                    NAME,
+                    COLLECTION_FIELD,
+                    COLLECTION_COORDINATOR,
+                    COLLECTION_PER_SHARD,
+                    collection
+                )
+            );
+        }
+        if (candidateDepth != CANDIDATE_DEPTH_UNSET && candidateDepth <= 0) {
+            throw new IllegalArgumentException(String.format(Locale.ROOT, "[%s] %s must be > 0", NAME, CANDIDATE_DEPTH_FIELD));
+        }
+        // Coherence: per_shard collection is only meaningful for the score-based min_max+arithmetic_mean fusion
+        // (RRF is rank-based and already at parity), and candidate_depth only applies to per_shard collection.
+        // Reject incoherent combinations rather than silently ignoring the knob.
+        if (COLLECTION_PER_SHARD.equals(collection) && TECHNIQUE_ARITHMETIC_MEAN.equals(combination) == false) {
+            throw new IllegalArgumentException(
+                String.format(
+                    Locale.ROOT,
+                    "[%s] %s=%s is only supported with combination technique [%s], got [%s]",
+                    NAME,
+                    COLLECTION_FIELD,
+                    COLLECTION_PER_SHARD,
+                    TECHNIQUE_ARITHMETIC_MEAN,
+                    combination
+                )
+            );
+        }
+        if (candidateDepth != CANDIDATE_DEPTH_UNSET && COLLECTION_PER_SHARD.equals(collection) == false) {
+            throw new IllegalArgumentException(
+                String.format(
+                    Locale.ROOT,
+                    "[%s] %s only applies when %s=%s",
+                    NAME,
+                    CANDIDATE_DEPTH_FIELD,
+                    COLLECTION_FIELD,
+                    COLLECTION_PER_SHARD
+                )
+            );
+        }
     }
 
     @Override
@@ -312,6 +411,12 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         }
         builder.endArray();
         builder.field(RANK_WINDOW_SIZE_FIELD, rankWindowSize);
+        if (COLLECTION_COORDINATOR.equals(collection) == false) {
+            builder.field(COLLECTION_FIELD, collection);
+        }
+        if (candidateDepth != CANDIDATE_DEPTH_UNSET) {
+            builder.field(CANDIDATE_DEPTH_FIELD, candidateDepth);
+        }
         if (NORMALIZATION_NONE.equals(normalization) == false) {
             builder.startObject(NORMALIZATION_FIELD).field(TECHNIQUE_FIELD, normalization).endObject();
         }
@@ -349,12 +454,23 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
             && Objects.equals(normalization, other.normalization)
             && rankConstant == other.rankConstant
             && rankWindowSize == other.rankWindowSize
-            && Arrays.equals(weights, other.weights);
+            && Arrays.equals(weights, other.weights)
+            && Objects.equals(collection, other.collection)
+            && candidateDepth == other.candidateDepth;
     }
 
     @Override
     protected int doHashCode() {
-        return Objects.hash(queries, technique, normalization, rankConstant, rankWindowSize, Arrays.hashCode(weights));
+        return Objects.hash(
+            queries,
+            technique,
+            normalization,
+            rankConstant,
+            rankWindowSize,
+            Arrays.hashCode(weights),
+            collection,
+            candidateDepth
+        );
     }
 
     @Override

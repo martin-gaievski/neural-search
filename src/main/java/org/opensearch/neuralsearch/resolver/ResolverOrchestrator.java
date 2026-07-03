@@ -8,15 +8,16 @@ import org.apache.lucene.search.TotalHits;
 import org.opensearch.action.search.MultiSearchRequest;
 import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.builder.SearchSourceBuilder;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
@@ -53,12 +54,94 @@ public final class ResolverOrchestrator {
     // Top-level path (single resolver as the whole query)
     // ---------------------------------------------------------------------------------------------
 
-    /** Build one independent search per leg, to be fired together as a parallel MultiSearch. */
-    public static MultiSearchRequest buildLegMultiSearch(SearchRequest request, ResolverQueryBuilder resolver) {
+    /** Maximum leg-search fan-out (legs x shards) before per-shard collection falls back to the coordinator path,
+     *  to bound the MultiSearch size / coordinator memory at very high shard counts. */
+    static final int MAX_PER_SHARD_FANOUT = 128;
+
+    /** Secondary preference appended after {@code _shards:i} to pin every leg of a shard to the same (primary) copy. */
+    private static final String PRIMARY_PREFERENCE = "_primary";
+
+    /**
+     * Decision for how a top-level resolver's legs are collected. When {@link #perShard} is false the legs are
+     * fired as one standalone search each (coordinator reduce to the global top-{@code rank_window_size}); when
+     * true, each leg is fired once PER SHARD ({@code preference=_shards:i|<copyPin>}) so fusion sees the same
+     * {@code num_shards x depth} candidate pool as the hybrid query.
+     *
+     * <p>The plan is computed ONCE (in the interception point, via {@link #planCollection}) and threaded into
+     * both {@link #buildLegMultiSearch} and {@link #applyFusedResults} — it MUST NOT be recomputed between them,
+     * because it reads live cluster state and the item layout produced during the build must match the layout the
+     * reduce reads back (a concurrent index/alias change between two independent reads would otherwise mis-index
+     * the MultiSearch responses).
+     */
+    public record CollectionPlan(boolean perShard, int numShards, int depth, String copyPin) {
+        static CollectionPlan coordinator() {
+            return new CollectionPlan(false, 1, 0, null);
+        }
+    }
+
+    /**
+     * Resolve the per-shard collection plan for a top-level resolver. Falls back to the coordinator path (returns
+     * {@code perShard=false}) unless ALL of the following hold: the marker requests per-shard collection for
+     * min_max+arithmetic_mean; the request targets exactly one concrete index (so a single shard ordinal is
+     * unambiguous — {@code _shards:i} would otherwise hit shard i of every co-targeted index); no custom
+     * {@code routing}/{@code preference} is set (which would narrow the shard set / select a copy and break naive
+     * enumeration); the index has >= 2 shards (with 1 shard the global top-K already equals the shard's local
+     * top-K); and the fan-out stays within {@link #MAX_PER_SHARD_FANOUT}.
+     *
+     * <p>Call this ONCE per request and thread the result; see {@link CollectionPlan}.
+     */
+    public static CollectionPlan planCollection(SearchRequest request, ResolverQueryBuilder resolver) {
+        if (resolver.isPerShardCollection() == false) {
+            return CollectionPlan.coordinator();
+        }
+        if (request.routing() != null || request.preference() != null) {
+            // routing narrows the shard set; a custom preference selects a copy (and can't be safely composed after
+            // "_shards:i|"). In both cases don't hand-roll enumeration — fall back to the coordinator path.
+            return CollectionPlan.coordinator();
+        }
+        List<IndexMetadata> indices = NeuralSearchClusterUtil.instance().getIndexMetadataList(request);
+        // Exactly one non-null concrete index: _shards:i is ambiguous across co-targeted indices, and a null entry
+        // means the resolved index was concurrently removed — fall back rather than NPE on getNumberOfShards().
+        if (indices.size() != 1 || indices.get(0) == null) {
+            return CollectionPlan.coordinator();
+        }
+        int numShards = indices.get(0).getNumberOfShards();
+        if (numShards < 2) {
+            return CollectionPlan.coordinator(); // single shard: per-shard pool == coordinator pool
+        }
+        int fanout = numShards * resolver.queries().size();
+        if (fanout > MAX_PER_SHARD_FANOUT) {
+            return CollectionPlan.coordinator(); // bound MultiSearch size / coordinator memory
+        }
+        // Pin every leg of shard i to the PRIMARY copy so they all read the identical segment view — the
+        // union-then-normalize equivalence with hybrid requires it under replicas. "_primary" is a valid secondary
+        // preference after "_shards:i|" (a custom session string is not; verified against core Preference.parse), and
+        // the caller can't have set their own preference here (that path already fell back to coordinator above).
+        // Known trade-off (acceptable for the POC; opt-in per_shard only): pinning to the primary means that if a
+        // shard's primary is transiently unavailable while a replica is up, that per-shard leg fails and the whole
+        // search errors — whereas the coordinator path would serve from the replica. There is no preference string
+        // that means "the same arbitrary copy across N independent searches", so primary is the only deterministic
+        // same-copy pin available plugin-side; production would gather per-shard candidates in one collector pass.
+        return new CollectionPlan(true, numShards, resolver.candidateDepth(), PRIMARY_PREFERENCE);
+    }
+
+    /** Build the leg MultiSearch for a top-level resolver, per the pre-computed {@code plan}: one search per leg
+     *  (coordinator), or one search per (leg, shard) when the plan is per-shard. Items are laid out LEG-MAJOR: for
+     *  per-shard, leg L's shards occupy indices {@code [L*numShards, (L+1)*numShards)}. */
+    public static MultiSearchRequest buildLegMultiSearch(SearchRequest request, ResolverQueryBuilder resolver, CollectionPlan plan) {
         MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
-        int trackTotalHitsUpTo = trackTotalHitsCap(request.source());
-        for (QueryBuilder leg : resolver.queries()) {
-            multiSearchRequest.add(legSearch(request, leg, List.of(), resolver.rankWindowSize(), trackTotalHitsUpTo));
+        if (plan.perShard()) {
+            // Per-shard sub-searches gather candidate scores only; totals come from the Tail (see applyFusedResults).
+            for (QueryBuilder leg : resolver.queries()) {
+                for (int shard = 0; shard < plan.numShards(); shard++) {
+                    multiSearchRequest.add(perShardLegSearch(request, leg, plan.depth(), shard, plan.copyPin()));
+                }
+            }
+        } else {
+            int trackTotalHitsUpTo = trackTotalHitsCap(request.source());
+            for (QueryBuilder leg : resolver.queries()) {
+                multiSearchRequest.add(legSearch(request, leg, List.of(), resolver.rankWindowSize(), trackTotalHitsUpTo));
+            }
         }
         return multiSearchRequest;
     }
@@ -79,10 +162,12 @@ public final class ResolverOrchestrator {
     public static TotalHits applyFusedResults(
         SearchSourceBuilder source,
         MultiSearchResponse multiSearchResponse,
-        ResolverQueryBuilder resolver
+        ResolverQueryBuilder resolver,
+        CollectionPlan plan
     ) {
         MultiSearchResponse.Item[] items = multiSearchResponse.getResponses();
-        RankedDocs ranked = computeRankedDocs(items, resolver);
+        SearchHit[][] legHits = groupLegHits(items, resolver.queries().size(), plan);
+        RankedDocs ranked = computeRankedDocs(legHits, resolver);
         if (ranked.ids.length == 0) {
             source.query(new MatchNoneQueryBuilder());
             return null;
@@ -92,13 +177,58 @@ public final class ResolverOrchestrator {
         if (needsExecutionTail(source)) {
             topOnly = false; // aggregations / explain / profile / highlight need the full match set IN the query
         } else if (wantsTotalsBeyondWindow(source, ranked.ids.length)) {
-            patchTotal = legUnionTotalHits(items); // derive the union total from the legs (no re-run) when exact/capped
-            topOnly = patchTotal != null;          // else fall back to the Tail for an exact count
+            // Per-shard slices each report only their own shard's total, so the leg-union derivation is invalid;
+            // fall back to the Tail for an accurate index-wide count. Otherwise derive the union from the legs.
+            patchTotal = plan.perShard() ? null : legUnionTotalHits(items);
+            topOnly = patchTotal != null; // else fall back to the Tail for an exact count
         } else {
             topOnly = true; // track_total_hits:false -> plain top-K, no Tail
         }
         source.query(new RankDocsQueryBuilder(ranked.ids, ranked.scores, topOnly ? List.of() : resolver.queries()));
         return patchTotal;
+    }
+
+    /** Reduce the raw MultiSearch items into a per-leg array of hits. Coordinator plan: one item per leg. Per-shard
+     *  plan: leg L owns the {@code numShards} items at {@code [L*numShards, (L+1)*numShards)}, whose hits are
+     *  concatenated into leg L's union pool (over which min/max is later computed — the same pool hybrid normalizes
+     *  over). */
+    private static SearchHit[][] groupLegHits(MultiSearchResponse.Item[] items, int legCount, CollectionPlan plan) {
+        int expected = plan.perShard() ? legCount * plan.numShards() : legCount;
+        if (items.length != expected) {
+            // The plan that laid out the MultiSearch and the response items must agree. They are threaded from a
+            // single planCollection() call, so a mismatch here means an internal invariant was violated (never the
+            // recompute race the plan-threading eliminated) — fail loudly rather than mis-index the responses.
+            throw new IllegalStateException(
+                String.format(
+                    Locale.ROOT,
+                    "[resolver] expected %d leg sub-search responses (perShard=%b, legs=%d, shards=%d) but got %d",
+                    expected,
+                    plan.perShard(),
+                    legCount,
+                    plan.numShards(),
+                    items.length
+                )
+            );
+        }
+        SearchHit[][] legHits = new SearchHit[legCount][];
+        if (plan.perShard()) {
+            int n = plan.numShards();
+            for (int leg = 0; leg < legCount; leg++) {
+                List<SearchHit> union = new ArrayList<>();
+                for (int shard = 0; shard < n; shard++) {
+                    int itemIndex = leg * n + shard;
+                    for (SearchHit hit : hitsOrThrow(items[itemIndex], itemIndex)) {
+                        union.add(hit);
+                    }
+                }
+                legHits[leg] = union.toArray(new SearchHit[0]);
+            }
+        } else {
+            for (int leg = 0; leg < legCount; leg++) {
+                legHits[leg] = hitsOrThrow(items[leg], leg);
+            }
+        }
+        return legHits;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -164,9 +294,14 @@ public final class ResolverOrchestrator {
         int offset = 0;
         for (MarkerContext mc : markers) {
             int legCount = mc.marker().queries().size();
-            MultiSearchResponse.Item[] slice = Arrays.copyOfRange(items, offset, offset + legCount);
+            // Nested markers always collect one item per leg (per-shard collection is top-level-only), so the
+            // slice maps 1:1 to legs regardless of the marker's collection knob.
+            SearchHit[][] legHits = new SearchHit[legCount][];
+            for (int leg = 0; leg < legCount; leg++) {
+                legHits[leg] = hitsOrThrow(items[offset + leg], offset + leg);
+            }
             offset += legCount;
-            RankedDocs ranked = computeRankedDocs(slice, mc.marker());
+            RankedDocs ranked = computeRankedDocs(legHits, mc.marker());
             resolved.put(
                 mc.marker(),
                 ranked.ids.length == 0 ? new MatchNoneQueryBuilder() : new RankDocsQueryBuilder(ranked.ids, ranked.scores, List.of()) // Top-only
@@ -241,18 +376,35 @@ public final class ResolverOrchestrator {
         return new SearchRequest(request.indices()).indicesOptions(request.indicesOptions()).source(legSource);
     }
 
-    private static RankedDocs computeRankedDocs(MultiSearchResponse.Item[] items, ResolverQueryBuilder resolver) {
+    /** A single leg's LOCAL top-{@code depth} on ONE shard: routed to shard {@code shard} via
+     *  {@code preference=_shards:<shard>|<copyPin>} (the copy-pin keeps every leg of a shard on the same replica),
+     *  id-only, totals disabled (per-shard slices can't reconstruct index-wide totals — the Tail supplies those). */
+    private static SearchRequest perShardLegSearch(SearchRequest request, QueryBuilder leg, int depth, int shard, String copyPin) {
+        SearchSourceBuilder legSource = new SearchSourceBuilder().query(leg).size(depth).from(0).fetchSource(false).trackTotalHits(false);
+        return new SearchRequest(request.indices()).indicesOptions(request.indicesOptions())
+            .preference("_shards:" + shard + "|" + copyPin)
+            .source(legSource);
+    }
+
+    /** Fuse the per-leg candidate hits ({@code legHits[legIndex]} = that leg's pool; for per-shard collection this
+     *  is already the union across shards) into a ranked, truncated id/score list. */
+    private static RankedDocs computeRankedDocs(SearchHit[][] legHits, ResolverQueryBuilder resolver) {
         Map<String, Float> combined = ResolverQueryBuilder.TECHNIQUE_ARITHMETIC_MEAN.equals(resolver.technique())
-            ? minMaxArithmeticMean(items, resolver)
-            : rrf(items, resolver);
+            ? minMaxArithmeticMean(legHits, resolver)
+            : rrf(legHits, resolver);
         return toRankedDocs(combined, resolver.rankWindowSize());
     }
 
-    /** Rank-based Reciprocal Rank Fusion: score(d) = Σ 1 / (rank_constant + rank_i(d) + 1). */
-    private static Map<String, Float> rrf(MultiSearchResponse.Item[] items, ResolverQueryBuilder resolver) {
+    /**
+     * Rank-based Reciprocal Rank Fusion: score(d) = Σ 1 / (rank_constant + rank_i(d) + 1).
+     * <p>Note: RRF stays on the coordinator (global-top-K) collection path — {@code isPerShardCollection()} is
+     * false for RRF — so each {@code legHits[legIndex]} is a single globally-merged, rank-ordered leg result and
+     * the array index is the doc's rank. RRF is rank-based and already at hybrid parity, so it does not need the
+     * per-shard pool.
+     */
+    private static Map<String, Float> rrf(SearchHit[][] legHits, ResolverQueryBuilder resolver) {
         Map<String, Float> scores = new LinkedHashMap<>();
-        for (int legIndex = 0; legIndex < items.length; legIndex++) {
-            SearchHit[] hits = hitsOrThrow(items[legIndex], legIndex);
+        for (SearchHit[] hits : legHits) {
             for (int rank = 0; rank < hits.length; rank++) {
                 String id = hits[rank].getId();
                 if (id == null) {
@@ -266,20 +418,23 @@ public final class ResolverOrchestrator {
 
     /**
      * Score-based min-max normalization + (weighted) arithmetic mean. Per leg, raw {@code _score}s are
-     * min-max normalized over the returned window; per doc, the combined score is the weighted mean over
+     * min-max normalized over that leg's candidate pool; per doc, the combined score is the weighted mean over
      * ALL legs (a non-matched leg contributes 0). Mirrors hybrid's {@code MinMaxScoreNormalizationTechnique}
      * (degenerate min==max -> 1.0; normalized 0 -> 0.001 floor so a matched doc is never confused with a
      * non-match) and {@code ArithmeticMeanScoreCombinationTechnique} (denominator = sum of ALL leg weights,
      * so a doc strong in both legs outranks one strong in only a single leg).
+     * <p>Faithfulness to hybrid depends on the leg pool: under per-shard collection {@code legHits[legIndex]} is
+     * the union of every shard's local top-depth, so the min/max computed here equals hybrid's global per-subquery
+     * min/max (which {@code MinMaxScoreNormalizationTechnique.getMinScores/getMaxScores} take across all shards).
      */
-    private static Map<String, Float> minMaxArithmeticMean(MultiSearchResponse.Item[] items, ResolverQueryBuilder resolver) {
+    private static Map<String, Float> minMaxArithmeticMean(SearchHit[][] legHits, ResolverQueryBuilder resolver) {
         float totalWeight = 0.0f;
-        for (int legIndex = 0; legIndex < items.length; legIndex++) {
+        for (int legIndex = 0; legIndex < legHits.length; legIndex++) {
             totalWeight += weightForLeg(resolver.weights(), legIndex);
         }
         Map<String, Float> weightedSum = new LinkedHashMap<>(); // id -> Σ weight_leg * normalized_leg
-        for (int legIndex = 0; legIndex < items.length; legIndex++) {
-            SearchHit[] hits = hitsOrThrow(items[legIndex], legIndex);
+        for (int legIndex = 0; legIndex < legHits.length; legIndex++) {
+            SearchHit[] hits = legHits[legIndex];
             float min = Float.MAX_VALUE;
             float max = -Float.MAX_VALUE;
             for (SearchHit hit : hits) {

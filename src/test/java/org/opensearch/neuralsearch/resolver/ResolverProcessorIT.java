@@ -16,8 +16,10 @@ import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.neuralsearch.BaseNeuralSearchIT;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.opensearch.neuralsearch.util.TestUtils.DEFAULT_USER_AGENT;
 
@@ -41,6 +43,8 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     private static final String NESTED_INDEX = "resolver-poc-nested-index";
     private static final String SHOP_INDEX = "resolver-poc-shop-index";
     private static final String DIVERGE_INDEX = "resolver-poc-diverge-index";
+    private static final String PERSHARD_INDEX = "resolver-poc-pershard-index";
+    private static final String PERSHARD_PIPELINE = "resolver-poc-mmam-pipeline";
 
     @SneakyThrows
     public void testResolverRrf_whenDocMatchesBothLegs_thenRanksFirst() {
@@ -634,5 +638,156 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
             "{\"title\":\"casual sneakers\",\"description\":\"everyday comfort\",\"brand\":\"beta\",\"category\":\"shoes\",\"in_stock\":true}",
             "p5"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Per-shard candidate collection (multi-shard). The resolver's min_max+arithmetic_mean fusion is
+    // window-sensitive because the POC's default "coordinator" collection reduces each leg to the
+    // GLOBAL top-rank_window_size before fusion, so min/max are computed over a narrower, compressed
+    // pool than the hybrid query (which normalizes over each shard's local top-pagination_depth). The
+    // "per_shard" collection fires each leg once PER SHARD (preference=_shards:i) and unions the
+    // per-shard slices, reproducing hybrid's exact normalization pool.
+    //
+    // Decisive, placement-independent invariant: with candidate_depth == pagination_depth, the
+    // per_shard resolver must fuse to the SAME ranking and (within float epsilon) the SAME scores as
+    // an equivalent hybrid min_max+arithmetic_mean query, DOC-FOR-DOC — regardless of how the docs are
+    // physically distributed across shards. A grouping / routing / union bug breaks this equality.
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * CLAIM: on a multi-shard index, per_shard resolver min_max+AM == hybrid min_max+AM doc-for-doc
+     * (same doc set, per-id scores equal within epsilon), because both fuse over the union of each
+     * shard's local top-depth. candidate_depth (10) == hybrid pagination_depth (10). Both size and window
+     * are set >= the total matched docs (5) so the ENTIRE fused union is returned by both — no top-K
+     * truncation, so a boundary tie cannot spuriously differ; any mismatch is a real fusion divergence.
+     * This is the invariant that a grouping / routing / union regression would break.
+     */
+    @SneakyThrows
+    public void testPerShard_matchesHybridDocForDoc() {
+        initPerShardIndexIfNeeded();
+        createMinMaxArithmeticMeanPipelineIfNeeded();
+
+        // Hybrid oracle: match(title:apple) + match(body:banana), pagination_depth=10, min_max+AM, size=20 (all).
+        String hybridBody = "{\"size\":20,\"query\":{\"hybrid\":{\"pagination_depth\":10,\"queries\":["
+            + "{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}]}}}";
+        List<Map<String, Object>> hybridHits = readHits(searchWithPipeline(PERSHARD_INDEX, hybridBody, PERSHARD_PIPELINE));
+
+        // Resolver per_shard: same legs, candidate_depth=10 (== pagination_depth), window/size >= all matches, no pipeline.
+        String resolverBody = "{\"size\":20,\"query\":{\"resolver\":{\"queries\":["
+            + "{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
+            + "\"rank_window_size\":20,\"collection\":\"per_shard\",\"candidate_depth\":10,"
+            + "\"normalization\":{\"technique\":\"min_max\"},\"combination\":{\"technique\":\"arithmetic_mean\"}}},"
+            + "\"track_total_hits\":false}";
+        List<Map<String, Object>> resolverHits = readHits(searchNoPipeline(PERSHARD_INDEX, resolverBody));
+
+        assertFalse("hybrid returned no hits", hybridHits.isEmpty());
+        assertEquals("per_shard resolver and hybrid must return the same number of hits", hybridHits.size(), resolverHits.size());
+
+        // Doc-for-doc: identical id SET and identical per-id scores (within float epsilon). We compare by
+        // id->score map (not raw position) so a genuine fusion difference surfaces as a set/score mismatch,
+        // while a pure tie-break order difference between hybrid and resolver is not spuriously flagged.
+        Map<String, Double> hybridScores = scoresById(hybridHits);
+        Map<String, Double> resolverScores = scoresById(resolverHits);
+        assertEquals("per_shard resolver must return the same doc set as hybrid", hybridScores.keySet(), resolverScores.keySet());
+        for (Map.Entry<String, Double> e : hybridScores.entrySet()) {
+            assertEquals("score for " + e.getKey() + " must match hybrid", e.getValue(), resolverScores.get(e.getKey()), 1e-4);
+        }
+    }
+
+    private Map<String, Double> scoresById(final List<Map<String, Object>> hits) {
+        Map<String, Double> byId = new HashMap<>();
+        for (Map<String, Object> hit : hits) {
+            byId.put((String) hit.get("_id"), ((Number) hit.get("_score")).doubleValue());
+        }
+        return byId;
+    }
+
+    /**
+     * CLAIM: the per_shard collection genuinely widens the candidate pool - it is NOT a silent no-op /
+     * fallback to coordinator. With a deliberately narrow coordinator window (rank_window_size = 2), each
+     * leg's coordinator pool is the GLOBAL top-2, whereas per_shard (candidate_depth = 10) collects each
+     * shard's full local pool. A leg's global top-2 is always a subset of its full per-shard union, so the
+     * per_shard fused result set is a SUPERSET of the coordinator result set, and strictly larger here (5
+     * matching docs; a window-2 coordinator fuses at most 4 distinct). Both facts are deterministic and
+     * independent of BM25 tie-breaks and physical shard placement - a coordinator fallback (bug) would
+     * instead make the two sets identical.
+     */
+    @SneakyThrows
+    public void testPerShard_widensPoolVsCoordinator() {
+        initPerShardIndexIfNeeded();
+
+        // Coordinator: leg size = rank_window_size = 2 -> each leg's pool is the global top-2.
+        String coordinatorBody = "{\"size\":20,\"query\":{\"resolver\":{\"queries\":["
+            + "{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
+            + "\"rank_window_size\":2,"
+            + "\"normalization\":{\"technique\":\"min_max\"},\"combination\":{\"technique\":\"arithmetic_mean\"}}},"
+            + "\"track_total_hits\":false}";
+        Set<String> coordinatorIds = new HashSet<>(ids(searchNoPipeline(PERSHARD_INDEX, coordinatorBody)));
+
+        // Per-shard: candidate_depth=10 -> each shard's full local pool -> the union is every matching doc.
+        String perShardBody = "{\"size\":20,\"query\":{\"resolver\":{\"queries\":["
+            + "{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
+            + "\"rank_window_size\":20,\"collection\":\"per_shard\",\"candidate_depth\":10,"
+            + "\"normalization\":{\"technique\":\"min_max\"},\"combination\":{\"technique\":\"arithmetic_mean\"}}},"
+            + "\"track_total_hits\":false}";
+        Set<String> perShardIds = new HashSet<>(ids(searchNoPipeline(PERSHARD_INDEX, perShardBody)));
+
+        logger.info("PERSHARD_POOL coordinator={} per_shard={}", coordinatorIds, perShardIds);
+        // Per-shard pool is a strict superset of the narrow coordinator pool -> the path ran and widened it.
+        assertTrue(
+            "per_shard result set must contain the coordinator result set: coord=" + coordinatorIds + " per_shard=" + perShardIds,
+            perShardIds.containsAll(coordinatorIds)
+        );
+        assertTrue(
+            "per_shard must fuse strictly more docs than a window-2 coordinator: coord=" + coordinatorIds + " per_shard=" + perShardIds,
+            perShardIds.size() > coordinatorIds.size()
+        );
+        // candidate_depth (10) >= docs-per-shard, so per_shard recovers the entire 5-doc match set.
+        assertEquals("per_shard must fuse the full match set", 5, perShardIds.size());
+    }
+
+    @SneakyThrows
+    private Map<String, Object> searchWithPipeline(final String index, final String body, final String pipeline) {
+        Response response = makeRequest(
+            client(),
+            "POST",
+            "/" + index + "/_search?search_pipeline=" + pipeline,
+            Map.of(),
+            toHttpEntity(body),
+            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+        );
+        return XContentHelper.convertToMap(XContentType.JSON.xContent(), EntityUtils.toString(response.getEntity()), false);
+    }
+
+    private void createMinMaxArithmeticMeanPipelineIfNeeded() {
+        // min_max normalization + arithmetic_mean combination, unweighted — the hybrid equivalent of the resolver's
+        // default min_max+AM. Reuses the base IT helper so the pipeline JSON matches production exactly.
+        createSearchPipeline(PERSHARD_PIPELINE, "min_max", "arithmetic_mean", Map.of());
+    }
+
+    @SneakyThrows
+    private void initPerShardIndexIfNeeded() {
+        if (indexExists(PERSHARD_INDEX)) {
+            return;
+        }
+        // Multiple shards so coordinator (global-top-K) and per_shard (per-shard union) pools genuinely differ.
+        // The key doc is "wb" (weak in BOTH legs): it sits OUTSIDE each leg's global top-2 (its term frequency is
+        // strictly below the strong docs) but INSIDE each shard's local top-candidate_depth. So a window-2
+        // coordinator pool excludes wb entirely, while per-shard collection (and hybrid) include it — a
+        // deterministic, shard-placement-independent divergence. Strong docs use high TF + padding so their BM25
+        // clearly beats wb's regardless of length normalization.
+        String mapping = "{"
+            + "\"settings\":{\"index\":{\"number_of_shards\":3,\"number_of_replicas\":0}},"
+            + "\"mappings\":{\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"}}}"
+            + "}";
+        createIndex(PERSHARD_INDEX, mapping);
+        // Leg A (title:apple) strong docs — global top of leg A.
+        ingestDocument(PERSHARD_INDEX, "{\"title\":\"apple apple apple apple apple\",\"body\":\"grape grape grape\"}", "a1");
+        ingestDocument(PERSHARD_INDEX, "{\"title\":\"apple apple apple apple\",\"body\":\"grape grape\"}", "a2");
+        // Leg B (body:banana) strong docs — global top of leg B.
+        ingestDocument(PERSHARD_INDEX, "{\"title\":\"cherry cherry\",\"body\":\"banana banana banana banana banana\"}", "b1");
+        ingestDocument(PERSHARD_INDEX, "{\"title\":\"cherry\",\"body\":\"banana banana banana banana\"}", "b2");
+        // wb: matches BOTH legs but weakly (TF 1 each) -> outside each leg's global top-2, inside each shard's pool.
+        ingestDocument(PERSHARD_INDEX, "{\"title\":\"apple\",\"body\":\"banana\"}", "wb");
     }
 }

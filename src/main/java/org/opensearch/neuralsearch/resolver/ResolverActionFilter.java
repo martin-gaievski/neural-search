@@ -71,11 +71,19 @@ public class ResolverActionFilter implements ActionFilter {
 
                 // Case 1: top-level resolver — rewrite the whole query; patch total_hits from the legs when the Tail is skipped.
                 if (query instanceof ResolverQueryBuilder resolver) {
+                    // Compute the collection plan ONCE and thread it into both the build and the reduce, so the item
+                    // layout the reduce reads back always matches what the build produced (no recompute race).
+                    ResolverOrchestrator.CollectionPlan plan = ResolverOrchestrator.planCollection(searchRequest, resolver);
                     client.multiSearch(
-                        ResolverOrchestrator.buildLegMultiSearch(searchRequest, resolver),
+                        ResolverOrchestrator.buildLegMultiSearch(searchRequest, resolver, plan),
                         ActionListener.wrap(multiSearchResponse -> {
                             try {
-                                TotalHits patchedTotal = ResolverOrchestrator.applyFusedResults(source, multiSearchResponse, resolver);
+                                TotalHits patchedTotal = ResolverOrchestrator.applyFusedResults(
+                                    source,
+                                    multiSearchResponse,
+                                    resolver,
+                                    plan
+                                );
                                 ActionListener<Response> downstream = patchedTotal == null
                                     ? listener
                                     : patchTotalHits(listener, patchedTotal);
