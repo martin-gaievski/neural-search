@@ -13,6 +13,7 @@ import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
+import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -67,10 +68,10 @@ public class ResolverActionFilter implements ActionFilter {
             SearchSourceBuilder source = searchRequest.source();
             if (source != null && source.query() != null) {
                 QueryBuilder query = source.query();
-                Client client = clientSupplier.get();
 
                 // Case 1: top-level resolver — rewrite the whole query; patch total_hits from the legs when the Tail is skipped.
                 if (query instanceof ResolverQueryBuilder resolver) {
+                    Client client = clientSupplier.get();
                     // Compute the collection plan ONCE and thread it into both the build and the reduce, so the item
                     // layout the reduce reads back always matches what the build produced (no recompute race).
                     ResolverOrchestrator.CollectionPlan plan = ResolverOrchestrator.planCollection(searchRequest, resolver);
@@ -122,25 +123,31 @@ public class ResolverActionFilter implements ActionFilter {
                 }
 
                 // Case 2: one or more resolver markers nested inside a bool tree — resolve each in place.
-                List<ResolverOrchestrator.MarkerContext> markers = ResolverOrchestrator.collectMarkers(query);
-                if (markers.isEmpty() == false) {
-                    client.multiSearch(
-                        ResolverOrchestrator.buildMarkerMultiSearch(searchRequest, markers),
-                        ActionListener.wrap(multiSearchResponse -> {
-                            try {
-                                source.query(
-                                    ResolverOrchestrator.replaceMarkers(
-                                        query,
-                                        ResolverOrchestrator.resolveMarkers(markers, multiSearchResponse)
-                                    )
-                                );
-                                chain.proceed(task, action, request, listener);
-                            } catch (Exception e) {
-                                listener.onFailure(e);
-                            }
-                        }, listener::onFailure)
-                    );
-                    return; // defer
+                // The marker walk only descends into bool containers (ResolverOrchestrator.collect), so a top-level
+                // non-bool query (match/term/knn/dis_max/function_score/...) can never hold a reachable marker —
+                // skip the walk entirely for it, leaving the fall-through overhead on ordinary queries at ~zero.
+                if (query instanceof BoolQueryBuilder) {
+                    List<ResolverOrchestrator.MarkerContext> markers = ResolverOrchestrator.collectMarkers(query);
+                    if (markers.isEmpty() == false) {
+                        Client client = clientSupplier.get();
+                        client.multiSearch(
+                            ResolverOrchestrator.buildMarkerMultiSearch(searchRequest, markers),
+                            ActionListener.wrap(multiSearchResponse -> {
+                                try {
+                                    source.query(
+                                        ResolverOrchestrator.replaceMarkers(
+                                            query,
+                                            ResolverOrchestrator.resolveMarkers(markers, multiSearchResponse)
+                                        )
+                                    );
+                                    chain.proceed(task, action, request, listener);
+                                } catch (Exception e) {
+                                    listener.onFailure(e);
+                                }
+                            }, listener::onFailure)
+                        );
+                        return; // defer
+                    }
                 }
             }
         }
