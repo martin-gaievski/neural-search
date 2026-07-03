@@ -8,6 +8,7 @@ import org.apache.lucene.search.TotalHits;
 import org.opensearch.action.search.MultiSearchRequest;
 import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
@@ -16,9 +17,11 @@ import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.internal.InternalSearchResponse;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
@@ -129,18 +132,32 @@ public final class ResolverOrchestrator {
      *  (coordinator), or one search per (leg, shard) when the plan is per-shard. Items are laid out LEG-MAJOR: for
      *  per-shard, leg L's shards occupy indices {@code [L*numShards, (L+1)*numShards)}. */
     public static MultiSearchRequest buildLegMultiSearch(SearchRequest request, ResolverQueryBuilder resolver, CollectionPlan plan) {
+        return buildLegMultiSearch(request, resolver, plan, false);
+    }
+
+    /** As {@link #buildLegMultiSearch(SearchRequest, ResolverQueryBuilder, CollectionPlan)}, but when
+     *  {@code fetchSource} is true the legs return {@code _source} (and stored fields), so the fused window's hits are
+     *  already hydrated and the stage-B main search can be skipped (the fast path — see
+     *  {@link #fabricateFastPathResponse}). Only used on the coordinator-collection fast path. */
+    public static MultiSearchRequest buildLegMultiSearch(
+        SearchRequest request,
+        ResolverQueryBuilder resolver,
+        CollectionPlan plan,
+        boolean fetchSource
+    ) {
         MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
         if (plan.perShard()) {
-            // Per-shard sub-searches gather candidate scores only; totals come from the Tail (see applyFusedResults).
+            // Per-shard sub-searches gather candidate scores only (totals come from the Tail); on the fast path they
+            // also hydrate _source so the fused window can be returned directly (see fabricateFastPathResponse).
             for (QueryBuilder leg : resolver.queries()) {
                 for (int shard = 0; shard < plan.numShards(); shard++) {
-                    multiSearchRequest.add(perShardLegSearch(request, leg, plan.depth(), shard, plan.copyPin()));
+                    multiSearchRequest.add(perShardLegSearch(request, leg, plan.depth(), shard, plan.copyPin(), fetchSource));
                 }
             }
         } else {
             int trackTotalHitsUpTo = trackTotalHitsCap(request.source());
             for (QueryBuilder leg : resolver.queries()) {
-                multiSearchRequest.add(legSearch(request, leg, List.of(), resolver.rankWindowSize(), trackTotalHitsUpTo));
+                multiSearchRequest.add(legSearch(request, leg, List.of(), resolver.rankWindowSize(), trackTotalHitsUpTo, fetchSource));
             }
         }
         return multiSearchRequest;
@@ -186,6 +203,132 @@ public final class ResolverOrchestrator {
         }
         source.query(new RankDocsQueryBuilder(ranked.ids, ranked.scores, topOnly ? List.of() : resolver.queries()));
         return patchTotal;
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Fast path: skip the stage-B main search for plain top-K retrieval by fabricating the response
+    // directly from the fused window. The legs are fired with _source enabled, so the fused window's
+    // hits are already hydrated; we override each hit's score with the fused score, sort, and page.
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * True when a top-level resolver request can be served by the stage-B-free fast path: plain top-K retrieval only.
+     * We require the whole page to fit inside the fused window ({@code from + size <= rank_window_size}), and NONE of
+     * the features whose semantics a fabricated response cannot faithfully reproduce without a real query phase:
+     * aggregations / explain / profile / highlight (need the full match set IN the query — {@link #needsExecutionTail}),
+     * plus user {@code sort} / {@code collapse} / {@code rescore} / {@code post_filter} / {@code search_after} /
+     * {@code min_score} (need real collection over the executed query). Anything else falls back to the self-erasing
+     * {@link RankDocsQueryBuilder} path, which handles all of these.
+     */
+    public static boolean fastPathEligible(SearchSourceBuilder source, ResolverQueryBuilder resolver) {
+        if (source == null) {
+            return false;
+        }
+        if (needsExecutionTail(source)) {
+            return false;
+        }
+        int from = Math.max(0, source.from());
+        int size = source.size() < 0 ? 10 : source.size();
+        if (from + size > resolver.rankWindowSize()) {
+            return false; // page extends beyond the fused window — the window cannot serve it
+        }
+        // Accurate total_hits BEYOND the fused window cannot be reconstructed from a window-sized fabricated response
+        // (the legs retrieve only rankWindowSize hits, so a leg with more matches than the window would undercount);
+        // that case needs the Tail / leg-union path. Only serve the fast path when totals need not exceed the window.
+        if (wantsTotalsBeyondWindow(source, size)) {
+            return false;
+        }
+        boolean hasSort = source.sorts() != null && source.sorts().isEmpty() == false;
+        boolean hasRescore = source.rescores() != null && source.rescores().isEmpty() == false;
+        return hasSort == false
+            && hasRescore == false
+            && source.collapse() == null
+            && source.postFilter() == null
+            && source.searchAfter() == null
+            && source.minScore() == null;
+    }
+
+    /**
+     * Fabricate the final {@link SearchResponse} directly from the fused window — no stage-B search. The legs were
+     * fired with {@code _source} enabled (so their hits are hydrated); we take the fused ranked ids, reuse each
+     * doc's already-fetched hit, override its {@code _score} with the fused score, sort by score desc, page to
+     * {@code [from, from+size)}, and attach a leg-union {@code total_hits}. {@code template} is any of the leg
+     * responses, used only to copy shard-count / took / clusters envelope fields.
+     */
+    public static SearchResponse fabricateFastPathResponse(
+        SearchRequest request,
+        SearchSourceBuilder source,
+        MultiSearchResponse multiSearchResponse,
+        ResolverQueryBuilder resolver,
+        CollectionPlan plan
+    ) {
+        MultiSearchResponse.Item[] items = multiSearchResponse.getResponses();
+        SearchHit[][] legHits = groupLegHits(items, resolver.queries().size(), plan);
+        RankedDocs ranked = computeRankedDocs(legHits, resolver);
+
+        // id -> a hydrated hit for that doc (first occurrence across legs; all carry the same _source).
+        Map<String, SearchHit> hitById = new HashMap<>();
+        for (SearchHit[] legHit : legHits) {
+            for (SearchHit hit : legHit) {
+                if (hit.getId() != null) {
+                    hitById.putIfAbsent(hit.getId(), hit);
+                }
+            }
+        }
+
+        int from = Math.max(0, source.from());
+        int size = source.size() < 0 ? 10 : source.size();
+        List<SearchHit> page = new ArrayList<>();
+        float maxScore = Float.NaN;
+        for (int rank = from; rank < ranked.ids.length && page.size() < size; rank++) {
+            SearchHit hit = hitById.get(ranked.ids[rank]);
+            if (hit == null) {
+                continue; // fused id whose hit wasn't hydrated (shouldn't happen with fetchSource legs) — skip
+            }
+            hit.score(ranked.scores[rank]);
+            if (Float.isNaN(maxScore)) {
+                maxScore = ranked.scores[rank];
+            }
+            page.add(hit);
+        }
+
+        // total_hits: exact/capped leg-union when derivable, else the size of the fused id set (a lower bound).
+        TotalHits total = legUnionTotalHits(items);
+        if (total == null) {
+            total = new TotalHits(ranked.ids.length, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+        }
+
+        SearchHits searchHits = new SearchHits(page.toArray(new SearchHit[0]), total, maxScore);
+        InternalSearchResponse internal = new InternalSearchResponse(
+            searchHits,
+            null, // aggregations — fast path is gated to no-aggs
+            null, // suggest
+            null, // profile — gated out
+            false,
+            null,
+            1
+        );
+        MultiSearchResponse.Item template = firstSuccess(items);
+        SearchResponse t = template == null ? null : template.getResponse();
+        return new SearchResponse(
+            internal,
+            null, // scrollId
+            t == null ? plan.numShards() : t.getTotalShards(),
+            t == null ? plan.numShards() : t.getSuccessfulShards(),
+            t == null ? 0 : t.getSkippedShards(),
+            t == null ? 0 : t.getTook().millis(),
+            t == null ? new org.opensearch.action.search.ShardSearchFailure[0] : t.getShardFailures(),
+            t == null ? SearchResponse.Clusters.EMPTY : t.getClusters()
+        );
+    }
+
+    private static MultiSearchResponse.Item firstSuccess(MultiSearchResponse.Item[] items) {
+        for (MultiSearchResponse.Item item : items) {
+            if (item.isFailure() == false) {
+                return item;
+            }
+        }
+        return null;
     }
 
     /** Reduce the raw MultiSearch items into a per-leg array of hits. Coordinator plan: one item per leg. Per-shard
@@ -350,13 +493,25 @@ public final class ResolverOrchestrator {
     // Shared helpers
     // ---------------------------------------------------------------------------------------------
 
-    /** A single leg search: the leg query, optionally constrained by pushed-down filters, id-only. */
     private static SearchRequest legSearch(
         SearchRequest request,
         QueryBuilder leg,
         List<QueryBuilder> pushDownFilters,
         int size,
         int trackTotalHitsUpTo
+    ) {
+        return legSearch(request, leg, pushDownFilters, size, trackTotalHitsUpTo, false);
+    }
+
+    /** A single leg search: the leg query, optionally constrained by pushed-down filters. Id-only unless
+     *  {@code fetchSource} (fast path), which hydrates {@code _source} so the fused window can be returned directly. */
+    private static SearchRequest legSearch(
+        SearchRequest request,
+        QueryBuilder leg,
+        List<QueryBuilder> pushDownFilters,
+        int size,
+        int trackTotalHitsUpTo,
+        boolean fetchSource
     ) {
         QueryBuilder legQuery = leg;
         if (pushDownFilters.isEmpty() == false) {
@@ -366,7 +521,7 @@ public final class ResolverOrchestrator {
             }
             legQuery = constrained;
         }
-        SearchSourceBuilder legSource = new SearchSourceBuilder().query(legQuery).size(size).from(0).fetchSource(false);
+        SearchSourceBuilder legSource = new SearchSourceBuilder().query(legQuery).size(size).from(0).fetchSource(fetchSource);
         if (trackTotalHitsUpTo > 0) {
             // count matches (up to the cap) so the union total can be derived from the legs without a Tail re-run
             legSource.trackTotalHitsUpTo(trackTotalHitsUpTo);
@@ -376,11 +531,27 @@ public final class ResolverOrchestrator {
         return new SearchRequest(request.indices()).indicesOptions(request.indicesOptions()).source(legSource);
     }
 
+    private static SearchRequest perShardLegSearch(SearchRequest request, QueryBuilder leg, int depth, int shard, String copyPin) {
+        return perShardLegSearch(request, leg, depth, shard, copyPin, false);
+    }
+
     /** A single leg's LOCAL top-{@code depth} on ONE shard: routed to shard {@code shard} via
      *  {@code preference=_shards:<shard>|<copyPin>} (the copy-pin keeps every leg of a shard on the same replica),
-     *  id-only, totals disabled (per-shard slices can't reconstruct index-wide totals — the Tail supplies those). */
-    private static SearchRequest perShardLegSearch(SearchRequest request, QueryBuilder leg, int depth, int shard, String copyPin) {
-        SearchSourceBuilder legSource = new SearchSourceBuilder().query(leg).size(depth).from(0).fetchSource(false).trackTotalHits(false);
+     *  totals disabled (per-shard slices can't reconstruct index-wide totals — the Tail supplies those). Id-only unless
+     *  {@code fetchSource} (fast path), which hydrates {@code _source} so the fused window can be returned directly. */
+    private static SearchRequest perShardLegSearch(
+        SearchRequest request,
+        QueryBuilder leg,
+        int depth,
+        int shard,
+        String copyPin,
+        boolean fetchSource
+    ) {
+        SearchSourceBuilder legSource = new SearchSourceBuilder().query(leg)
+            .size(depth)
+            .from(0)
+            .fetchSource(fetchSource)
+            .trackTotalHits(false);
         return new SearchRequest(request.indices()).indicesOptions(request.indicesOptions())
             .preference("_shards:" + shard + "|" + copyPin)
             .source(legSource);

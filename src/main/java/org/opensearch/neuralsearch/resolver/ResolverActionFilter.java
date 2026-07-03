@@ -74,6 +74,31 @@ public class ResolverActionFilter implements ActionFilter {
                     // Compute the collection plan ONCE and thread it into both the build and the reduce, so the item
                     // layout the reduce reads back always matches what the build produced (no recompute race).
                     ResolverOrchestrator.CollectionPlan plan = ResolverOrchestrator.planCollection(searchRequest, resolver);
+
+                    // Fast path: for plain top-K retrieval (no aggs/explain/highlight/sort/collapse/rescore/...), fire
+                    // the legs with _source enabled and fabricate the response directly from the fused window — no
+                    // second (stage-B) distributed search. Skipping stage B is the resolver's main latency lever.
+                    if (ResolverOrchestrator.fastPathEligible(source, resolver)) {
+                        client.multiSearch(
+                            ResolverOrchestrator.buildLegMultiSearch(searchRequest, resolver, plan, true),
+                            ActionListener.wrap(multiSearchResponse -> {
+                                try {
+                                    SearchResponse fabricated = ResolverOrchestrator.fabricateFastPathResponse(
+                                        searchRequest,
+                                        source,
+                                        multiSearchResponse,
+                                        resolver,
+                                        plan
+                                    );
+                                    listener.onResponse((Response) fabricated);
+                                } catch (Exception e) {
+                                    listener.onFailure(e);
+                                }
+                            }, listener::onFailure)
+                        );
+                        return; // defer; no chain.proceed — the fabricated response IS the result
+                    }
+
                     client.multiSearch(
                         ResolverOrchestrator.buildLegMultiSearch(searchRequest, resolver, plan),
                         ActionListener.wrap(multiSearchResponse -> {

@@ -424,6 +424,86 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
         assertFalse(ids(response).contains("r4")); // matches neither leg
     }
 
+    /**
+     * CLAIM: the stage-B-free FAST PATH — a plain top-K resolver with {@code track_total_hits:false} (and no
+     * aggs/explain/highlight/sort/collapse/rescore) fabricates the response directly from the fused window instead
+     * of injecting a RankDocsQuery + second search. Verifies it produces the correct fused ranking AND that hits
+     * carry {@code _source} (proving the legs were fetched with source and the window returned directly).
+     */
+    @SneakyThrows
+    public void testFastPath_plainTopK_returnsFusedWindowWithSource() {
+        initRankDocsIndexIfNeeded();
+        // track_total_hits:false + plain top-K within the window -> fast path. r1 matches both legs -> RRF leader.
+        String body = "{\"size\":10,\"track_total_hits\":false,\"query\":{" + resolverFragment(100) + "}}";
+        Map<String, Object> response = searchNoPipeline(RANKDOCS_INDEX, body);
+        List<Map<String, Object>> hits = readHits(response);
+        List<String> hitIds = hits.stream().map(h -> (String) h.get("_id")).toList();
+
+        assertEquals(3, hitIds.size()); // fused union {r1,r2,r3}, r4 (matches neither leg) excluded
+        assertEquals("r1", hitIds.get(0));
+        assertFalse(hitIds.contains("r4"));
+
+        // Fabricated from source-hydrated legs -> every hit carries _source (proves the fast path hydrated the
+        // window and returned it directly, rather than the id-only legs the standard path uses).
+        for (Map<String, Object> hit : hits) {
+            assertNotNull("fast-path hit must carry _source", hit.get("_source"));
+        }
+        // Standard scored query semantics preserved: scores descending.
+        List<Double> scores = hits.stream().map(h -> ((Number) h.get("_score")).doubleValue()).toList();
+        for (int i = 0; i < scores.size() - 1; i++) {
+            assertTrue("fast-path scores must be descending", scores.get(i) >= scores.get(i + 1));
+        }
+    }
+
+    /**
+     * CLAIM: the fast path is correctly GATED OFF when a feature needs the real query phase — here aggregations,
+     * which must run over the full match set. The request must still return correct aggregation buckets (served by
+     * the standard RankDocsQuery + Tail path), proving the dispatcher fell back rather than fabricating.
+     */
+    @SneakyThrows
+    public void testFastPath_fallsBackWhenAggregationsRequested() {
+        initRankDocsIndexIfNeeded();
+        String body = "{\"size\":1,\"query\":{"
+            + resolverFragment(1)
+            + "},\"aggs\":{\"by_category\":{\"terms\":{\"field\":\"category\"}}}}";
+        Map<String, Object> response = searchNoPipeline(RANKDOCS_INDEX, body);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> aggs = (Map<String, Object>) response.get("aggregations");
+        assertNotNull("aggregations must be present -> fast path fell back to the Tail path", aggs);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> byCategory = (Map<String, Object>) aggs.get("by_category");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> buckets = (List<Map<String, Object>>) byCategory.get("buckets");
+        int total = 0;
+        for (Map<String, Object> b : buckets) {
+            total += ((Number) b.get("doc_count")).intValue();
+        }
+        assertEquals("aggs cover all 3 leg matches (Tail path), not just the size-1 window", 3, total);
+    }
+
+    /**
+     * CLAIM: the fast path also works with PER-SHARD collection on a multi-shard index — the per-shard leg
+     * sub-searches hydrate {@code _source}, so the fabricated window carries source (regression guard: per-shard
+     * leg builds must honor the fetchSource flag, not just the coordinator legs).
+     */
+    @SneakyThrows
+    public void testFastPath_perShard_returnsFusedWindowWithSource() {
+        initPerShardIndexIfNeeded();
+        String body = "{\"size\":10,\"track_total_hits\":false,\"query\":{\"resolver\":{\"queries\":["
+            + "{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
+            + "\"rank_window_size\":20,\"collection\":\"per_shard\",\"candidate_depth\":10,"
+            + "\"normalization\":{\"technique\":\"min_max\"},\"combination\":{\"technique\":\"arithmetic_mean\"}}}}";
+        List<Map<String, Object>> hits = readHits(searchNoPipeline(PERSHARD_INDEX, body));
+        assertFalse("per-shard fast path must return the fused window", hits.isEmpty());
+        for (Map<String, Object> hit : hits) {
+            assertNotNull("per-shard fast-path hit must carry _source", hit.get("_source"));
+        }
+        List<Double> scores = hits.stream().map(h -> ((Number) h.get("_score")).doubleValue()).toList();
+        for (int i = 0; i < scores.size() - 1; i++) {
+            assertTrue("scores must be descending", scores.get(i) >= scores.get(i + 1));
+        }
+    }
+
     @SneakyThrows
     private void initRankDocsIndexIfNeeded() {
         if (indexExists(RANKDOCS_INDEX)) {
