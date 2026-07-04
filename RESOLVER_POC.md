@@ -193,3 +193,29 @@ Net: the Tail recovers **total-hits, aggregations, and highlighting** (over all 
   via the `normalization`/`combination` objects. `l2`/`z_score`, `geometric`/`harmonic` mean, `rescorer`,
   and rerankers are Phase 2/3.
 - **Stats:** no `EventStatsManager` counters wired yet (follow-up).
+
+## Production feasibility (summary)
+
+Assessed across 3 BEIR datasets (TREC-COVID / Quora / NQ, incl. mpnet-768) on 2–3 node / 12–65 shard
+clusters, and adversarially verified. **Feasible now for one mode; the rest needs defined work.**
+
+- ✅ **Production-ready: RRF + coordinator collection + fast path.** RRF ≈ hybrid relevance (exact on
+  Quora; a −3%…−6% rank residual on TREC-COVID). The stage-B-free fast path is **0.58–0.88× hybrid**
+  latency, and RRF **never fans out** (it's excluded from per-shard collection by an enforced invariant).
+  Pipeline-free is a real managed/serverless win.
+- ⚠️ **Experimental: `min_max`+`arithmetic_mean` with `collection: per_shard`.** It closes the coordinator
+  relevance gap (a pure candidate-pool-width effect; faithful math), but per dataset the closure varies
+  (TREC-COVID lands ~−3.4% vs hybrid, Quora/NQ ~−1.1%), and it carries a real fan-out latency
+  (`num_shards × legs × f(candidate_depth)`; ~2.77× hybrid at 24 shards / `size=100`) plus **silent
+  fallback to coordinator** on multi-index/alias, custom routing/preference, or `num_shards × legs > 128`.
+  Ship behind a flag.
+- **GA blockers for any mode:** (1) re-home off the `ActionFilter` onto a `registerAsyncAction`
+  `QueryBuilder` (native rewrite recursion → correct nesting/multiplicity); (2) adopt **PIT** for stage-B
+  snapshot consistency — a correctness prerequisite (`_id` matching can drop/mis-score docs under
+  concurrent indexing), not an optimization. CCS/remote targets need explicit gating.
+- **The one credible per-shard latency fix** is a real query-phase shard-collector (reuse hybrid's
+  `HybridTopScoreDocCollector` / `CompoundTopDocs`) → per-shard ~1× hybrid at equal depth, removing the
+  fan-out, the 128 cap, and the alias/routing fallbacks.
+
+Full assessment + P0/P1/P2 optimization roadmap (and the list of *rejected* optimizations) is in the
+design package's showcase doc §13.
