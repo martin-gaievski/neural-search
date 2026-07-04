@@ -349,6 +349,62 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     }
 
     /**
+     * CLAIM (POC v2 adaptive-fusion #1): the resolver supports z_score (DBSF-style) normalization + arithmetic_mean —
+     * each leg normalized by its OWN returned-score distribution (mean/std), per query, pipeline-free. Happy path: the
+     * doc strongest in BOTH legs sits at the high end of both leg distributions -> highest mean -> ranks first, and the
+     * fused window is the union of the legs, self-erased into a standard descending-scored query.
+     */
+    @SneakyThrows
+    public void testResolver_zScoreArithmeticMean_happyPath() {
+        initRescoreIndexIfNeeded();
+        String body = "{\"size\":10,\"query\":{\"resolver\":{"
+            + "\"queries\":[{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
+            + "\"rank_window_size\":100,"
+            + "\"normalization\":{\"technique\":\"z_score\"},"
+            + "\"combination\":{\"technique\":\"arithmetic_mean\"}"
+            + "}}}";
+        Map<String, Object> response = searchNoPipeline(RESCORE_INDEX, body);
+        List<Map<String, Object>> hits = readHits(response);
+        List<String> ids = hits.stream().map(hit -> (String) hit.get("_id")).toList();
+
+        // d_rrf_leader is strongest in both legs -> top of both per-leg z-score distributions -> highest mean.
+        assertEquals("d_rrf_leader", ids.get(0));
+        assertTrue(ids.contains("d_phrase_winner")); // both legs, weaker
+        assertTrue(ids.contains("d_filler"));         // leg 1 only, still present
+
+        // Self-erased into a standard scored query -> scores are in descending order.
+        double previous = Double.MAX_VALUE;
+        for (Map<String, Object> hit : hits) {
+            double score = ((Number) hit.get("_score")).doubleValue();
+            assertTrue("z_score fused scores must be descending", score <= previous);
+            previous = score;
+        }
+    }
+
+    /**
+     * CLAIM (POC v2): z_score also composes with per_shard collection on a multi-shard index — per-query distribution
+     * normalization over the num_shards x depth union pool. Smoke test: returns the fused window, source-hydrated
+     * (fast path), scores descending; proves the z_score path is reachable under per_shard without error.
+     */
+    @SneakyThrows
+    public void testResolver_zScore_perShard_returnsFusedWindow() {
+        initPerShardIndexIfNeeded();
+        String body = "{\"size\":10,\"track_total_hits\":false,\"query\":{\"resolver\":{\"queries\":["
+            + "{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
+            + "\"rank_window_size\":20,\"collection\":\"per_shard\",\"candidate_depth\":10,"
+            + "\"normalization\":{\"technique\":\"z_score\"},\"combination\":{\"technique\":\"arithmetic_mean\"}}}}";
+        List<Map<String, Object>> hits = readHits(searchNoPipeline(PERSHARD_INDEX, body));
+        assertFalse("z_score per_shard must return the fused window", hits.isEmpty());
+        double previous = Double.MAX_VALUE;
+        for (Map<String, Object> hit : hits) {
+            assertNotNull("hit must carry _source", hit.get("_source"));
+            double score = ((Number) hit.get("_score")).doubleValue();
+            assertTrue("scores must be descending", score <= previous);
+            previous = score;
+        }
+    }
+
+    /**
      * CLAIM: RRF and min_max+arithmetic_mean are genuinely different techniques (not silently the same).
      * Decisive setup (single shard), two legs — match(title:apple), match(body:banana) — three docs:
      * <ul>

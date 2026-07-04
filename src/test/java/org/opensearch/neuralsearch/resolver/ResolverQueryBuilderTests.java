@@ -238,6 +238,42 @@ public class ResolverQueryBuilderTests extends OpenSearchTestCase {
         assertTrue(e.getMessage().contains("candidate_depth"));
     }
 
+    public void testZScoreNormalizationParses() throws Exception {
+        // POC v2 adaptive-fusion #1: z_score (DBSF-style) normalization + arithmetic_mean.
+        String json = "{\"queries\":[{\"match\":{\"title\":\"a\"}},{\"match\":{\"body\":\"b\"}}],"
+            + "\"normalization\":{\"technique\":\"z_score\"},\"combination\":{\"technique\":\"arithmetic_mean\"}}";
+        XContentParser parser = createParser(JsonXContent.jsonXContent, json);
+        parser.nextToken();
+        ResolverQueryBuilder builder = ResolverQueryBuilder.fromXContent(parser);
+        assertEquals(ResolverQueryBuilder.NORMALIZATION_Z_SCORE, builder.normalization());
+        assertEquals(ResolverQueryBuilder.TECHNIQUE_ARITHMETIC_MEAN, builder.technique());
+    }
+
+    public void testZScoreNormalizationRejectedWithRrf() throws Exception {
+        // z_score normalizes by score distribution, so it is incoherent with rank-based RRF (which ignores scores).
+        String json = "{\"queries\":[{\"match\":{\"title\":\"a\"}},{\"match\":{\"body\":\"b\"}}],"
+            + "\"technique\":\"rrf\",\"normalization\":{\"technique\":\"z_score\"}}";
+        XContentParser parser = createParser(JsonXContent.jsonXContent, json);
+        parser.nextToken();
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> ResolverQueryBuilder.fromXContent(parser));
+        assertTrue(e.getMessage().contains("z_score"));
+        assertTrue(e.getMessage().contains(ResolverQueryBuilder.TECHNIQUE_ARITHMETIC_MEAN));
+    }
+
+    public void testZScoreSerializationRoundTrip() throws Exception {
+        ResolverQueryBuilder original = new ResolverQueryBuilder(
+            List.of(new MatchQueryBuilder("title", "a"), new MatchQueryBuilder("body", "b")),
+            ResolverQueryBuilder.TECHNIQUE_ARITHMETIC_MEAN,
+            ResolverQueryBuilder.NORMALIZATION_Z_SCORE,
+            ResolverQueryBuilder.DEFAULT_RANK_CONSTANT,
+            100,
+            new float[0]
+        );
+        ResolverQueryBuilder deserialized = copyWriteable(original, namedWriteableRegistry(), ResolverQueryBuilder::new);
+        assertEquals(original, deserialized);
+        assertEquals(ResolverQueryBuilder.NORMALIZATION_Z_SCORE, deserialized.normalization());
+    }
+
     public void testSerializationRoundTripWithPerShardFields() throws Exception {
         ResolverQueryBuilder original = new ResolverQueryBuilder(
             List.of(new MatchQueryBuilder("title", "a"), new MatchQueryBuilder("body", "b")),

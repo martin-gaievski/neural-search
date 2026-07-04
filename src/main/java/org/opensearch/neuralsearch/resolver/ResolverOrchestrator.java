@@ -443,11 +443,17 @@ public final class ResolverOrchestrator {
     }
 
     /** Fuse the per-leg candidate hits ({@code legHits[legIndex]} = that leg's pool; for per-shard collection this
-     *  is already the union across shards) into a ranked, truncated id/score list. */
+     *  is already the union across shards) into a ranked, truncated id/score list. RRF is rank-based; arithmetic_mean
+     *  is score-based and normalizes each leg first — by min_max (range) or z_score (distribution / DBSF-style). */
     private static RankedDocs computeRankedDocs(SearchHit[][] legHits, ResolverQueryBuilder resolver) {
-        Map<String, Float> combined = ResolverQueryBuilder.TECHNIQUE_ARITHMETIC_MEAN.equals(resolver.technique())
-            ? minMaxArithmeticMean(legHits, resolver)
-            : rrf(legHits, resolver);
+        Map<String, Float> combined;
+        if (ResolverQueryBuilder.TECHNIQUE_ARITHMETIC_MEAN.equals(resolver.technique())) {
+            combined = ResolverQueryBuilder.NORMALIZATION_Z_SCORE.equals(resolver.normalization())
+                ? zScoreArithmeticMean(legHits, resolver)
+                : minMaxArithmeticMean(legHits, resolver);
+        } else {
+            combined = rrf(legHits, resolver);
+        }
         return toRankedDocs(combined, resolver.rankWindowSize());
     }
 
@@ -519,6 +525,71 @@ public final class ResolverOrchestrator {
         }
         float normalized = (score - min) / (max - min);
         return normalized == 0.0f ? 0.001f : normalized; // floor: matched-with-min != not-matched(0)
+    }
+
+    /**
+     * POC v2 adaptive-fusion #1 — DBSF-style per-query z-score normalization + (weighted) arithmetic mean. Per leg,
+     * compute the mean {@code mu} and sample std {@code sigma} of that leg's returned raw scores (this query's
+     * distribution, nothing global/offline), then remap each score to {@code (s - (mu - 3*sigma)) / (6*sigma)} — a
+     * linear rescaling of the z-score onto the +/-3-sigma span, clamped to [0,1]. Per doc, the combined score is the
+     * weighted mean over ALL legs (a non-matched leg contributes 0), identical in shape to {@link #minMaxArithmeticMean}
+     * so weighting/denominator semantics match. This is exactly Qdrant's Distribution-Based Score Fusion, adapted to
+     * the resolver: unsupervised, label-free, computed from the score lists already in memory. Motivation: unlike
+     * min_max (whose range is set by a single outlier), z_score adapts to each query's per-leg score SPREAD, so a leg
+     * whose scores are tightly clustered vs one that is spread out are normalized on their own terms per query.
+     */
+    private static Map<String, Float> zScoreArithmeticMean(SearchHit[][] legHits, ResolverQueryBuilder resolver) {
+        float totalWeight = 0.0f;
+        for (int legIndex = 0; legIndex < legHits.length; legIndex++) {
+            totalWeight += weightForLeg(resolver.weights(), legIndex);
+        }
+        Map<String, Float> weightedSum = new LinkedHashMap<>(); // id -> Σ weight_leg * normalized_leg
+        for (int legIndex = 0; legIndex < legHits.length; legIndex++) {
+            SearchHit[] hits = legHits[legIndex];
+            // Mean and sample standard deviation of this leg's returned scores (the per-query distribution).
+            double sum = 0.0;
+            int n = 0;
+            for (SearchHit hit : hits) {
+                sum += hit.getScore();
+                n++;
+            }
+            double mean = n == 0 ? 0.0 : sum / n;
+            double sumSq = 0.0;
+            for (SearchHit hit : hits) {
+                double d = hit.getScore() - mean;
+                sumSq += d * d;
+            }
+            // Sample std (n-1). With < 2 points there is no spread → the normalizer is degenerate (handled below).
+            double std = n < 2 ? 0.0 : Math.sqrt(sumSq / (n - 1));
+            float weight = weightForLeg(resolver.weights(), legIndex);
+            for (SearchHit hit : hits) {
+                String id = hit.getId();
+                if (id == null) {
+                    continue;
+                }
+                weightedSum.merge(id, weight * normalizeZScore(hit.getScore(), mean, std), Float::sum);
+            }
+        }
+        Map<String, Float> combined = new LinkedHashMap<>();
+        for (Map.Entry<String, Float> e : weightedSum.entrySet()) {
+            combined.put(e.getKey(), totalWeight == 0.0f ? 0.0f : e.getValue() / totalWeight);
+        }
+        return combined;
+    }
+
+    /** Map a raw score onto [0,1] via DBSF's z-score rescaling: {@code (s - (mu - 3*sigma)) / (6*sigma)}, clamped.
+     *  Degenerate leg (sigma == 0: identical or single score) → 0.5, matching Qdrant DBSF. The 0.001 floor mirrors
+     *  {@link #normalizeMinMax}: a matched doc that lands at the low extreme must not read as a non-match (0). */
+    private static float normalizeZScore(float score, double mean, double std) {
+        if (std == 0.0) {
+            return 0.5f; // no spread — every score maps to the distribution center (DBSF convention)
+        }
+        double lower = mean - 3.0 * std;
+        double normalized = (score - lower) / (6.0 * std);
+        if (normalized <= 0.0) {
+            return 0.001f; // floor: matched-at-or-below-lower-extreme != not-matched(0)
+        }
+        return normalized >= 1.0 ? 1.0f : (float) normalized;
     }
 
     private static float weightForLeg(float[] weights, int legIndex) {

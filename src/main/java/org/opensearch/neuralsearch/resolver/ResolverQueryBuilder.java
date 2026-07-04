@@ -42,6 +42,9 @@ import java.util.function.Supplier;
  *   <li><b>RRF</b> — {@code combination.technique = rrf} (rank-based; no normalization).</li>
  *   <li><b>min_max + arithmetic mean</b> — {@code normalization.technique = min_max} +
  *       {@code combination.technique = arithmetic_mean} (score-based; optional per-leg weights).</li>
+ *   <li><b>z_score + arithmetic mean</b> — {@code normalization.technique = z_score} +
+ *       {@code combination.technique = arithmetic_mean} (POC v2 adaptive-fusion #1; DBSF-style per-query
+ *       distribution normalization — each leg normalized by its own returned-score mean/std).</li>
  * </ul>
  *
  * <p>REST shape (Option B — mirrors the hybrid normalization/combination model and ES retrievers):
@@ -68,6 +71,11 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
     // Normalization techniques
     public static final String NORMALIZATION_NONE = "none";
     public static final String NORMALIZATION_MIN_MAX = "min_max";
+    // z_score (DBSF-style, POC v2 adaptive-fusion #1): normalize each leg by its OWN returned-score distribution
+    // (mean mu, sample std sigma) — a per-query, unsupervised, label-free normalizer. Unlike min_max (which is
+    // range-sensitive to a single outlier), z_score adapts to each query's per-leg score spread. Only meaningful
+    // with the score-based arithmetic_mean combination (rank-based RRF ignores scores).
+    public static final String NORMALIZATION_Z_SCORE = "z_score";
     // Candidate-collection strategies (how the legs' results reach the coordinator for fusion)
     public static final String COLLECTION_COORDINATOR = "coordinator"; // each leg = one standalone search reduced to global top-K (default)
     public static final String COLLECTION_PER_SHARD = "per_shard";     // each leg collected per shard, fused over num_shards x depth
@@ -358,15 +366,33 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
                 )
             );
         }
-        if (NORMALIZATION_NONE.equals(normalization) == false && NORMALIZATION_MIN_MAX.equals(normalization) == false) {
+        if (NORMALIZATION_NONE.equals(normalization) == false
+            && NORMALIZATION_MIN_MAX.equals(normalization) == false
+            && NORMALIZATION_Z_SCORE.equals(normalization) == false) {
             throw new IllegalArgumentException(
                 String.format(
                     Locale.ROOT,
-                    "[%s] POC supports normalization techniques [%s, %s], got [%s]",
+                    "[%s] POC supports normalization techniques [%s, %s, %s], got [%s]",
                     NAME,
                     NORMALIZATION_NONE,
                     NORMALIZATION_MIN_MAX,
+                    NORMALIZATION_Z_SCORE,
                     normalization
+                )
+            );
+        }
+        // z_score normalizes by each leg's score distribution, so it is only meaningful with the score-based
+        // arithmetic_mean combination (rank-based RRF ignores scores). Reject the incoherent pairing rather than
+        // silently ignoring it. (Mirrors OpenSearch's "z_score supports only arithmetic_mean".)
+        if (NORMALIZATION_Z_SCORE.equals(normalization) && TECHNIQUE_ARITHMETIC_MEAN.equals(combination) == false) {
+            throw new IllegalArgumentException(
+                String.format(
+                    Locale.ROOT,
+                    "[%s] normalization [%s] is only supported with combination technique [%s], got [%s]",
+                    NAME,
+                    NORMALIZATION_Z_SCORE,
+                    TECHNIQUE_ARITHMETIC_MEAN,
+                    combination
                 )
             );
         }
