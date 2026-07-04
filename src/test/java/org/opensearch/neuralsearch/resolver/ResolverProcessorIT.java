@@ -26,11 +26,12 @@ import static org.opensearch.neuralsearch.util.TestUtils.DEFAULT_USER_AGENT;
 /**
  * End-to-end demonstration of the Resolver framework POC (Phase 1).
  *
- * <p>Runs {@code resolver} queries with NO search pipeline — the {@code ResolverActionFilter}
- * intercepts them on the coordinator, fires the legs as a parallel MultiSearch, fuses them (RRF or
- * min_max + arithmetic_mean), and rewrites the request into a standard scored query. Covers top-level
- * and nested / multi-marker placement, filter push-down, combined rescore, and the RankDocsQuery
- * (Top + conditional Tail) recoveries. Because fusion happens at the coordinator, the document that
+ * <p>Runs {@code resolver} queries with NO search pipeline. The resolver self-erases at the coordinator rewrite
+ * ({@code ResolverQueryBuilder.doRewrite} fires the legs as a parallel MultiSearch via {@code registerAsyncAction},
+ * fuses them — RRF or min_max + arithmetic_mean — and rewrites into a standard scored query); the thin
+ * {@code ResolverActionFilter} handles only the stage-B-free fast path. Covers top-level and nested / multi-marker
+ * placement (bool, dis_max, function_score), fuse-then-filter with an enclosing filter, combined rescore, and the
+ * RankDocsQuery (Top + conditional Tail) recoveries. Because fusion happens at the coordinator, the document that
  * matches BOTH legs ranks first regardless of shard placement.
  */
 public class ResolverProcessorIT extends BaseNeuralSearchIT {
@@ -482,6 +483,42 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     }
 
     /**
+     * CLAIM: the fast path is GATED OFF for per-hit fetch customization it cannot reproduce. With
+     * {@code _source} include filtering, the fabricated fast path (which returns each hit's FULL _source) would
+     * silently ignore the filter; the request must instead take the standard path and honor it — here _source is
+     * filtered to only the "title" field, so the returned _source must contain "title" and NOT "body".
+     */
+    @SneakyThrows
+    public void testFastPath_fallsBackWhenSourceFilteringRequested() {
+        initRankDocsIndexIfNeeded();
+        String body = "{\"size\":10,\"track_total_hits\":false,\"_source\":[\"title\"],\"query\":{" + resolverFragment(100) + "}}";
+        List<Map<String, Object>> hits = readHits(searchNoPipeline(RANKDOCS_INDEX, body));
+        assertFalse(hits.isEmpty());
+        for (Map<String, Object> hit : hits) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> hitSource = (Map<String, Object>) hit.get("_source");
+            assertNotNull("hit must carry _source", hitSource);
+            assertTrue("_source include filter must be honored (title present)", hitSource.containsKey("title"));
+            assertFalse("_source include filter must be honored (body excluded)", hitSource.containsKey("body"));
+        }
+    }
+
+    /**
+     * CLAIM: the fast path is GATED OFF when a {@code suggest} section is present (a fabricated response would drop
+     * it). The request takes the standard path and the suggest section is returned alongside the fused hits.
+     */
+    @SneakyThrows
+    public void testFastPath_fallsBackWhenSuggestRequested() {
+        initRankDocsIndexIfNeeded();
+        String body = "{\"size\":10,\"track_total_hits\":false,\"query\":{"
+            + resolverFragment(100)
+            + "},\"suggest\":{\"s\":{\"text\":\"appel\",\"term\":{\"field\":\"title\"}}}}";
+        Map<String, Object> response = searchNoPipeline(RANKDOCS_INDEX, body);
+        assertNotNull("suggest section must be present -> fast path fell back to the standard path", response.get("suggest"));
+        assertFalse("the fused hits are still returned", readHits(response).isEmpty());
+    }
+
+    /**
      * CLAIM: the fast path also works with PER-SHARD collection on a multi-shard index — the per-shard leg
      * sub-searches hydrate {@code _source}, so the fabricated window carries source (regression guard: per-shard
      * leg builds must honor the fetchSource flag, not just the coordinator legs).
@@ -563,27 +600,41 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     }
 
     /**
-     * CLAIM: an enclosing bool filter is PUSHED DOWN into each leg, so fusion runs over the filtered
-     * candidate set (not a global fuse-then-filter). Decisive setup: rank_window_size=1 and the
-     * globally strongest doc (n_both_y, higher term frequency) is category=y.
+     * CLAIM (fuse-then-filter semantics — the re-home changed this deliberately): after the resolver self-erases via
+     * {@code doRewrite}, a nested marker fuses over the UNFILTERED candidate set and the enclosing bool filter
+     * intersects the fused window at the query phase. This is NOT the old ActionFilter push-down (which pre-filtered
+     * each leg), because a self-erasing rewrite cannot see its enclosing bool's filter clauses.
+     *
+     * <p>Decisive setup: the globally strongest doc (n_both_y, higher term frequency) is category=y.
      * <ul>
-     *   <li>With push-down (implemented): legs are filtered to category=x first, so the size-1 fused
-     *       window is n_both_x -> result is [n_both_x].</li>
-     *   <li>Without push-down (fuse-then-filter): the global size-1 window would be n_both_y, which the
-     *       outer category=x filter then removes -> result would be EMPTY.</li>
+     *   <li><b>window=1</b>: the resolver fuses over ALL docs first -> global size-1 window = n_both_y (category=y).
+     *       The outer category=x filter then removes it -> EMPTY. (Under the OLD push-down this returned [n_both_x].)</li>
+     *   <li><b>wide window</b>: the fused window includes n_both_x and n_title_x; the outer category=x filter keeps
+     *       exactly the category=x docs -> the filter still constrains the final result, just AFTER fusion.</li>
      * </ul>
-     * A non-empty [n_both_x] therefore proves the filter reached the legs.
      */
     @SneakyThrows
-    public void testResolver_nestedInBool_pushesFilterIntoLegs() {
+    public void testResolver_nestedInBool_filterAppliesAfterFusion() {
         initNestedIndexIfNeeded();
-        String body = "{\"size\":10,\"query\":{\"bool\":{"
+        // window=1: global leader n_both_y (category=y) is fused first, then removed by the outer category=x filter.
+        String narrow = "{\"size\":10,\"query\":{\"bool\":{"
             + "\"must\":[{"
             + resolverFragment(1)
             + "}],"
             + "\"filter\":[{\"term\":{\"category\":\"x\"}}]}}}";
-        List<String> ids = ids(searchNoPipeline(NESTED_INDEX, body));
-        assertEquals(List.of("n_both_x"), ids);
+        assertTrue(
+            "fuse-then-filter: the size-1 fused window (n_both_y) is filtered out -> empty",
+            ids(searchNoPipeline(NESTED_INDEX, narrow)).isEmpty()
+        );
+
+        // wide window: fusion includes the category=x docs; the outer filter keeps exactly those (post-fusion).
+        String wide = "{\"size\":10,\"query\":{\"bool\":{"
+            + "\"must\":[{"
+            + resolverFragment(100)
+            + "}],"
+            + "\"filter\":[{\"term\":{\"category\":\"x\"}}]}}}";
+        Set<String> wideIds = new HashSet<>(ids(searchNoPipeline(NESTED_INDEX, wide)));
+        assertEquals("the outer category=x filter keeps exactly the category=x fused docs", Set.of("n_both_x", "n_title_x"), wideIds);
     }
 
     @SneakyThrows
@@ -620,28 +671,32 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     }
 
     /**
-     * CLAIM: a single search query can carry MULTIPLE resolver markers at DIFFERENT nesting levels,
-     * each resolved independently with depth-dependent filter push-down. The hybrid query cannot be
-     * placed in any of these positions.
+     * CLAIM: a single search query can carry MULTIPLE resolver markers at DIFFERENT nesting levels, each self-erasing
+     * independently via {@code doRewrite} (the container bools recurse {@code rewrite()} into every child, so each
+     * marker orchestrates on its own). The hybrid query cannot be placed in any of these positions.
      *
      * <pre>
      * bool {
-     *   filter:  [ in_stock=true ]                         // (1) applies to BOTH resolvers
+     *   filter:  [ in_stock=true ]                         // applies (post-fusion) to the whole result
      *   must:    [ R1 ]                                     // R1 at level 2
      *   should:  [ bool {
-     *                filter: [ category=shoes ]             // (2) applies to R2 only
+     *                filter: [ category=shoes ]             // applies (post-fusion) to the R2 branch
      *                must:   [ R2 ]                         // R2 at level 3
      *              } ]
      * }
-     * R1 legs = title:running, description:lightweight  -> push-down [in_stock=true]
-     * R2 legs = title:trail,   description:grip         -> push-down [in_stock=true, category=shoes]
+     * R1 legs = title:running, description:lightweight   R2 legs = title:trail, description:grip
      * </pre>
      *
-     * Docs: p1 running shoes, p2 trail running shoes (grip sole), p3 running jacket (category=apparel),
+     * <p>Fuse-then-filter (the re-home semantics): each marker fuses over the UNFILTERED candidate set, then the
+     * enclosing bool clauses constrain the fused results at the query phase. R1 fuses to {p1,p2,p3} (p4/p5 match
+     * neither R1 leg); R2 fuses to {p2,p4}; the outer {@code in_stock=true} filter drops p4 post-fusion, and
+     * {@code bool.must:R1} requires an R1 match — so the final set is {p1,p2,p3} and p2 (in both R1 and R2) ranks first.
+     *
+     * <p>Docs: p1 running shoes, p2 trail running shoes (grip sole), p3 running jacket (category=apparel),
      * p4 trail grip boots (OUT OF STOCK), p5 casual sneakers.
      */
     @SneakyThrows
-    public void testResolver_multipleMarkersAtDifferentLevels_withPerLevelPushDown() {
+    public void testResolver_multipleMarkersAtDifferentLevels_fuseThenFilter() {
         initShopIndexIfNeeded();
         String body = "{"
             + "\"size\":10,"
@@ -659,13 +714,13 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
         List<Map<String, Object>> hits = readHits(response);
         List<String> hitIds = hits.stream().map(hit -> (String) hit.get("_id")).toList();
 
-        // R1's fused set (in-stock docs matching running/lightweight) = {p1, p2, p3}.
+        // Final set = {p1, p2, p3}: R1 (bool.must) fuses to these, the outer in_stock=true filter keeps them.
         assertEquals(3, totalHits(response));
         assertEquals(3, hitIds.size());
         assertTrue(hitIds.contains("p1"));
         assertTrue(hitIds.contains("p2"));
         assertTrue(hitIds.contains("p3"));
-        assertFalse(hitIds.contains("p4")); // in_stock=true pushed into BOTH resolvers' legs -> excluded
+        assertFalse(hitIds.contains("p4")); // out of stock -> removed by the outer in_stock=true filter (post-fusion)
         assertFalse(hitIds.contains("p5")); // matches neither R1 leg; bool.must requires an R1 match
 
         // p2 is in BOTH R1's and R2's fused sets, so the must (R1) and should->R2 scores add -> ranks first.
@@ -678,6 +733,57 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
         }
         assertTrue(scoreById.get("p2") > scoreById.get("p1"));
         assertTrue(scoreById.get("p2") > scoreById.get("p3"));
+    }
+
+    /**
+     * CLAIM (new capability the re-home unlocks): a resolver marker nested inside {@code dis_max} and inside
+     * {@code function_score} self-orchestrates. The old ActionFilter tree-walk only descended into {@code bool}, so a
+     * marker in these containers threw at the shard; now the rewrite framework recurses {@code rewrite()} into every
+     * container, so the marker self-erases regardless of the wrapping query type. Both wrappers must return the same
+     * fused union {n_both_y, n_both_x, n_title_x} with the both-legs docs ranked above the title-only doc.
+     */
+    @SneakyThrows
+    public void testResolver_nestedInDisMaxAndFunctionScore_selfOrchestrates() {
+        initNestedIndexIfNeeded();
+
+        // dis_max wrapping a single resolver: the resolver's fused scores flow through unchanged (tie_breaker=0).
+        String disMax = "{\"size\":10,\"query\":{\"dis_max\":{\"queries\":[{" + resolverFragment(100) + "}]}}}";
+        List<String> disMaxIds = ids(searchNoPipeline(NESTED_INDEX, disMax));
+        assertEquals(3, disMaxIds.size());
+        assertEquals("n_both_y", disMaxIds.get(0)); // strongest in both legs -> RRF leader
+        assertEquals(Set.of("n_both_y", "n_both_x", "n_title_x"), new HashSet<>(disMaxIds));
+
+        // function_score wrapping a resolver (default: no functions -> passes the fused score through).
+        String functionScore = "{\"size\":10,\"query\":{\"function_score\":{\"query\":{" + resolverFragment(100) + "}}}}";
+        List<String> fsIds = ids(searchNoPipeline(NESTED_INDEX, functionScore));
+        assertEquals(3, fsIds.size());
+        assertEquals("n_both_y", fsIds.get(0));
+        assertEquals(Set.of("n_both_y", "n_both_x", "n_title_x"), new HashSet<>(fsIds));
+    }
+
+    /**
+     * CLAIM: multiple INDEPENDENT resolver markers in sibling bool clauses all self-erase in the same search without
+     * tripping the rewrite framework's {@code MAX_REWRITE_ROUNDS} cap (16). Each marker registers its async action in
+     * the same round and they drain together, so N markers converge in ~2 rounds, not 2N — a search with several
+     * markers must simply succeed and fuse each. Uses 4 markers over the two-leg apple/banana index; the union
+     * {n_both_y, n_both_x, n_title_x} is returned (a rewrite-cap failure would instead error the search).
+     */
+    @SneakyThrows
+    public void testResolver_manyIndependentMarkers_withinRewriteRoundCap() {
+        initNestedIndexIfNeeded();
+        StringBuilder shoulds = new StringBuilder();
+        int markerCount = 4;
+        for (int i = 0; i < markerCount; i++) {
+            if (i > 0) {
+                shoulds.append(",");
+            }
+            shoulds.append("{").append(resolverFragment(100)).append("}");
+        }
+        String body = "{\"size\":10,\"query\":{\"bool\":{\"should\":[" + shoulds + "],\"minimum_should_match\":1}}}";
+        List<String> ids = ids(searchNoPipeline(NESTED_INDEX, body));
+        // All markers fused successfully (no rewrite-cap error); the union of the identical legs is the 3-doc set.
+        assertEquals(Set.of("n_both_y", "n_both_x", "n_title_x"), new HashSet<>(ids));
+        assertEquals("n_both_y", ids.get(0));
     }
 
     @SneakyThrows

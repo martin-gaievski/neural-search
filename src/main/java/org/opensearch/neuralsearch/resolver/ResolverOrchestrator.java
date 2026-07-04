@@ -10,7 +10,6 @@ import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
@@ -23,7 +22,6 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -31,30 +29,27 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Shared coordinator-level orchestration for the resolver, independent of the interception point
- * (search pipeline processor or ActionFilter).
+ * Shared coordinator-level orchestration for the resolver: build the leg {@code MultiSearch}, fuse (RRF or
+ * min_max+arithmetic_mean), and produce the standard query the resolver self-erases into. Interception-agnostic —
+ * all methods are static and take the {@link SearchRequest}/{@link MultiSearchResponse} explicitly.
  *
- * <p>Two placement modes:
+ * <p>Two entry points, both driven from {@link ResolverQueryBuilder#doRewrite} (the {@code registerAsyncAction}
+ * self-erase) except the fast path, which the thin {@link ResolverActionFilter} drives:
  * <ul>
- *   <li><b>Top-level</b> ({@link #buildLegMultiSearch}/{@link #applyFusedResults}): the resolver IS
- *       the whole query. Rewrites {@code source.query()} into a {@link RankDocsQueryBuilder} with a
- *       <em>conditional Tail</em> (aggregations / total-hits / explain / highlight).</li>
- *   <li><b>Nested</b> ({@link #collectMarkers}/{@link #buildMarkerMultiSearch}/{@link #resolveMarkers}
- *       /{@link #replaceMarkers}): one or more resolver markers appear inside a {@code bool} tree.
- *       Each marker is resolved to a Top-only {@link RankDocsQueryBuilder} and spliced back in place;
- *       enclosing {@code bool} filter clauses are <b>pushed down</b> into each leg so fusion runs over
- *       the filtered candidate set. This is possible because the resolver self-erases into a standard
- *       query — something the hybrid query (which emits non-standard CompoundTopDocs) cannot do.</li>
+ *   <li><b>Self-erase</b> ({@link #buildLegMultiSearch} + {@link #buildFusedQuery}): fuse and return a
+ *       {@link RankDocsQueryBuilder} (Top + conditional Tail) or {@code match_none}. Used for the standard, nested,
+ *       and per-shard paths. A nested marker self-erases to a Top-only query and any enclosing filter intersects the
+ *       fused window at the query phase (fuse-then-filter) — the resolver no longer pushes filters into the legs.</li>
+ *   <li><b>Fast path</b> ({@link #fastPathEligible} + {@link #fabricateFastPathResponse}): for plain top-K, fire the
+ *       legs with {@code _source} and fabricate the response from the fused window, skipping the stage-B search.</li>
  * </ul>
- *
- * <p>Nested traversal is scoped to {@code bool} containers in this prototype.
  */
 public final class ResolverOrchestrator {
 
     private ResolverOrchestrator() {}
 
     // ---------------------------------------------------------------------------------------------
-    // Top-level path (single resolver as the whole query)
+    // Leg collection + fusion (drives the self-erase and the fast path)
     // ---------------------------------------------------------------------------------------------
 
     /** Maximum leg-search fan-out (legs x shards) before per-shard collection falls back to the coordinator path,
@@ -70,8 +65,9 @@ public final class ResolverOrchestrator {
      * true, each leg is fired once PER SHARD ({@code preference=_shards:i|<copyPin>}) so fusion sees the same
      * {@code num_shards x depth} candidate pool as the hybrid query.
      *
-     * <p>The plan is computed ONCE (in the interception point, via {@link #planCollection}) and threaded into
-     * both {@link #buildLegMultiSearch} and {@link #applyFusedResults} — it MUST NOT be recomputed between them,
+     * <p>The plan is computed ONCE (in {@link ResolverQueryBuilder#doRewrite}, or the fast-path filter, via
+     * {@link #planCollection}) and threaded into both {@link #buildLegMultiSearch} and the reduce
+     * ({@link #buildFusedQuery} / {@link #fabricateFastPathResponse}) — it MUST NOT be recomputed between them,
      * because it reads live cluster state and the item layout produced during the build must match the layout the
      * reduce reads back (a concurrent index/alias change between two independent reads would otherwise mis-index
      * the MultiSearch responses).
@@ -157,7 +153,7 @@ public final class ResolverOrchestrator {
         } else {
             int trackTotalHitsUpTo = trackTotalHitsCap(request.source());
             for (QueryBuilder leg : resolver.queries()) {
-                multiSearchRequest.add(legSearch(request, leg, List.of(), resolver.rankWindowSize(), trackTotalHitsUpTo, fetchSource));
+                multiSearchRequest.add(legSearch(request, leg, resolver.rankWindowSize(), trackTotalHitsUpTo, fetchSource));
             }
         }
         return multiSearchRequest;
@@ -172,37 +168,47 @@ public final class ResolverOrchestrator {
         return trackTotalHitsUpTo == null ? DEFAULT_TRACK_TOTAL_HITS : trackTotalHitsUpTo;
     }
 
-    /** Compute coordinator RRF / min_max+AM and rewrite {@code source.query()} into a {@link RankDocsQueryBuilder}.
-     *  Returns a {@link TotalHits} to patch onto the response when accurate total-hits are derivable from the legs'
-     *  own totals (Tail avoided); null when Top-only (no accurate totals needed) or when the Tail is kept (it carries
-     *  totals / aggregations / explain / highlight). */
-    public static TotalHits applyFusedResults(
+    /**
+     * Fuse the leg results into the standard query this resolver self-erases into — a {@link RankDocsQueryBuilder}
+     * (Top + conditional Tail), or a {@link MatchNoneQueryBuilder} when nothing fused. Pure: returns the query and
+     * mutates nothing (the caller — {@code ResolverQueryBuilder.doRewrite} — returns it to the rewrite framework).
+     *
+     * <p>The Tail (non-scoring {@code bool{should: legs}} that surfaces the full match set) is included only when the
+     * request needs it and this marker is the whole query:
+     * <ul>
+     *   <li><b>Nested</b> ({@code topLevel == false}): always <b>Top-only</b>. An enclosing {@code bool} filter
+     *       intersects the fused window at the query phase (fuse-then-filter) — the resolver no longer pushes filters
+     *       into the legs, so a nested marker's fused set is the unfiltered union and the outer clause narrows it.</li>
+     *   <li><b>Top-level</b>: keep the Tail when aggregations / explain / profile / highlight need the full match set,
+     *       or when an accurate total-hits count beyond the fused window is wanted (the Tail supplies that count in the
+     *       single query phase — a rewrite cannot patch the response, so the legs'-own-totals shortcut the ActionFilter
+     *       used is intentionally not reproduced here). Otherwise ({@code track_total_hits:false}) Top-only.</li>
+     * </ul>
+     */
+    public static QueryBuilder buildFusedQuery(
         SearchSourceBuilder source,
         MultiSearchResponse multiSearchResponse,
         ResolverQueryBuilder resolver,
-        CollectionPlan plan
+        CollectionPlan plan,
+        boolean topLevel
     ) {
         MultiSearchResponse.Item[] items = multiSearchResponse.getResponses();
         SearchHit[][] legHits = groupLegHits(items, resolver.queries().size(), plan);
         RankedDocs ranked = computeRankedDocs(legHits, resolver);
         if (ranked.ids.length == 0) {
-            source.query(new MatchNoneQueryBuilder());
-            return null;
+            return new MatchNoneQueryBuilder();
         }
         boolean topOnly;
-        TotalHits patchTotal = null;
-        if (needsExecutionTail(source)) {
+        if (topLevel == false) {
+            topOnly = true; // nested: enclosing filter intersects at the query phase
+        } else if (needsExecutionTail(source)) {
             topOnly = false; // aggregations / explain / profile / highlight need the full match set IN the query
         } else if (wantsTotalsBeyondWindow(source, ranked.ids.length)) {
-            // Per-shard slices each report only their own shard's total, so the leg-union derivation is invalid;
-            // fall back to the Tail for an accurate index-wide count. Otherwise derive the union from the legs.
-            patchTotal = plan.perShard() ? null : legUnionTotalHits(items);
-            topOnly = patchTotal != null; // else fall back to the Tail for an exact count
+            topOnly = false; // keep the Tail for an accurate index-wide count (no response patch available in a rewrite)
         } else {
             topOnly = true; // track_total_hits:false -> plain top-K, no Tail
         }
-        source.query(new RankDocsQueryBuilder(ranked.ids, ranked.scores, topOnly ? List.of() : resolver.queries()));
-        return patchTotal;
+        return new RankDocsQueryBuilder(ranked.ids, ranked.scores, topOnly ? List.of() : resolver.queries());
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -216,9 +222,15 @@ public final class ResolverOrchestrator {
      * We require the whole page to fit inside the fused window ({@code from + size <= rank_window_size}), and NONE of
      * the features whose semantics a fabricated response cannot faithfully reproduce without a real query phase:
      * aggregations / explain / profile / highlight (need the full match set IN the query — {@link #needsExecutionTail}),
-     * plus user {@code sort} / {@code collapse} / {@code rescore} / {@code post_filter} / {@code search_after} /
-     * {@code min_score} (need real collection over the executed query). Anything else falls back to the self-erasing
-     * {@link RankDocsQueryBuilder} path, which handles all of these.
+     * user {@code sort} / {@code collapse} / {@code rescore} / {@code post_filter} / {@code search_after} /
+     * {@code min_score} (need real collection over the executed query), {@code suggest} (a separate execution section
+     * the fabricated response would drop), and per-hit fetch customization — {@code _source} include/exclude filtering,
+     * {@code script_fields} / {@code docvalue_fields} / {@code fields} / {@code stored_fields}, {@code version} and
+     * {@code seq_no_primary_term} — which the fast path's fixed full-{@code _source} leg fetch cannot reproduce.
+     * Anything else falls back to the self-erasing {@link RankDocsQueryBuilder} path, which handles all of these.
+     *
+     * <p>Note: {@code scroll} is a property of the {@link SearchRequest}, not the {@link SearchSourceBuilder}, so it is
+     * gated separately at the interception point (the fast path cannot produce a scroll cursor).
      */
     public static boolean fastPathEligible(SearchSourceBuilder source, ResolverQueryBuilder resolver) {
         if (source == null) {
@@ -236,6 +248,21 @@ public final class ResolverOrchestrator {
         // (the legs retrieve only rankWindowSize hits, so a leg with more matches than the window would undercount);
         // that case needs the Tail / leg-union path. Only serve the fast path when totals need not exceed the window.
         if (wantsTotalsBeyondWindow(source, size)) {
+            return false;
+        }
+        // Suggest is a separate execution section a fabricated response cannot carry — defer to the real query phase.
+        if (source.suggest() != null) {
+            return false;
+        }
+        // Per-hit fetch customization: the fast path returns each hit's FULL _source (the legs are fired with
+        // fetchSource=true) and no derived per-hit fields, so any of these would be silently ignored — defer.
+        if (source.fetchSource() != null
+            || (source.scriptFields() != null && source.scriptFields().isEmpty() == false)
+            || (source.docValueFields() != null && source.docValueFields().isEmpty() == false)
+            || (source.fetchFields() != null && source.fetchFields().isEmpty() == false)
+            || source.storedFields() != null
+            || Boolean.TRUE.equals(source.version())
+            || Boolean.TRUE.equals(source.seqNoAndPrimaryTerm())) {
             return false;
         }
         boolean hasSort = source.sorts() != null && source.sorts().isEmpty() == false;
@@ -375,153 +402,15 @@ public final class ResolverOrchestrator {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Nested path (resolver markers inside a bool tree)
-    // ---------------------------------------------------------------------------------------------
-
-    /** One resolver marker found in the query tree, with the enclosing-bool filters to push down. */
-    public record MarkerContext(ResolverQueryBuilder marker, List<QueryBuilder> pushDownFilters) {
-    }
-
-    /** Recursively collect resolver markers inside {@code bool} containers, accumulating enclosing
-     *  {@code filter} clauses (non-resolver) as push-down filters. */
-    public static List<MarkerContext> collectMarkers(QueryBuilder root) {
-        List<MarkerContext> markers = new ArrayList<>();
-        collect(root, List.of(), markers);
-        return markers;
-    }
-
-    private static void collect(QueryBuilder qb, List<QueryBuilder> pushDown, List<MarkerContext> out) {
-        if (qb instanceof ResolverQueryBuilder resolver) {
-            out.add(new MarkerContext(resolver, pushDown));
-            return;
-        }
-        if (qb instanceof BoolQueryBuilder bool) {
-            List<QueryBuilder> childPushDown = new ArrayList<>(pushDown);
-            for (QueryBuilder f : bool.filter()) {
-                if ((f instanceof ResolverQueryBuilder) == false) {
-                    childPushDown.add(f);
-                }
-            }
-            for (QueryBuilder c : bool.must()) {
-                collect(c, childPushDown, out);
-            }
-            for (QueryBuilder c : bool.should()) {
-                collect(c, childPushDown, out);
-            }
-            for (QueryBuilder c : bool.filter()) {
-                collect(c, childPushDown, out);
-            }
-            // must_not intentionally not traversed (a resolver as a negative clause is nonsensical).
-        }
-        // Leaves and non-bool containers are not traversed in this prototype.
-    }
-
-    /** Flatten every marker's legs (with push-down filters applied) into a single MultiSearch. */
-    public static MultiSearchRequest buildMarkerMultiSearch(SearchRequest request, List<MarkerContext> markers) {
-        MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
-        for (MarkerContext mc : markers) {
-            for (QueryBuilder leg : mc.marker().queries()) {
-                multiSearchRequest.add(legSearch(request, leg, mc.pushDownFilters(), mc.marker().rankWindowSize(), 0));
-            }
-        }
-        return multiSearchRequest;
-    }
-
-    /** Resolve each marker to a Top-only {@link RankDocsQueryBuilder} (identity-keyed for replacement). */
-    public static IdentityHashMap<ResolverQueryBuilder, QueryBuilder> resolveMarkers(
-        List<MarkerContext> markers,
-        MultiSearchResponse multiSearchResponse
-    ) {
-        MultiSearchResponse.Item[] items = multiSearchResponse.getResponses();
-        IdentityHashMap<ResolverQueryBuilder, QueryBuilder> resolved = new IdentityHashMap<>();
-        int offset = 0;
-        for (MarkerContext mc : markers) {
-            int legCount = mc.marker().queries().size();
-            // Nested markers always collect one item per leg (per-shard collection is top-level-only), so the
-            // slice maps 1:1 to legs regardless of the marker's collection knob.
-            SearchHit[][] legHits = new SearchHit[legCount][];
-            for (int leg = 0; leg < legCount; leg++) {
-                legHits[leg] = hitsOrThrow(items[offset + leg], offset + leg);
-            }
-            offset += legCount;
-            RankedDocs ranked = computeRankedDocs(legHits, mc.marker());
-            resolved.put(
-                mc.marker(),
-                ranked.ids.length == 0 ? new MatchNoneQueryBuilder() : new RankDocsQueryBuilder(ranked.ids, ranked.scores, List.of()) // Top-only
-                                                                                                                                      // for
-                                                                                                                                      // nested
-                                                                                                                                      // markers
-            );
-        }
-        return resolved;
-    }
-
-    /** Rebuild the query tree, swapping each resolver marker for its resolved standard query. */
-    public static QueryBuilder replaceMarkers(QueryBuilder qb, IdentityHashMap<ResolverQueryBuilder, QueryBuilder> resolved) {
-        if (qb instanceof ResolverQueryBuilder resolver) {
-            QueryBuilder replacement = resolved.get(resolver);
-            return replacement != null ? replacement : qb;
-        }
-        if (qb instanceof BoolQueryBuilder bool) {
-            BoolQueryBuilder rebuilt = new BoolQueryBuilder();
-            for (QueryBuilder c : bool.must()) {
-                rebuilt.must(replaceMarkers(c, resolved));
-            }
-            for (QueryBuilder c : bool.should()) {
-                rebuilt.should(replaceMarkers(c, resolved));
-            }
-            for (QueryBuilder c : bool.filter()) {
-                rebuilt.filter(replaceMarkers(c, resolved));
-            }
-            for (QueryBuilder c : bool.mustNot()) {
-                rebuilt.mustNot(replaceMarkers(c, resolved));
-            }
-            if (bool.minimumShouldMatch() != null) {
-                rebuilt.minimumShouldMatch(bool.minimumShouldMatch());
-            }
-            rebuilt.adjustPureNegative(bool.adjustPureNegative());
-            rebuilt.boost(bool.boost());
-            if (bool.queryName() != null) {
-                rebuilt.queryName(bool.queryName());
-            }
-            return rebuilt;
-        }
-        return qb;
-    }
-
-    // ---------------------------------------------------------------------------------------------
     // Shared helpers
     // ---------------------------------------------------------------------------------------------
 
-    private static SearchRequest legSearch(
-        SearchRequest request,
-        QueryBuilder leg,
-        List<QueryBuilder> pushDownFilters,
-        int size,
-        int trackTotalHitsUpTo
-    ) {
-        return legSearch(request, leg, pushDownFilters, size, trackTotalHitsUpTo, false);
-    }
-
-    /** A single leg search: the leg query, optionally constrained by pushed-down filters. Id-only unless
-     *  {@code fetchSource} (fast path), which hydrates {@code _source} so the fused window can be returned directly. */
-    private static SearchRequest legSearch(
-        SearchRequest request,
-        QueryBuilder leg,
-        List<QueryBuilder> pushDownFilters,
-        int size,
-        int trackTotalHitsUpTo,
-        boolean fetchSource
-    ) {
-        QueryBuilder legQuery = leg;
-        if (pushDownFilters.isEmpty() == false) {
-            BoolQueryBuilder constrained = new BoolQueryBuilder().must(leg);
-            for (QueryBuilder f : pushDownFilters) {
-                constrained.filter(f);
-            }
-            legQuery = constrained;
-        }
-        SearchSourceBuilder legSource = new SearchSourceBuilder().query(legQuery).size(size).from(0).fetchSource(fetchSource);
+    /** A single leg search (coordinator collection): the leg query reduced to the global top-{@code size}. Id-only
+     *  unless {@code fetchSource} (fast path), which hydrates {@code _source} so the fused window can be returned
+     *  directly. Filters are no longer pushed down here — a nested resolver self-erases to a Top-only query and any
+     *  enclosing filter intersects the fused window at the query phase (fuse-then-filter). */
+    private static SearchRequest legSearch(SearchRequest request, QueryBuilder leg, int size, int trackTotalHitsUpTo, boolean fetchSource) {
+        SearchSourceBuilder legSource = new SearchSourceBuilder().query(leg).size(size).from(0).fetchSource(fetchSource);
         if (trackTotalHitsUpTo > 0) {
             // count matches (up to the cap) so the union total can be derived from the legs without a Tail re-run
             legSource.trackTotalHitsUpTo(trackTotalHitsUpTo);
@@ -529,10 +418,6 @@ public final class ResolverOrchestrator {
             legSource.trackTotalHits(false);
         }
         return new SearchRequest(request.indices()).indicesOptions(request.indicesOptions()).source(legSource);
-    }
-
-    private static SearchRequest perShardLegSearch(SearchRequest request, QueryBuilder leg, int depth, int shard, String copyPin) {
-        return perShardLegSearch(request, leg, depth, shard, copyPin, false);
     }
 
     /** A single leg's LOCAL top-{@code depth} on ONE shard: routed to shard {@code shard} via

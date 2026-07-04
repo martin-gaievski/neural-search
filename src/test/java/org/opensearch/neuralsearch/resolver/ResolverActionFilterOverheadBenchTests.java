@@ -13,33 +13,31 @@ import org.opensearch.test.OpenSearchTestCase;
 
 /**
  * Microbenchmark for the per-query CPU overhead the {@link ResolverActionFilter} adds to searches that are
- * NOT resolver queries — i.e. the synchronous work every ordinary search pays on the coordinator: the action/type
- * gate ({@code SearchAction.NAME.equals} + instanceof) plus {@link ResolverOrchestrator#collectMarkers} (the
- * recursive bool-tree walk that finds no markers and returns).
+ * NOT resolver queries. After the re-home onto {@link ResolverQueryBuilder#doRewrite}, the filter is a thin fast-path
+ * hook: its only synchronous work for a non-resolver query is the action/type gate ({@code SearchAction.NAME.equals}
+ * + {@code source.query() instanceof ResolverQueryBuilder}). There is NO tree-walk anymore — the recursive
+ * marker collection that used to run on every top-level {@code bool} is gone (nesting is now handled structurally by
+ * the rewrite framework recursing into container queries). So the overhead is constant, allocation-free, and
+ * independent of query shape/depth.
  *
- * <p>Not a JUnit assertion test in spirit — it prints ns/op so we can quote the actual per-query delay. Runs a
- * warmup then a timed loop over three representative query shapes: a leaf match, a small 3-clause bool, and a deep
- * nested bool (~50 leaf clauses). Reported figure is the coordinator-side, once-per-request cost (not per shard/doc).
+ * <p>Not a JUnit assertion test in spirit — it prints ns/op so we can quote the actual per-query delay. Runs a warmup
+ * then a timed loop over three representative query shapes: a leaf match, a small 3-clause bool, and a deep nested
+ * bool (~50 leaf clauses). The three should be indistinguishable now (no shape sensitivity), which is the point.
  */
 public class ResolverActionFilterOverheadBenchTests extends OpenSearchTestCase {
 
     private static final int WARMUP = 200_000;
     private static final int ITERS = 2_000_000;
 
-    /** The exact synchronous work apply() does for a non-resolver query, up to the chain.proceed decision.
-     *  Mirrors the optimized ResolverActionFilter.apply(): action check + not-a-resolver + (only for a top-level
-     *  bool) the collectMarkers walk. Leaf / non-bool queries skip collectMarkers entirely (no allocation). */
+    /** The exact synchronous work the thin apply() does for a non-resolver query, up to the chain.proceed decision:
+     *  the action check + a single instanceof. No tree-walk, no allocation — regardless of query shape/depth. */
     private static boolean filterGate(String action, QueryBuilder query) {
         if (SearchAction.NAME.equals(action) == false) {
             return false;
         }
-        if (query instanceof ResolverQueryBuilder) {
-            return true;
-        }
-        if (query instanceof org.opensearch.index.query.BoolQueryBuilder) {
-            return ResolverOrchestrator.collectMarkers(query).isEmpty() == false;
-        }
-        return false;
+        // Mirrors ResolverActionFilter: only a top-level ResolverQueryBuilder enters the fast-path branch; everything
+        // else (including any bool tree) falls straight through with no further inspection.
+        return query instanceof ResolverQueryBuilder;
     }
 
     private double benchNsPerOp(String label, QueryBuilder q) {
@@ -64,7 +62,8 @@ public class ResolverActionFilterOverheadBenchTests extends OpenSearchTestCase {
             .filter(new TermQueryBuilder("category", "c"));
     }
 
-    /** ~50-leaf nested bool: 5 top clauses, each a bool of 10 leaves — exercises the recursive walk + per-node alloc. */
+    /** ~50-leaf nested bool: 5 top clauses, each a bool of 10 leaves. With the tree-walk removed, the filter no longer
+     *  descends this — so it must cost the same as a leaf query (shape-independence is the property under test). */
     private static QueryBuilder deepBool() {
         BoolQueryBuilder root = new BoolQueryBuilder();
         for (int i = 0; i < 5; i++) {
@@ -78,13 +77,12 @@ public class ResolverActionFilterOverheadBenchTests extends OpenSearchTestCase {
     }
 
     public void testActionFilterNonResolverOverhead() {
-        // leaf query: not a bool, so collect() returns in O(1) after one instanceof
         double leaf = benchNsPerOp("leaf-match", new MatchQueryBuilder("title", "hello world"));
         double small = benchNsPerOp("small-bool-3clause", smallBool());
         double deep = benchNsPerOp("deep-bool-~50leaf", deepBool());
-        // sanity: all should be well under a microsecond-scale ceiling for the leaf case; we just assert they ran
-        // and are finite (the real output is the logged ns/op numbers).
-        assertTrue("leaf overhead should be tiny (<2000 ns/op even on a slow box)", leaf < 2000.0);
+        // The gate is a single instanceof now, so all three are tiny AND shape-independent (no tree-walk).
+        assertTrue("non-resolver gate overhead should be tiny (<2000 ns/op even on a slow box)", leaf < 2000.0);
+        assertTrue("deep bool must not cost more than a leaf now that the tree-walk is gone (<2000 ns/op)", deep < 2000.0);
         assertTrue(small > 0 && deep > 0);
     }
 }

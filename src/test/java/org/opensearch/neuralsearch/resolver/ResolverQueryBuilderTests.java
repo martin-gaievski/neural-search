@@ -4,16 +4,26 @@
  */
 package org.opensearch.neuralsearch.resolver;
 
+import org.opensearch.action.IndicesRequest;
+import org.opensearch.action.search.SearchRequest;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.query.MatchQueryBuilder;
+import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.QueryCoordinatorContext;
+import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.search.SearchModule;
+import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 public class ResolverQueryBuilderTests extends OpenSearchTestCase {
 
@@ -50,6 +60,59 @@ public class ResolverQueryBuilderTests extends OpenSearchTestCase {
         IllegalStateException e = expectThrows(IllegalStateException.class, () -> builder.doToQuery(null));
         assertTrue(e.getMessage().contains("resolver"));
         assertTrue(e.getMessage().contains(ResolverQueryBuilder.NAME));
+    }
+
+    /** On a shard / base rewrite context (no coordinator context) doRewrite is a no-op: it returns `this` and
+     *  registers no async action, so the marker stays intact for the coordinator round (or trips doToQuery). */
+    public void testDoRewriteReturnsThisOnShardOrBaseContext() throws Exception {
+        ResolverQueryBuilder builder = sampleBuilder();
+        QueryRewriteContext ctx = mock(QueryRewriteContext.class);
+        when(ctx.convertToCoordinatorContext()).thenReturn(null);
+        assertSame(builder, builder.doRewrite(ctx));
+        org.mockito.Mockito.verify(ctx, org.mockito.Mockito.never()).registerAsyncAction(org.mockito.Mockito.any());
+    }
+
+    /** At the coordinator rewrite, if the request is not a SearchRequest (e.g. _explain/_validate pass other
+     *  IndicesRequest types), the guarded cast fails and doRewrite returns `this` without registering an async action. */
+    public void testDoRewriteReturnsThisWhenRequestNotSearchRequest() throws Exception {
+        ResolverQueryBuilder builder = sampleBuilder();
+        QueryRewriteContext ctx = mock(QueryRewriteContext.class);
+        QueryCoordinatorContext coordinatorContext = mock(QueryCoordinatorContext.class);
+        when(ctx.convertToCoordinatorContext()).thenReturn(coordinatorContext);
+        when(coordinatorContext.getSearchRequest()).thenReturn(mock(IndicesRequest.class)); // not a SearchRequest
+        assertSame(builder, builder.doRewrite(ctx));
+        org.mockito.Mockito.verify(ctx, org.mockito.Mockito.never()).registerAsyncAction(org.mockito.Mockito.any());
+    }
+
+    /** At the coordinator rewrite over a real SearchRequest, doRewrite registers EXACTLY ONE async action (the leg
+     *  MultiSearch) and returns a DISTINCT builder (a new object drives the next rewrite round after the async drains).
+     *  While that builder's fused result is still pending, a further doRewrite on it makes no progress (returns `this`),
+     *  so the whole-tree rewrite stays inside MAX_REWRITE_ROUNDS. */
+    public void testDoRewriteRegistersExactlyOneAsyncActionAndSelfErasesWhenPending() throws Exception {
+        ResolverQueryBuilder builder = sampleBuilder();
+        QueryRewriteContext ctx = mock(QueryRewriteContext.class);
+        QueryCoordinatorContext coordinatorContext = mock(QueryCoordinatorContext.class);
+        when(ctx.convertToCoordinatorContext()).thenReturn(coordinatorContext);
+        SearchRequest searchRequest = new SearchRequest("idx").source(new SearchSourceBuilder().query(builder));
+        when(coordinatorContext.getSearchRequest()).thenReturn(searchRequest);
+
+        AtomicInteger registered = new AtomicInteger();
+        org.mockito.Mockito.doAnswer(inv -> {
+            registered.incrementAndGet();
+            return null;
+        }).when(ctx).registerAsyncAction(org.mockito.Mockito.any());
+
+        QueryBuilder rewritten = builder.doRewrite(ctx);
+        assertEquals("exactly one async action (the leg MultiSearch) is registered", 1, registered.get());
+        assertNotSame("must return a distinct builder to drive another rewrite round", builder, rewritten);
+        assertTrue(rewritten instanceof ResolverQueryBuilder);
+
+        // Supplier still pending (the mocked async action never populated it) -> the next round makes no progress.
+        ResolverQueryBuilder pending = (ResolverQueryBuilder) rewritten;
+        QueryRewriteContext ctx2 = mock(QueryRewriteContext.class);
+        assertSame(pending, pending.doRewrite(ctx2));
+        // A still-pending supplier must not touch the coordinator context (no re-fire) — it returns before the gate.
+        org.mockito.Mockito.verify(ctx2, org.mockito.Mockito.never()).convertToCoordinatorContext();
     }
 
     public void testEqualsAndHashCode() {

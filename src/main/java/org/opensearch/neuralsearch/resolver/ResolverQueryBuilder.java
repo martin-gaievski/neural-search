@@ -5,6 +5,9 @@
 package org.opensearch.neuralsearch.resolver;
 
 import org.apache.lucene.search.Query;
+import org.opensearch.action.search.SearchRequest;
+import org.opensearch.common.SetOnce;
+import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.ParsingException;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -12,6 +15,8 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.query.AbstractQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.QueryCoordinatorContext;
+import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.query.QueryShardContext;
 
 import java.io.IOException;
@@ -21,6 +26,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Supplier;
 
 /**
  * POC marker query for the Resolver framework (Phase 1).
@@ -93,6 +99,15 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
     private final String collection;       // candidate collection: coordinator | per_shard
     private final int candidateDepth;      // per-shard local top-K depth; CANDIDATE_DEPTH_UNSET => rankWindowSize
 
+    /**
+     * Transient result of the coordinator-rewrite async orchestration: the standard query this marker self-erases into
+     * once the leg {@code MultiSearch} completes (a {@link RankDocsQueryBuilder}, or a {@code match_none} when the fused
+     * set is empty). Populated by the async action registered in {@link #doRewrite}; read on the next rewrite round to
+     * finish the self-erase. NEVER serialized (the wire form is always the parsed marker) and intentionally excluded
+     * from {@link #doEquals}/{@link #doHashCode} identity — it is orchestration state, not part of the query's identity.
+     */
+    private final Supplier<QueryBuilder> fusedSupplier;
+
     /** Legacy 4-arg constructor (RRF, no normalization, unweighted, coordinator collection). */
     public ResolverQueryBuilder(List<QueryBuilder> queries, String technique, int rankConstant, int rankWindowSize) {
         this(queries, technique, NORMALIZATION_NONE, rankConstant, rankWindowSize, new float[0]);
@@ -120,6 +135,21 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         String collection,
         int candidateDepth
     ) {
+        this(queries, technique, normalization, rankConstant, rankWindowSize, weights, collection, candidateDepth, null);
+    }
+
+    /** Full constructor incl. the transient {@link #fusedSupplier} (set only by {@link #doRewrite}'s async self-erase). */
+    private ResolverQueryBuilder(
+        List<QueryBuilder> queries,
+        String technique,
+        String normalization,
+        int rankConstant,
+        int rankWindowSize,
+        float[] weights,
+        String collection,
+        int candidateDepth,
+        Supplier<QueryBuilder> fusedSupplier
+    ) {
         this.queries = queries == null ? new ArrayList<>() : queries;
         this.technique = technique;
         this.normalization = normalization == null ? NORMALIZATION_NONE : normalization;
@@ -128,6 +158,7 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         this.weights = weights == null ? new float[0] : weights;
         this.collection = collection == null ? COLLECTION_COORDINATOR : collection;
         this.candidateDepth = candidateDepth;
+        this.fusedSupplier = fusedSupplier;
     }
 
     public ResolverQueryBuilder(StreamInput in) throws IOException {
@@ -140,6 +171,7 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         this.weights = in.readFloatArray();
         this.collection = in.readString();
         this.candidateDepth = in.readInt();
+        this.fusedSupplier = null; // never serialized — the wire form is always the parsed marker
     }
 
     @Override
@@ -435,15 +467,95 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         builder.endObject();
     }
 
+    /**
+     * Coordinator-level self-erasing orchestration (mirrors {@code NeuralQueryBuilder}/{@code NeuralSparseQueryBuilder}'s
+     * async-inference rewrite). Runs ONLY at the coordinator rewrite (where {@link QueryRewriteContext#convertToCoordinatorContext()}
+     * is non-null); on the shards it is a no-op so {@link #doToQuery} stays the safety net for a marker that slips through.
+     *
+     * <p>Two-pass lifecycle, driven by {@code Rewriteable.rewriteAndFetch}:
+     * <ol>
+     *   <li><b>Round 1</b> (supplier absent): fire the legs as a parallel {@code MultiSearch} via
+     *       {@link QueryRewriteContext#registerAsyncAction} and return a NEW marker carrying a {@link SetOnce}-backed
+     *       supplier. Returning a distinct object drives another rewrite round after the async action drains.</li>
+     *   <li><b>Round 2</b> (supplier present and populated): return the fused standard query
+     *       ({@link RankDocsQueryBuilder} Top-only, or {@code match_none}); the marker is now gone from the tree.</li>
+     * </ol>
+     *
+     * <p>Because the container query builders ({@code bool}/{@code dis_max}/{@code function_score}/{@code constant_score})
+     * recurse {@code rewrite()} into their children, a nested marker self-orchestrates from here too — no bespoke tree-walk.
+     * The Top-only shape (no Tail) means an enclosing {@code bool} filter intersects the fused window at the query phase
+     * (fuse-then-filter), rather than being pushed into each leg. Accurate-totals / aggregations / explain / highlight on a
+     * TOP-LEVEL resolver are served by the {@link RankDocsQueryBuilder} Tail: those requests skip the fast path, and the
+     * conditional Tail is added below whenever the request needs the full match set.
+     *
+     * <p>Idempotency / termination: once the {@code SetOnce} is populated the returned query is a plain standard builder
+     * (never a resolver marker), so it cannot loop; a still-pending supplier returns {@code this} to make no progress until
+     * the async round completes. Both keep the whole-tree rewrite within {@code Rewriteable.MAX_REWRITE_ROUNDS}.
+     */
+    @Override
+    protected QueryBuilder doRewrite(QueryRewriteContext queryRewriteContext) throws IOException {
+        // Round 2: the async self-erase already produced the standard query — swap to it (or stay put until it lands).
+        if (fusedSupplier != null) {
+            QueryBuilder fused = fusedSupplier.get();
+            return fused == null ? this : fused;
+        }
+        // Only orchestrate at the coordinator rewrite; on shards / base contexts this is a no-op.
+        QueryCoordinatorContext coordinatorContext = queryRewriteContext.convertToCoordinatorContext();
+        if (coordinatorContext == null) {
+            return this;
+        }
+        // The runtime request on the _search path is a PipelinedRequest (extends SearchRequest); _explain/_validate pass
+        // other IndicesRequest types. Guard the cast — only a SearchRequest exposes source()/routing()/preference().
+        if ((coordinatorContext.getSearchRequest() instanceof SearchRequest) == false) {
+            return this;
+        }
+        SearchRequest searchRequest = (SearchRequest) coordinatorContext.getSearchRequest();
+        // Whether this marker is the whole query (=> conditional Tail for accurate totals/aggs/etc.) or nested inside a
+        // container (=> Top-only; an enclosing filter intersects at the query phase). Determined by reference identity
+        // against the request's top-level query on this first round, before any rewrite has replaced it.
+        boolean topLevel = searchRequest.source() != null && searchRequest.source().query() == this;
+
+        // Compute the per-shard collection plan ONCE and thread it into both the build and the reduce (single-plan
+        // invariant), exactly as the ActionFilter path did.
+        ResolverOrchestrator.CollectionPlan plan = ResolverOrchestrator.planCollection(searchRequest, this);
+        SetOnce<QueryBuilder> fused = new SetOnce<>();
+        ResolverQueryBuilder self = this;
+        queryRewriteContext.registerAsyncAction(
+            (client, listener) -> client.multiSearch(
+                ResolverOrchestrator.buildLegMultiSearch(searchRequest, self, plan),
+                ActionListener.wrap(multiSearchResponse -> {
+                    try {
+                        fused.set(ResolverOrchestrator.buildFusedQuery(searchRequest.source(), multiSearchResponse, self, plan, topLevel));
+                        listener.onResponse(null);
+                    } catch (Exception e) {
+                        listener.onFailure(e);
+                    }
+                }, listener::onFailure)
+            )
+        );
+        return new ResolverQueryBuilder(
+            queries,
+            technique,
+            normalization,
+            rankConstant,
+            rankWindowSize,
+            weights,
+            collection,
+            candidateDepth,
+            fused::get
+        );
+    }
+
     @Override
     protected Query doToQuery(QueryShardContext context) throws IOException {
-        // A resolver is coordinator-level orchestration; it must never reach a shard.
+        // A resolver is coordinator-level orchestration; it self-erases into a standard query at the coordinator rewrite
+        // and must never reach a shard. If it does, the coordinator rewrite did not run (e.g. a code path that bypasses
+        // Rewriteable.rewriteAndFetch) — fail loudly rather than silently mis-scoring.
         throw new IllegalStateException(
             "["
                 + NAME
-                + "] query must be the top-level query (or nested in a bool) so the coordinator can orchestrate "
-                + "its sub-queries before the query phase; it is handled by the resolver ActionFilter on the "
-                + "coordinator and must not reach a shard."
+                + "] query is coordinator-only: it must be self-erased into a standard query during the coordinator "
+                + "rewrite (see doRewrite) and must not reach a shard."
         );
     }
 
