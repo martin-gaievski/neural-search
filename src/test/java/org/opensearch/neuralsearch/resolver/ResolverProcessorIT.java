@@ -104,6 +104,29 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
         assertFalse(ids.contains("d_none"));
     }
 
+    /**
+     * CLAIM (POC v2, B1): GRACEFUL per-leg failure — if one leg's sub-search fails but another succeeds, the resolver
+     * returns the surviving leg's results instead of erroring the whole search. Here leg 2 is a {@code knn} query
+     * against the {@code body} TEXT field (not a vector field), which fails at the shard; leg 1 (match title:apple)
+     * succeeds. The resolver must still return leg 1's matches (d_both, d_title) rather than a 4xx/5xx.
+     */
+    @SneakyThrows
+    public void testResolver_gracefulLegFailure_returnsSurvivingLeg() {
+        initIndexIfNeeded();
+        // leg 1: valid lexical match on title. leg 2: knn on a text field -> shard-level failure for that leg only.
+        String body = "{\"size\":10,\"query\":{\"resolver\":{\"queries\":["
+            + "{\"match\":{\"title\":\"apple\"}},"
+            + "{\"knn\":{\"body\":{\"vector\":[0.1,0.2,0.3],\"k\":10}}}],"
+            + "\"combination\":{\"technique\":\"rrf\",\"rank_constant\":60},\"rank_window_size\":100}}}";
+        Map<String, Object> response = searchNoPipeline(INDEX, body);
+        List<String> ids = ids(response);
+        // Surviving leg 1 (title:apple) matches d_both + d_title; the failed knn leg contributes nothing.
+        assertFalse("resolver must degrade to the surviving leg, not error", ids.isEmpty());
+        assertTrue(ids.contains("d_both"));
+        assertTrue(ids.contains("d_title"));
+        assertFalse(ids.contains("d_none")); // matches neither surviving leg
+    }
+
     @SneakyThrows
     private void initIndexIfNeeded() {
         if (indexExists(INDEX)) {

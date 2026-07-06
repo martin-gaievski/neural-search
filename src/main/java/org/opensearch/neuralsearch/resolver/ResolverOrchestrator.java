@@ -4,6 +4,8 @@
  */
 package org.opensearch.neuralsearch.resolver;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.search.TotalHits;
 import org.opensearch.action.search.MultiSearchRequest;
 import org.opensearch.action.search.MultiSearchResponse;
@@ -45,6 +47,8 @@ import java.util.Set;
  * </ul>
  */
 public final class ResolverOrchestrator {
+
+    private static final Logger log = LogManager.getLogger(ResolverOrchestrator.class);
 
     private ResolverOrchestrator() {}
 
@@ -117,8 +121,10 @@ public final class ResolverOrchestrator {
         // preference after "_shards:i|" (a custom session string is not; verified against core Preference.parse), and
         // the caller can't have set their own preference here (that path already fell back to coordinator above).
         // Known trade-off (acceptable for the POC; opt-in per_shard only): pinning to the primary means that if a
-        // shard's primary is transiently unavailable while a replica is up, that per-shard leg fails and the whole
-        // search errors — whereas the coordinator path would serve from the replica. There is no preference string
+        // shard's primary is transiently unavailable while a replica is up, that per-shard sub-search fails; with the
+        // B1 graceful-failure handling this now degrades (the leg fuses over its surviving shards, or is dropped if all
+        // its shards fail) rather than erroring the whole search — whereas the coordinator path would serve from the
+        // replica. There is no preference string
         // that means "the same arbitrary copy across N independent searches", so primary is the only deterministic
         // same-copy pin available plugin-side; production would gather per-shard candidates in one collector pass.
         return new CollectionPlan(true, numShards, resolver.candidateDepth(), PRIMARY_PREFERENCE);
@@ -208,7 +214,23 @@ public final class ResolverOrchestrator {
         } else {
             topOnly = true; // track_total_hits:false -> plain top-K, no Tail
         }
-        return new RankDocsQueryBuilder(ranked.ids, ranked.scores, topOnly ? List.of() : resolver.queries());
+        // The Tail re-runs the legs at the query phase (stage B). Only include legs that SURVIVED stage A — a leg that
+        // failed (its legHits slot is null, B1 graceful degradation) would fail again in the Tail and error the whole
+        // search, defeating the fallback. So the Tail matches the same surviving-leg set the fusion used.
+        return new RankDocsQueryBuilder(ranked.ids, ranked.scores, topOnly ? List.of() : survivingLegQueries(resolver, legHits));
+    }
+
+    /** The resolver's leg queries, restricted to legs that survived stage A (non-null {@code legHits} slot). Used for
+     *  the RankDocsQuery Tail so a failed leg is not re-executed in stage B (B1 graceful degradation). */
+    private static List<QueryBuilder> survivingLegQueries(ResolverQueryBuilder resolver, SearchHit[][] legHits) {
+        List<QueryBuilder> legs = resolver.queries();
+        List<QueryBuilder> surviving = new ArrayList<>(legs.size());
+        for (int legIndex = 0; legIndex < legs.size(); legIndex++) {
+            if (legIndex >= legHits.length || legHits[legIndex] != null) {
+                surviving.add(legs.get(legIndex));
+            }
+        }
+        return surviving;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -296,6 +318,9 @@ public final class ResolverOrchestrator {
         // id -> a hydrated hit for that doc (first occurrence across legs; all carry the same _source).
         Map<String, SearchHit> hitById = new HashMap<>();
         for (SearchHit[] legHit : legHits) {
+            if (legHit == null) {
+                continue; // leg dropped (graceful failure)
+            }
             for (SearchHit hit : legHit) {
                 if (hit.getId() != null) {
                     hitById.putIfAbsent(hit.getId(), hit);
@@ -361,7 +386,14 @@ public final class ResolverOrchestrator {
     /** Reduce the raw MultiSearch items into a per-leg array of hits. Coordinator plan: one item per leg. Per-shard
      *  plan: leg L owns the {@code numShards} items at {@code [L*numShards, (L+1)*numShards)}, whose hits are
      *  concatenated into leg L's union pool (over which min/max is later computed — the same pool hybrid normalizes
-     *  over). */
+     *  over).
+     *
+     *  <p>Graceful per-leg failure (B1): a failed sub-search does NOT error the whole resolver search. A leg's slot is
+     *  set to {@code null} only when it produced NO hits at all — coordinator: its single item failed; per-shard: every
+     *  one of its shard sub-searches failed. A partially-failed per-shard leg keeps the hits from its surviving shards
+     *  (with a warning), because a narrower-than-intended pool still fuses meaningfully. The downstream fusion skips
+     *  null legs and excludes them from the weight denominator, keeping the array full-length so {@code weights[]} index
+     *  alignment holds. Only when ALL legs are null (nothing succeeded) do we throw — there is nothing to fuse. */
     private static SearchHit[][] groupLegHits(MultiSearchResponse.Item[] items, int legCount, CollectionPlan plan) {
         int expected = plan.perShard() ? legCount * plan.numShards() : legCount;
         if (items.length != expected) {
@@ -381,24 +413,69 @@ public final class ResolverOrchestrator {
             );
         }
         SearchHit[][] legHits = new SearchHit[legCount][];
+        int survivingLegs = 0;
         if (plan.perShard()) {
             int n = plan.numShards();
             for (int leg = 0; leg < legCount; leg++) {
                 List<SearchHit> union = new ArrayList<>();
+                int failedShards = 0;
                 for (int shard = 0; shard < n; shard++) {
                     int itemIndex = leg * n + shard;
-                    for (SearchHit hit : hitsOrThrow(items[itemIndex], itemIndex)) {
+                    MultiSearchResponse.Item item = items[itemIndex];
+                    if (item.isFailure()) {
+                        failedShards++;
+                        continue;
+                    }
+                    for (SearchHit hit : item.getResponse().getHits().getHits()) {
                         union.add(hit);
                     }
                 }
-                legHits[leg] = union.toArray(new SearchHit[0]);
+                if (failedShards == n) {
+                    log.warn("[resolver] sub-query {} dropped: all {} per-shard sub-searches failed", leg, n);
+                    legHits[leg] = null;
+                } else {
+                    if (failedShards > 0) {
+                        log.warn(
+                            "[resolver] sub-query {} degraded: {} of {} per-shard sub-searches failed, fusing over the rest",
+                            leg,
+                            failedShards,
+                            n
+                        );
+                    }
+                    legHits[leg] = union.toArray(new SearchHit[0]);
+                    survivingLegs++;
+                }
             }
         } else {
             for (int leg = 0; leg < legCount; leg++) {
-                legHits[leg] = hitsOrThrow(items[leg], leg);
+                MultiSearchResponse.Item item = items[leg];
+                if (item.isFailure()) {
+                    log.warn("[resolver] sub-query {} dropped: {}", leg, item.getFailureMessage());
+                    legHits[leg] = null;
+                } else {
+                    legHits[leg] = item.getResponse().getHits().getHits();
+                    survivingLegs++;
+                }
             }
         }
+        if (survivingLegs == 0) {
+            // Every leg failed — no candidates to fuse. Surface the first failure as the cause.
+            MultiSearchResponse.Item firstFailure = firstFailure(items);
+            throw new IllegalStateException(
+                "[resolver] all sub-queries failed" + (firstFailure == null ? "" : ": " + firstFailure.getFailureMessage()),
+                firstFailure == null ? null : firstFailure.getFailure()
+            );
+        }
         return legHits;
+    }
+
+    private static MultiSearchResponse.Item firstFailure(MultiSearchResponse.Item[] items) {
+        for (MultiSearchResponse.Item item : items) {
+            if (item.isFailure()) {
+                return item;
+            }
+        }
+        return null;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -478,6 +555,9 @@ public final class ResolverOrchestrator {
         Map<String, Float> scores = new LinkedHashMap<>();
         for (int legIndex = 0; legIndex < legHits.length; legIndex++) {
             SearchHit[] hits = legHits[legIndex];
+            if (hits == null) {
+                continue; // leg dropped (all its sub-searches failed) — skip; ranks are per-leg so no re-index needed
+            }
             float weight = weightForLeg(resolver.weights(), legIndex);
             for (int rank = 0; rank < hits.length; rank++) {
                 String id = hits[rank].getId();
@@ -502,13 +582,13 @@ public final class ResolverOrchestrator {
      * min/max (which {@code MinMaxScoreNormalizationTechnique.getMinScores/getMaxScores} take across all shards).
      */
     private static Map<String, Float> minMaxArithmeticMean(SearchHit[][] legHits, ResolverQueryBuilder resolver) {
-        float totalWeight = 0.0f;
-        for (int legIndex = 0; legIndex < legHits.length; legIndex++) {
-            totalWeight += weightForLeg(resolver.weights(), legIndex);
-        }
+        float totalWeight = survivingWeight(legHits, resolver.weights());
         Map<String, Float> weightedSum = new LinkedHashMap<>(); // id -> Σ weight_leg * normalized_leg
         for (int legIndex = 0; legIndex < legHits.length; legIndex++) {
             SearchHit[] hits = legHits[legIndex];
+            if (hits == null) {
+                continue; // leg dropped (graceful failure) — excluded from both the sum and the denominator
+            }
             float min = Float.MAX_VALUE;
             float max = -Float.MAX_VALUE;
             for (SearchHit hit : hits) {
@@ -551,13 +631,13 @@ public final class ResolverOrchestrator {
      * whose scores are tightly clustered vs one that is spread out are normalized on their own terms per query.
      */
     private static Map<String, Float> zScoreArithmeticMean(SearchHit[][] legHits, ResolverQueryBuilder resolver) {
-        float totalWeight = 0.0f;
-        for (int legIndex = 0; legIndex < legHits.length; legIndex++) {
-            totalWeight += weightForLeg(resolver.weights(), legIndex);
-        }
+        float totalWeight = survivingWeight(legHits, resolver.weights());
         Map<String, Float> weightedSum = new LinkedHashMap<>(); // id -> Σ weight_leg * normalized_leg
         for (int legIndex = 0; legIndex < legHits.length; legIndex++) {
             SearchHit[] hits = legHits[legIndex];
+            if (hits == null) {
+                continue; // leg dropped (graceful failure)
+            }
             // Mean and sample standard deviation of this leg's returned scores (the per-query distribution).
             double sum = 0.0;
             int n = 0;
@@ -612,13 +692,13 @@ public final class ResolverOrchestrator {
      * (and ES {@code l2_norm}): magnitude-preserving (unlike range/rank normalizers), norm==0 leg → 0.
      */
     private static Map<String, Float> l2ArithmeticMean(SearchHit[][] legHits, ResolverQueryBuilder resolver) {
-        float totalWeight = 0.0f;
-        for (int legIndex = 0; legIndex < legHits.length; legIndex++) {
-            totalWeight += weightForLeg(resolver.weights(), legIndex);
-        }
+        float totalWeight = survivingWeight(legHits, resolver.weights());
         Map<String, Float> weightedSum = new LinkedHashMap<>(); // id -> Σ weight_leg * normalized_leg
         for (int legIndex = 0; legIndex < legHits.length; legIndex++) {
             SearchHit[] hits = legHits[legIndex];
+            if (hits == null) {
+                continue; // leg dropped (graceful failure)
+            }
             double sumSq = 0.0;
             for (SearchHit hit : hits) {
                 sumSq += (double) hit.getScore() * hit.getScore();
@@ -649,14 +729,16 @@ public final class ResolverOrchestrator {
         return (weights == null || weights.length == 0) ? 1.0f : weights[legIndex];
     }
 
-    private static SearchHit[] hitsOrThrow(MultiSearchResponse.Item item, int legIndex) {
-        if (item.isFailure()) {
-            throw new IllegalStateException(
-                String.format(Locale.ROOT, "[resolver] sub-query %d failed: %s", legIndex, item.getFailureMessage()),
-                item.getFailure()
-            );
+    /** Sum of weights over the SURVIVING legs only (null = dropped after a graceful leg failure). Excluding dropped
+     *  legs from the arithmetic-mean denominator keeps the surviving legs' contributions from being wrongly diluted. */
+    private static float survivingWeight(SearchHit[][] legHits, float[] weights) {
+        float total = 0.0f;
+        for (int legIndex = 0; legIndex < legHits.length; legIndex++) {
+            if (legHits[legIndex] != null) {
+                total += weightForLeg(weights, legIndex);
+            }
         }
-        return item.getResponse().getHits().getHits();
+        return total;
     }
 
     private static RankedDocs toRankedDocs(Map<String, Float> scoresById, int rankWindowSize) {
