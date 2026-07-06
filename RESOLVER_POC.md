@@ -1,9 +1,9 @@
-# Resolver Framework — Phase 1 POC (running code)
+# Resolver Framework — POC (running code)
 
-Branch: `poc/resolver-phase1`
+Branch: `poc/resolver-v2-adaptive-fusion` (off tag `resolver-poc-v1`; tip carries the v2 adaptive-fusion + audit work).
 
 This is a **runnable** proof-of-concept for the Resolver framework — next-generation hybrid
-search for OpenSearch that runs **coordinator-level RRF as pre-search orchestration** and
+search for OpenSearch that runs **coordinator-level fusion as pre-search orchestration** and
 **self-erases into a standard query** so `explain`, `profile`, and aggregations work natively.
 
 Design background: `steering_documents/hybrid query/simplified_hybrid_search/`
@@ -15,207 +15,189 @@ Design background: `steering_documents/hybrid query/simplified_hybrid_search/`
 
 ## What this POC does
 
-A single self-contained query — **no search pipeline required** (the `ResolverActionFilter` intercepts it on the coordinator):
+A single self-contained query — **no search pipeline required**:
 
 ```json
 POST /my-index/_search
 {
   "query": {
     "resolver": {
-      "technique": "rrf",
       "queries": [
-        { "match":  { "title": "apple" } },
-        { "match":  { "body":  "banana" } }
+        { "match": { "title": "apple" } },
+        { "knn":   { "body_vector": { "vector": [ ... ], "k": 100 } } }
       ],
-      "rank_constant": 60,
+      "combination": { "technique": "rrf", "parameters": { "rank_constant": 60 } },
       "rank_window_size": 100
     }
   }
 }
 ```
 
-Flow (all on the coordinator, before the query phase):
-1. The `ResolverActionFilter` detects the `resolver` query on the coordinator (no pipeline needed).
-2. It fires each sub-query as an **independent, parallel** search via `MultiSearch`
+Flow (all on the coordinator, before the query phase — via `ResolverQueryBuilder.doRewrite()`):
+1. At the **coordinator rewrite**, `ResolverQueryBuilder.doRewrite()` detects the coordinator context and
+   registers an async action via `QueryRewriteContext.registerAsyncAction` (the same mechanism
+   `NeuralQueryBuilder` / `NeuralSparseQueryBuilder` use — and the same one ES's compound retrievers use).
+2. The async action fires each sub-query ("leg") as an **independent, parallel** search via `MultiSearch`
    (each leg fans out to all shards → globally merged results).
-3. It fuses the per-leg results with **Reciprocal Rank Fusion** at the coordinator
-   (`score(d) = Σ 1 / (k + rank_i(d))`) — this is the coordinator-level RRF that keeps
-   multi-shard relevance quality.
-4. It **rewrites the request** into a standard `RankDocsQuery` — **Top** (ranked docs with RRF
-   scores) + **Tail** (source legs as a non-scoring filter) — and removes the resolver.
-   The query phase now runs a standard query, so explain/profile work natively and
-   total-hits/aggregations cover the full match set (via the Tail).
+3. It fuses the per-leg results **on the coordinator** (`ResolverOrchestrator`) — RRF or a normalized
+   arithmetic mean (see [Fusion techniques](#fusion-techniques)) — keeping multi-shard relevance quality.
+4. On the next rewrite round it **self-erases into a standard `RankDocsQuery`** — **Top** (ranked docs with
+   fused scores) + a **conditional Tail** (source legs as a non-scoring filter). The query phase then runs a
+   standard query, so explain/profile work natively and total-hits/aggregations cover the full match set.
+
+For plain top-K there is also a **stage-B-free fast path** (below) that fabricates the response directly
+from the fused window, skipping the second query phase — the resolver's below-hybrid latency win.
+
+## Fusion techniques
+
+Selected via the `normalization` / `combination` objects (Option-B config, mirrors the hybrid pipeline
+and ES retrievers). Per-leg `weights` are optional (validated finite, non-negative, not-all-zero).
+
+| combination | normalization | Notes |
+|---|---|---|
+| `rrf` | — (rank-based) | **weighted RRF** — `score(d) = Σ weightᵢ / (rank_constant + rankᵢ(d) + 1)`. Exact parity with the hybrid RRF processor and ES `rrf`. Zero-config default. |
+| `arithmetic_mean` | `min_max` | range normalization per leg, then weighted mean. Best on dense-dominant data. |
+| `arithmetic_mean` | `z_score` | **DBSF-style** per-query distribution normalization (mean/std, Qdrant-style). Best on lexical-signal data; do not use under `per_shard` on dense-dominant data (collapses). |
+| `arithmetic_mean` | `l2` | magnitude-preserving `s / √Σs²` per leg (matches the hybrid processor / ES `l2_norm`). The robust middle option. |
+
+(`geometric_mean`/`harmonic_mean` were benchmarked and measured *worse* than arithmetic mean — intentionally not added.)
 
 ## What's implemented
 
 | File | Role |
 |---|---|
-| `src/main/java/org/opensearch/neuralsearch/resolver/ResolverQueryBuilder.java` | `resolver` marker query — carries sub-queries + fusion spec (normalization/combination); throws if it reaches a shard unprocessed |
-| `src/main/java/org/opensearch/neuralsearch/resolver/ResolverOrchestrator.java` | shared orchestration — build parallel-leg MultiSearch + coordinator RRF + rewrite to `RankDocsQuery` (Top + conditional Tail) |
-| `src/main/java/org/opensearch/neuralsearch/resolver/ResolverActionFilter.java` | **pipeline-free** entry (sole mechanism) — ActionFilter that runs the orchestration for any `resolver` query, top-level or nested, no search pipeline |
-| `src/main/java/org/opensearch/neuralsearch/resolver/RankDocsQueryBuilder.java` | the injected standard query — **Top** (ranked docs w/ RRF scores) + **Tail** (source legs as a non-scoring filter for total-hits/aggregations/highlight) |
-| `src/main/java/org/opensearch/neuralsearch/plugin/NeuralSearch.java` | registers the `resolver` + `rank_docs` queries and the `ResolverActionFilter` (pipeline-free); captures the node `Client` |
-| `src/test/java/org/opensearch/neuralsearch/resolver/ResolverQueryBuilderTests.java` | unit: parsing, validation, serialization, shard-guard |
-| `src/test/java/org/opensearch/neuralsearch/resolver/RankDocsQueryBuilderTests.java` | unit: serialization roundtrip, non-parseable guard |
-| `src/test/java/org/opensearch/neuralsearch/resolver/ResolverProcessorIT.java` | end-to-end ITs (13, all pipeline-free): RRF fusion (3-shard), min_max+arithmetic_mean, RRF-vs-min_max divergence, nested-in-`bool` + multi-marker/multi-level (filter push-down), combined rescore, + RankDocsQuery total-hits / aggregations / highlight / explain / conditional-Tail |
+| `.../resolver/ResolverQueryBuilder.java` | `resolver` marker query — sub-queries + fusion spec + `collection`/`candidate_depth` + `weights`. **`doRewrite()` is the entry point**: self-erases at the coordinator rewrite via `registerAsyncAction`. `doToQuery()` throws (must never reach a shard). |
+| `.../resolver/ResolverOrchestrator.java` | stateless orchestration — `planCollection`, `buildLegMultiSearch`, `buildFusedQuery` (pure; returns the query), fusion (`rrf` / `min_max` / `z_score` / `l2`), `survivingLegQueries`/`survivingWeight` (graceful per-leg failure), `fabricateFastPathResponse`/`fastPathEligible` (fast path), `legUnionTotalHits`. |
+| `.../resolver/ResolverActionFilter.java` | **thin coordinator hook for the stage-B-free fast path ONLY** — fabricates the response and short-circuits (`listener.onResponse`, no `chain.proceed`) when `fastPathEligible`. Everything else falls through to `chain.proceed` and is handled by `doRewrite`. (A rewrite can return a `QueryBuilder` but never a `SearchResponse`, so the fast path needs a request/response-boundary hook.) |
+| `.../resolver/RankDocsQueryBuilder.java` | the injected standard query — **Top** (`constant_score(_id)^fusedScore`) + **conditional Tail** (surviving source legs as a non-scoring filter for total-hits/aggregations/highlight). |
+| `.../plugin/NeuralSearch.java` | registers the `resolver` + `rank_docs` queries (`getQueries()`) and the thin `ResolverActionFilter` (`getActionFilters()`); captures the node `Client`. |
+| `.../resolver/ResolverQueryBuilderTests.java` | unit: parsing/validation/serialization/shard-guard, `doRewrite` gating + self-erase, weight validation, fast-path eligibility, z_score/l2/weighted-RRF. |
+| `.../resolver/RankDocsQueryBuilderTests.java` | unit: serialization roundtrip, non-parseable guard. |
+| `.../resolver/ResolverProcessorIT.java` | end-to-end ITs (30, all pipeline-free): RRF / min_max+AM / z_score / l2 / weighted RRF, per-shard collection (doc-for-doc == hybrid), fast path (+ min_score, source-filtering/suggest fallback), nested-in-`bool`/`dis_max`/`function_score` (fuse-then-filter), multi-marker, graceful per-leg failure, combined rescore, RankDocsQuery total-hits / aggs / highlight / explain / conditional-Tail. |
 
 ## Pipeline-free (no search pipeline required)
 
-The resolver works **without any search pipeline**. `ResolverActionFilter` (registered via `getActionFilters()`) intercepts every search on the coordinator, detects the `resolver` query, and runs the MultiSearch + RRF + rewrite orchestration — mirroring `HybridQuerySearchRequestFilter` (documented as working "transparently without any pipeline"), but async. So this works with **no `?search_pipeline=`**:
+The resolver works **without any search pipeline** — `ResolverQueryBuilder.doRewrite()` self-erases at the
+coordinator rewrite, no `?search_pipeline=` and no pipeline object to create or manage (a win for
+managed/serverless). Verified by `ResolverProcessorIT.testResolver_worksWithoutSearchPipeline` (and every
+IT runs pipeline-free). The thin `ResolverActionFilter` exists only to serve the fast path; it is **not** a
+general request interceptor and does not run the orchestration for ordinary searches.
 
-```json
-POST /demo/_search
-{ "query": { "resolver": { "queries": [ { "match": { "title": "apple" } }, { "match": { "body": "banana" } } ],
-                           "technique": "rrf", "rank_constant": 60, "rank_window_size": 100 } } }
-```
+## Nested placement (resolver inside bool / dis_max / function_score)
 
-Verified by `ResolverProcessorIT.testResolver_worksWithoutSearchPipeline` (and every other IT — all 13 run pipeline-free). This removes the "mandatory pipeline" friction (a win for managed/serverless — no pipeline object to create or manage, no pipeline restrictions). **The ActionFilter is the sole mechanism** — an earlier request-processor path was evaluated as redundant and removed. Note: dropping the pipeline is an operational/infra win, not a latency win (pipeline execution is cheap).
-
-## Nested placement (resolver inside a bool)
-
-Unlike the hybrid query — which must be the top-level query, because it emits non-standard `CompoundTopDocs` — the resolver can be **nested inside a `bool`**, because it self-erases into a standard `RankDocsQuery`. The `ResolverActionFilter` recursively finds resolver markers in the query tree, resolves each to a Top-only `RankDocsQuery`, and splices it back in place. Enclosing `bool` `filter` clauses are **pushed down into each leg**, so fusion runs over the filtered candidate set:
+Unlike the hybrid query — which must be top-level, because it emits non-standard `CompoundTopDocs` — the
+resolver can be **nested inside any container**, because each marker self-erases into a standard
+`RankDocsQuery`. This is **structural**: the rewrite framework recurses `rewrite()` into container query
+builders (`bool`, `dis_max`, `function_score`, `constant_score`), so each nested marker's own `doRewrite`
+fires independently. No bespoke tree-walk.
 
 ```json
 POST /demo/_search
 { "query": { "bool": {
     "must":   [ { "resolver": { "queries": [ {"match":{"title":"apple"}}, {"match":{"body":"banana"}} ],
-                                "technique": "rrf", "rank_constant": 60, "rank_window_size": 100 } } ],
+                                "combination": { "technique": "rrf" }, "rank_window_size": 100 } } ],
     "filter": [ { "term": { "category": "x" } } ] } } }
 ```
 
-Verified by `ResolverProcessorIT.testResolver_nestedInBoolMust_noFilter_thenFuses` and `testResolver_nestedInBool_pushesFilterIntoLegs` (a decisive `rank_window_size=1` push-down test: fuse-then-filter would return empty). Scope: `bool` traversal only in this prototype; nested markers use Top-only (no Tail); only `filter` clauses are pushed down (non-scoring), which avoids score-scale mixing with sibling clauses.
+**Fuse-then-filter semantics:** a nested marker fuses over the *unfiltered* candidate set and self-erases to
+a **Top-only** `RankDocsQuery`; an enclosing `bool` filter then intersects the fused window at the query
+phase. (This replaces the earlier "filter push-down into legs" — a deliberate change; the tradeoff is that
+under a highly selective filter with a small `rank_window_size`, recall can be lower than push-down.)
+Verified by `testResolver_nestedInBool_filterAppliesAfterFusion`,
+`testResolver_nestedInDisMaxAndFunctionScore_selfOrchestrates`, and
+`testResolver_manyIndependentMarkers_withinRewriteRoundCap`.
 
 ## Build & test
 
 ```bash
-# compile
-./gradlew spotlessApply compileJava
-
-# unit tests
-./gradlew test --tests "*.ResolverQueryBuilderTests"
-
-# end-to-end integration test (spins up a live cluster)
-./gradlew integTest --tests "*.ResolverProcessorIT"
+./gradlew spotlessApply compileJava                          # compile
+./gradlew test --tests "*.ResolverQueryBuilderTests"         # unit
+./gradlew integTest --tests "*.ResolverProcessorIT"          # end-to-end (spins a live cluster)
 ```
 
 ## Live demo (curl)
 
 ```bash
-# 1) start a local cluster with the plugin
 ./gradlew run    # http://localhost:9200
 
-# 2) create a 3-shard index
 curl -s -XPUT "localhost:9200/demo" -H 'Content-Type: application/json' -d '{
   "settings": { "index": { "number_of_shards": 3, "number_of_replicas": 0 } },
   "mappings": { "properties": { "title": {"type":"text"}, "body": {"type":"text"} } }
 }'
-
-# 3) index 4 docs (d_both matches both legs; d_none matches neither)
 curl -s -XPOST "localhost:9200/demo/_doc/d_both?refresh"  -H 'Content-Type: application/json' -d '{"title":"apple pie recipe","body":"banana bread loaf"}'
 curl -s -XPOST "localhost:9200/demo/_doc/d_title?refresh" -H 'Content-Type: application/json' -d '{"title":"apple orchard tour","body":"fresh grape juice"}'
 curl -s -XPOST "localhost:9200/demo/_doc/d_body?refresh"  -H 'Content-Type: application/json' -d '{"title":"classic cherry tart","body":"banana milk smoothie"}'
 curl -s -XPOST "localhost:9200/demo/_doc/d_none?refresh"  -H 'Content-Type: application/json' -d '{"title":"cherry chocolate cake","body":"grape jam jar"}'
 
-# 4) run one resolver query — no search pipeline; the ActionFilter handles it
+# one resolver query — no search pipeline; the coordinator rewrite handles it
 curl -s -XPOST "localhost:9200/demo/_search" -H 'Content-Type: application/json' -d '{
   "query": { "resolver": {
-    "technique": "rrf",
     "queries": [ { "match": { "title": "apple" } }, { "match": { "body": "banana" } } ],
-    "rank_constant": 60, "rank_window_size": 100
+    "combination": { "technique": "rrf", "parameters": { "rank_constant": 60 } },
+    "rank_window_size": 100
   } },
   "size": 10
 }'
 # Expected: d_both first (in both legs), then d_title / d_body; d_none absent.
-
-# 5) explain works natively (the resolver has self-erased into a standard query)
-curl -s -XPOST "localhost:9200/demo/_search" -H 'Content-Type: application/json' -d '{
-  "explain": true, "size": 3,
-  "query": { "resolver": { "queries": [ { "match": { "title": "apple" } }, { "match": { "body": "banana" } } ] } }
-}'
 ```
 
-Every query above runs **without any search pipeline** — the `ResolverActionFilter` handles the
-`resolver` query on the coordinator.
+Every query runs **without any search pipeline** — the resolver self-erases at the coordinator rewrite.
 
 ## Combined rescore (standard syntax, verified)
 
-Because the resolver self-erases into a standard query, the **standard OpenSearch top-level `rescore`** element works and is applied to the **fused (combined) scores** — the plugin does not parse `rescore`; core does, and the resolver orchestration leaves it untouched. This is the mode hybrid query cannot do (its rescore is per-leg, pre-normalization, capped by leg weight).
-
-```json
-POST /demo/_search
-{
-  "query": { "resolver": { "queries": [ { "match": { "title": "apple" } }, { "match": { "body": "banana" } } ],
-                           "technique": "rrf", "rank_constant": 60, "rank_window_size": 100 } },
-  "rescore": {
-    "window_size": 50,
-    "query": {
-      "rescore_query": { "match_phrase": { "content": "open source search" } },
-      "query_weight": 0.6, "rescore_query_weight": 1.4, "score_mode": "total"
-    }
-  }
-}
-```
-
-Verified by `ResolverProcessorIT.testResolverRrf_withStandardRescore_thenFusedRankingIsRescored`: without rescore the RRF leader ranks first; with the rescore above, the only document containing the phrase is lifted to #1 — i.e. the rescore blends with the combined RRF score. Caveat: RRF scores are small (~0.01–0.05), so `query_weight`/`rescore_query_weight` must be tuned or the rescore query dominates. Per-leg rescore (rescore inside a leg) is **not** supported in this POC — that's the Phase-2 `rescorer` resolver.
+Because the resolver self-erases into a standard query, the **standard OpenSearch top-level `rescore`**
+element works and is applied to the **fused (combined) scores** — the plugin does not parse `rescore`; core
+does, and the resolver orchestration leaves it untouched. This is the mode hybrid query cannot do (its
+rescore is per-leg, pre-normalization, capped by leg weight). Verified by
+`testResolverRrf_withStandardRescore_thenFusedRankingIsRescored`. Caveat: RRF scores are small (~0.01–0.05),
+so `query_weight`/`rescore_query_weight` must be tuned. (Per-leg rescore is a Phase-2 `rescorer` resolver.)
 
 ## RankDocsQuery — verified improvements (and what still needs work)
 
-The injected query is a `RankDocsQuery` (Top + Tail). ITs verify which improvements the composite actually delivers:
+The injected query is a `RankDocsQuery` (Top + Tail). ITs verify which improvements it delivers:
 
 | Claim | Result | Test |
 |---|---|---|
-| Total hits cover ALL matches (not just the fused window) | ✅ achieved | `testRankDocs_totalHits_coversAllMatchesNotJustWindow` (window=1 → total_hits=3) |
-| Aggregations cover ALL matches | ✅ achieved | `testRankDocs_aggregations_coverAllMatchesNotJustWindow` (buckets A=2, B=1) |
-| Highlighting on sub-query terms | ✅ achieved | `testRankDocs_highlightOnSubQueryTerms` (title → `<em>apple</em>`) |
-| Explain present & score-consistent | ✅ achieved | `testRankDocs_explainIsPresentAndConsistent` |
-| Rich per-leg RRF rank breakdown in explain | ❌ not achieved | explain shows `ConstantScore(_id)^rrf` + source query as a 0-contribution filter, not per-leg ranks — needs a custom Top query |
-| Inner hits / nested | ❌ not implemented | would need a custom Top query / propagation |
-| Collapse completeness, global field sort, deep pagination | ❌ still window-bounded | fundamental to fusion, not fixable here |
+| Total hits cover ALL matches (not just the fused window) | ✅ | `testRankDocs_totalHits_coversAllMatchesNotJustWindow` |
+| Aggregations cover ALL matches | ✅ | `testRankDocs_aggregations_coverAllMatchesNotJustWindow` |
+| Highlighting on sub-query terms | ✅ | `testRankDocs_highlightOnSubQueryTerms` |
+| Explain present & score-consistent | ✅ | `testRankDocs_explainIsPresentAndConsistent` |
+| `min_score` on the fast path (post-fusion threshold) | ✅ | `testFastPath_minScore_filtersFusedWindow` |
+| Graceful per-leg failure (drop failed leg, fuse survivors) | ✅ | `testResolver_gracefulLegFailure_returnsSurvivingLeg` |
+| Rich per-leg rank breakdown in explain | ❌ | shows `constant_score(_id)^fusedScore` + source query as a 0-contribution filter — needs a custom Top query |
+| Inner hits / nested | ❌ | would need a custom Top query |
+| Collapse completeness, global field sort, deep pagination | ❌ | window-bounded; fundamental to fusion |
 
-Net: the Tail recovers **total-hits, aggregations, and highlighting** (over all matches); explain **works but is not a per-leg breakdown**; inner-hits and the window-bounded items remain.
+## POC status vs. the production design
 
-## POC simplifications vs. the production design
+- **Entry point:** the resolver self-erases at the coordinator rewrite via `ResolverQueryBuilder.doRewrite` +
+  `registerAsyncAction` (plugin-only; the earlier v1 global-`ActionFilter`-as-sole-mechanism was **re-homed** —
+  this was a GA blocker, now done). The production target is the same mechanism as a core
+  `SearchSourceBuilder.rewrite()` SPI, but the plugin `QueryBuilder` path needs no core change.
+- **Techniques:** `rrf` (weighted), `min_max`+`arithmetic_mean`, `z_score`+`arithmetic_mean` (DBSF),
+  `l2`+`arithmetic_mean` are all implemented and benchmarked. `rescorer` and rerankers are Phase 2/3.
+- **Snapshot consistency:** legs are matched back by `_id` (no PIT). Production needs **PIT** + `_shard_doc`
+  so all legs see the same snapshot — **the one remaining GA blocker** (a correctness prerequisite under
+  concurrent indexing, not an optimization).
+- **Explain depth / inner_hits:** still need a custom Top query (`RRFRankDoc`-style per-leg positions).
+- **Open backlog:** widen the fast path to the default `track_total_hits` (needs a leg-side accurate count
+  independent of the retrieved window size — not a gate flip); `min_max` lower/upper bounds; per_shard
+  observability signal; CCS gating; a core query-phase shard-collector (the credible per_shard latency fix).
 
-- **Entry point:** plugin-only `resolver` **query** processed by an **`ActionFilter`** (pipeline-free),
-  instead of the core top-level `resolver` field + `SearchSourceBuilder.rewrite()` SPI (which needs an
-  OpenSearch core change). Same architecture (coordinator orchestration + self-erasing rewrite). The POC
-  also supports **nested placement** (resolver inside `bool`, multiple markers at different levels,
-  filter push-down) — beyond the original top-level-only design.
-- **Snapshot consistency:** legs are matched back by `_id` (no PIT). Production uses PIT +
-  `_shard_doc` so all legs see the same snapshot.
-- **Explain depth:** explain works and is score-consistent, but shows `ConstantScore(_id)^rrf`
-  plus the source query as a 0-contribution filter match — not a per-leg RRF rank breakdown.
-  The clean breakdown needs a custom Top query (`RRFRankDoc` with per-leg positions).
-- **Inner hits / nested:** not produced by the Top+Tail composite — would need the custom Top query.
-- **Tail cost:** the Tail re-runs the source legs on the main search (for all-match total-hits/aggs);
-  production makes the Tail conditional (only when aggs/total-hits/explain need it).
-- **Techniques:** `rrf` and `min_max`+`arithmetic_mean` (optionally weighted) are implemented, selected
-  via the `normalization`/`combination` objects. `l2`/`z_score`, `geometric`/`harmonic` mean, `rescorer`,
-  and rerankers are Phase 2/3.
-- **Stats:** no `EventStatsManager` counters wired yet (follow-up).
+## Production feasibility & benchmarks (summary)
 
-## Production feasibility (summary)
+Assessed across 3 BEIR datasets (TREC-COVID / Quora / NQ) on a 3-node / 12-shard cluster, and against a
+matched 3-node Elasticsearch 8.19 cluster — adversarially verified. **Feasible now for RRF + coordinator +
+fast path; the rest needs defined work (PIT).**
 
-Assessed across 3 BEIR datasets (TREC-COVID / Quora / NQ, incl. mpnet-768) on 2–3 node / 12–65 shard
-clusters, and adversarially verified. **Feasible now for one mode; the rest needs defined work.**
+- ✅ **RRF + coordinator + fast path** — RRF ≈ hybrid relevance (exact on Quora; −3…−6% rank residual on
+  TREC-COVID). The stage-B-free fast path is **~1.7–2.0× faster than ES's `linear` retriever** on all 3
+  datasets and **faster than OpenSearch's own hybrid pipeline on heavy-kNN NQ** (96 vs 144 ms p50), at
+  comparable relevance. RRF never fans out. Pipeline-free is a real managed/serverless win.
+- **Score-based (min_max / z_score / l2) + `collection: per_shard`** closes the coordinator relevance gap to
+  within ~−1…−3% of hybrid (a candidate-pool-width effect), at a fan-out latency cost — ship behind a flag.
+  z_score wins on lexical-signal data; l2 is the robust middle; min_max the safe default.
+- **One GA blocker remains: PIT** for stage-B snapshot consistency. CCS/remote targets need explicit gating.
 
-- ✅ **Production-ready: RRF + coordinator collection + fast path.** RRF ≈ hybrid relevance (exact on
-  Quora; a −3%…−6% rank residual on TREC-COVID). The stage-B-free fast path is **0.58–0.88× hybrid**
-  latency, and RRF **never fans out** (it's excluded from per-shard collection by an enforced invariant).
-  Pipeline-free is a real managed/serverless win.
-- ⚠️ **Experimental: `min_max`+`arithmetic_mean` with `collection: per_shard`.** It closes the coordinator
-  relevance gap (a pure candidate-pool-width effect; faithful math), but per dataset the closure varies
-  (TREC-COVID lands ~−3.4% vs hybrid, Quora/NQ ~−1.1%), and it carries a real fan-out latency
-  (`num_shards × legs × f(candidate_depth)`; ~2.77× hybrid at 24 shards / `size=100`) plus **silent
-  fallback to coordinator** on multi-index/alias, custom routing/preference, or `num_shards × legs > 128`.
-  Ship behind a flag.
-- **GA blockers for any mode:** (1) re-home off the `ActionFilter` onto a `registerAsyncAction`
-  `QueryBuilder` (native rewrite recursion → correct nesting/multiplicity); (2) adopt **PIT** for stage-B
-  snapshot consistency — a correctness prerequisite (`_id` matching can drop/mis-score docs under
-  concurrent indexing), not an optimization. CCS/remote targets need explicit gating.
-- **The one credible per-shard latency fix** is a real query-phase shard-collector (reuse hybrid's
-  `HybridTopScoreDocCollector` / `CompoundTopDocs`) → per-shard ~1× hybrid at equal depth, removing the
-  fan-out, the 128 cap, and the alias/routing fallbacks.
-
-Full assessment + P0/P1/P2 optimization roadmap (and the list of *rejected* optimizations) is in the
-design package's showcase doc §13.
+Full assessment + roadmap: the design package's showcase doc §13; three-way benchmark tables:
+`resolver_v2_threeway_benchmark.md`; ES gap analysis: `resolver_es_normalization_gap_analysis.md`.
