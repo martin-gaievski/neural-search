@@ -238,6 +238,22 @@ public class ResolverQueryBuilderTests extends OpenSearchTestCase {
         assertTrue(e.getMessage().contains("candidate_depth"));
     }
 
+    public void testWeightedRrfParsesAndSerializes() throws Exception {
+        // POC v2: RRF now accepts per-leg weights (weighted RRF, mirrors ES 9.2).
+        String json = "{\"queries\":[{\"match\":{\"title\":\"a\"}},{\"match\":{\"body\":\"b\"}}],"
+            + "\"combination\":{\"technique\":\"rrf\",\"parameters\":{\"rank_constant\":60,\"weights\":[2.0,0.5]}}}";
+        XContentParser parser = createParser(JsonXContent.jsonXContent, json);
+        parser.nextToken();
+        ResolverQueryBuilder builder = ResolverQueryBuilder.fromXContent(parser);
+        assertEquals(ResolverQueryBuilder.TECHNIQUE_RRF, builder.technique());
+        assertEquals(2, builder.weights().length);
+        assertEquals(2.0f, builder.weights()[0], 1e-6);
+        assertEquals(0.5f, builder.weights()[1], 1e-6);
+        ResolverQueryBuilder deserialized = copyWriteable(builder, namedWriteableRegistry(), ResolverQueryBuilder::new);
+        assertEquals(builder, deserialized);
+        assertArrayEquals(builder.weights(), deserialized.weights(), 1e-6f);
+    }
+
     public void testZScoreNormalizationParses() throws Exception {
         // POC v2 adaptive-fusion #1: z_score (DBSF-style) normalization + arithmetic_mean.
         String json = "{\"queries\":[{\"match\":{\"title\":\"a\"}},{\"match\":{\"body\":\"b\"}}],"

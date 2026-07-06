@@ -440,6 +440,33 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
         assertNotEquals(rrfIds, amIds);
     }
 
+    /**
+     * CLAIM (POC v2): WEIGHTED RRF — per-leg weights multiply each leg's reciprocal-rank contribution (mirrors ES 9.2).
+     * Same diverge index; legs title:apple (leg 0) + body:banana (leg 1). Unweighted RRF ranks both_mid #1 (present in
+     * both legs). Heavily weighting the BODY leg lifts strong_body (leg-1 rank-1, absent from leg 0) above both_mid,
+     * whose title contribution is now nearly zeroed — proving the weights actually bias the rank-based fusion.
+     */
+    @SneakyThrows
+    public void testResolver_weightedRrf_biasesTowardWeightedLeg() {
+        initDivergeIndexIfNeeded();
+        String legs = "\"queries\":[{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}]";
+        // Unweighted baseline: both_mid wins.
+        String plain = "{\"size\":10,\"query\":{\"resolver\":{"
+            + legs
+            + ",\"combination\":{\"technique\":\"rrf\",\"parameters\":{\"rank_constant\":60}}}}}";
+        // Body-heavy weights [title=0.01, body=10]: strong_body (body rank 1) should overtake both_mid.
+        String bodyHeavy = "{\"size\":10,\"query\":{\"resolver\":{"
+            + legs
+            + ",\"combination\":{\"technique\":\"rrf\",\"parameters\":{\"rank_constant\":60,\"weights\":[0.01,10.0]}}}}}";
+
+        List<String> plainIds = ids(searchNoPipeline(DIVERGE_INDEX, plain));
+        List<String> bodyHeavyIds = ids(searchNoPipeline(DIVERGE_INDEX, bodyHeavy));
+
+        assertEquals("unweighted RRF: both-legs doc wins", "both_mid", plainIds.get(0));
+        assertEquals("body-weighted RRF: the body-leg leader wins", "strong_body", bodyHeavyIds.get(0));
+        assertNotEquals("weights genuinely changed the RRF ranking", plainIds.get(0), bodyHeavyIds.get(0));
+    }
+
     @SneakyThrows
     private void initDivergeIndexIfNeeded() {
         if (indexExists(DIVERGE_INDEX)) {

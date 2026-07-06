@@ -39,7 +39,8 @@ import java.util.function.Supplier;
  *
  * <p>Supported fusion pairs:
  * <ul>
- *   <li><b>RRF</b> — {@code combination.technique = rrf} (rank-based; no normalization).</li>
+ *   <li><b>RRF</b> — {@code combination.technique = rrf} (rank-based; no normalization; optional per-leg
+ *       {@code weights} — v2, weighted RRF, mirrors ES 9.2).</li>
  *   <li><b>min_max + arithmetic mean</b> — {@code normalization.technique = min_max} +
  *       {@code combination.technique = arithmetic_mean} (score-based; optional per-leg weights).</li>
  *   <li><b>z_score + arithmetic mean</b> — {@code normalization.technique = z_score} +
@@ -103,7 +104,7 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
     private final String normalization;    // normalization technique: none | min_max
     private final int rankConstant;        // RRF only
     private final int rankWindowSize;
-    private final float[] weights;         // arithmetic_mean only; empty => unweighted
+    private final float[] weights;         // per-leg weights for arithmetic_mean AND rrf (v2); empty => unweighted
     private final String collection;       // candidate collection: coordinator | per_shard
     private final int candidateDepth;      // per-shard local top-K depth; CANDIDATE_DEPTH_UNSET => rankWindowSize
 

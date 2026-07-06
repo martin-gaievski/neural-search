@@ -458,7 +458,11 @@ public final class ResolverOrchestrator {
     }
 
     /**
-     * Rank-based Reciprocal Rank Fusion: score(d) = Σ 1 / (rank_constant + rank_i(d) + 1).
+     * Rank-based Reciprocal Rank Fusion: score(d) = Σ weight_i / (rank_constant + rank_i(d) + 1).
+     * <p>Per-leg {@code weights} (POC v2; mirrors ES 9.2 weighted RRF, {@code rrf_score = Σ weight_i × rrf_score_i})
+     * multiply each leg's reciprocal-rank contribution, so a trusted leg can be biased WITHOUT the score-scale
+     * fragility of score normalization — RRF stays rank-based (immune to leg-scale mismatch). Empty weights =>
+     * unweighted (all 1.0), identical to plain RRF.
      * <p>Note: RRF stays on the coordinator (global-top-K) collection path — {@code isPerShardCollection()} is
      * false for RRF — so each {@code legHits[legIndex]} is a single globally-merged, rank-ordered leg result and
      * the array index is the doc's rank. RRF is rank-based and already at hybrid parity, so it does not need the
@@ -466,13 +470,15 @@ public final class ResolverOrchestrator {
      */
     private static Map<String, Float> rrf(SearchHit[][] legHits, ResolverQueryBuilder resolver) {
         Map<String, Float> scores = new LinkedHashMap<>();
-        for (SearchHit[] hits : legHits) {
+        for (int legIndex = 0; legIndex < legHits.length; legIndex++) {
+            SearchHit[] hits = legHits[legIndex];
+            float weight = weightForLeg(resolver.weights(), legIndex);
             for (int rank = 0; rank < hits.length; rank++) {
                 String id = hits[rank].getId();
                 if (id == null) {
                     continue;
                 }
-                scores.merge(id, 1.0f / (resolver.rankConstant() + rank + 1), Float::sum);
+                scores.merge(id, weight / (resolver.rankConstant() + rank + 1), Float::sum);
             }
         }
         return scores;
