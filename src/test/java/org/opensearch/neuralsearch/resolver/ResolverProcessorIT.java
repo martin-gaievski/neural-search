@@ -382,6 +382,39 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     }
 
     /**
+     * CLAIM (POC v2): the resolver supports l2 normalization + arithmetic_mean (parity with the OpenSearch hybrid
+     * processor / ES l2_norm) — each leg normalized by its L2 norm (magnitude-preserving), pipeline-free. Happy path:
+     * the doc strongest in BOTH legs has the largest normalized components -> highest mean -> ranks first; the fused
+     * window is the union of the legs, self-erased into a standard descending-scored query.
+     */
+    @SneakyThrows
+    public void testResolver_l2ArithmeticMean_happyPath() {
+        initRescoreIndexIfNeeded();
+        String body = "{\"size\":10,\"query\":{\"resolver\":{"
+            + "\"queries\":[{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
+            + "\"rank_window_size\":100,"
+            + "\"normalization\":{\"technique\":\"l2\"},"
+            + "\"combination\":{\"technique\":\"arithmetic_mean\"}"
+            + "}}}";
+        Map<String, Object> response = searchNoPipeline(RESCORE_INDEX, body);
+        List<Map<String, Object>> hits = readHits(response);
+        List<String> ids = hits.stream().map(hit -> (String) hit.get("_id")).toList();
+
+        // d_rrf_leader is strongest in both legs -> largest L2-normalized components -> highest mean.
+        assertEquals("d_rrf_leader", ids.get(0));
+        assertTrue(ids.contains("d_phrase_winner")); // both legs, weaker
+        assertTrue(ids.contains("d_filler"));         // leg 1 only, still present
+
+        // Self-erased into a standard scored query -> scores are in descending order.
+        double previous = Double.MAX_VALUE;
+        for (Map<String, Object> hit : hits) {
+            double score = ((Number) hit.get("_score")).doubleValue();
+            assertTrue("l2 fused scores must be descending", score <= previous);
+            previous = score;
+        }
+    }
+
+    /**
      * CLAIM (POC v2): z_score also composes with per_shard collection on a multi-shard index — per-query distribution
      * normalization over the num_shards x depth union pool. Smoke test: returns the fused window, source-hydrated
      * (fast path), scores descending; proves the z_score path is reachable under per_shard without error.

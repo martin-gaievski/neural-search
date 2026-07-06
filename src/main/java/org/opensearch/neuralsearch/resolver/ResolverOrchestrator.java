@@ -444,13 +444,19 @@ public final class ResolverOrchestrator {
 
     /** Fuse the per-leg candidate hits ({@code legHits[legIndex]} = that leg's pool; for per-shard collection this
      *  is already the union across shards) into a ranked, truncated id/score list. RRF is rank-based; arithmetic_mean
-     *  is score-based and normalizes each leg first — by min_max (range) or z_score (distribution / DBSF-style). */
+     *  is score-based and normalizes each leg first — by min_max (range), z_score (distribution / DBSF-style), or
+     *  l2 (magnitude). */
     private static RankedDocs computeRankedDocs(SearchHit[][] legHits, ResolverQueryBuilder resolver) {
         Map<String, Float> combined;
         if (ResolverQueryBuilder.TECHNIQUE_ARITHMETIC_MEAN.equals(resolver.technique())) {
-            combined = ResolverQueryBuilder.NORMALIZATION_Z_SCORE.equals(resolver.normalization())
-                ? zScoreArithmeticMean(legHits, resolver)
-                : minMaxArithmeticMean(legHits, resolver);
+            String norm = resolver.normalization();
+            if (ResolverQueryBuilder.NORMALIZATION_Z_SCORE.equals(norm)) {
+                combined = zScoreArithmeticMean(legHits, resolver);
+            } else if (ResolverQueryBuilder.NORMALIZATION_L2.equals(norm)) {
+                combined = l2ArithmeticMean(legHits, resolver);
+            } else {
+                combined = minMaxArithmeticMean(legHits, resolver);
+            }
         } else {
             combined = rrf(legHits, resolver);
         }
@@ -596,6 +602,47 @@ public final class ResolverOrchestrator {
             return 0.001f; // floor: matched-at-or-below-lower-extreme != not-matched(0)
         }
         return normalized >= 1.0 ? 1.0f : (float) normalized;
+    }
+
+    /**
+     * POC v2 — L2 normalization + (weighted) arithmetic mean. Per leg, divide each raw {@code _score} by the leg's
+     * L2 norm {@code sqrt(Σ s_i^2)} over its returned scores, then combine as the weighted mean over ALL legs (a
+     * non-matched leg contributes 0). Same weighted-mean skeleton as {@link #minMaxArithmeticMean}/{@link #zScoreArithmeticMean}
+     * so weighting/denominator semantics match. Mirrors the OpenSearch hybrid processor's {@code L2ScoreNormalizationTechnique}
+     * (and ES {@code l2_norm}): magnitude-preserving (unlike range/rank normalizers), norm==0 leg → 0.
+     */
+    private static Map<String, Float> l2ArithmeticMean(SearchHit[][] legHits, ResolverQueryBuilder resolver) {
+        float totalWeight = 0.0f;
+        for (int legIndex = 0; legIndex < legHits.length; legIndex++) {
+            totalWeight += weightForLeg(resolver.weights(), legIndex);
+        }
+        Map<String, Float> weightedSum = new LinkedHashMap<>(); // id -> Σ weight_leg * normalized_leg
+        for (int legIndex = 0; legIndex < legHits.length; legIndex++) {
+            SearchHit[] hits = legHits[legIndex];
+            double sumSq = 0.0;
+            for (SearchHit hit : hits) {
+                sumSq += (double) hit.getScore() * hit.getScore();
+            }
+            float norm = (float) Math.sqrt(sumSq);
+            float weight = weightForLeg(resolver.weights(), legIndex);
+            for (SearchHit hit : hits) {
+                String id = hit.getId();
+                if (id == null) {
+                    continue;
+                }
+                weightedSum.merge(id, weight * normalizeL2(hit.getScore(), norm), Float::sum);
+            }
+        }
+        Map<String, Float> combined = new LinkedHashMap<>();
+        for (Map.Entry<String, Float> e : weightedSum.entrySet()) {
+            combined.put(e.getKey(), totalWeight == 0.0f ? 0.0f : e.getValue() / totalWeight);
+        }
+        return combined;
+    }
+
+    /** L2: score / ||scores||_2 for the leg. Zero norm (all-zero/empty leg) → 0, mirroring the hybrid processor. */
+    private static float normalizeL2(float score, float l2Norm) {
+        return l2Norm == 0.0f ? 0.0f : score / l2Norm;
     }
 
     private static float weightForLeg(float[] weights, int legIndex) {

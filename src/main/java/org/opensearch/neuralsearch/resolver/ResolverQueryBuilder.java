@@ -46,6 +46,9 @@ import java.util.function.Supplier;
  *   <li><b>z_score + arithmetic mean</b> — {@code normalization.technique = z_score} +
  *       {@code combination.technique = arithmetic_mean} (POC v2 adaptive-fusion #1; DBSF-style per-query
  *       distribution normalization — each leg normalized by its own returned-score mean/std).</li>
+ *   <li><b>l2 + arithmetic mean</b> — {@code normalization.technique = l2} +
+ *       {@code combination.technique = arithmetic_mean} (POC v2; magnitude-preserving L2 normalization,
+ *       parity with the OpenSearch hybrid processor and ES {@code l2_norm}).</li>
  * </ul>
  *
  * <p>REST shape (Option B — mirrors the hybrid normalization/combination model and ES retrievers):
@@ -77,6 +80,9 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
     // range-sensitive to a single outlier), z_score adapts to each query's per-leg score spread. Only meaningful
     // with the score-based arithmetic_mean combination (rank-based RRF ignores scores).
     public static final String NORMALIZATION_Z_SCORE = "z_score";
+    // l2 (POC v2, ES/OS-hybrid parity): normalize each leg by its L2 norm — s / sqrt(sum s_i^2) over the leg's
+    // returned scores. Magnitude-preserving (unlike min_max/rank). Only meaningful with arithmetic_mean.
+    public static final String NORMALIZATION_L2 = "l2";
     // Candidate-collection strategies (how the legs' results reach the coordinator for fusion)
     public static final String COLLECTION_COORDINATOR = "coordinator"; // each leg = one standalone search reduced to global top-K (default)
     public static final String COLLECTION_PER_SHARD = "per_shard";     // each leg collected per shard, fused over num_shards x depth
@@ -369,29 +375,32 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         }
         if (NORMALIZATION_NONE.equals(normalization) == false
             && NORMALIZATION_MIN_MAX.equals(normalization) == false
-            && NORMALIZATION_Z_SCORE.equals(normalization) == false) {
+            && NORMALIZATION_Z_SCORE.equals(normalization) == false
+            && NORMALIZATION_L2.equals(normalization) == false) {
             throw new IllegalArgumentException(
                 String.format(
                     Locale.ROOT,
-                    "[%s] POC supports normalization techniques [%s, %s, %s], got [%s]",
+                    "[%s] POC supports normalization techniques [%s, %s, %s, %s], got [%s]",
                     NAME,
                     NORMALIZATION_NONE,
                     NORMALIZATION_MIN_MAX,
                     NORMALIZATION_Z_SCORE,
+                    NORMALIZATION_L2,
                     normalization
                 )
             );
         }
-        // z_score normalizes by each leg's score distribution, so it is only meaningful with the score-based
-        // arithmetic_mean combination (rank-based RRF ignores scores). Reject the incoherent pairing rather than
-        // silently ignoring it. (Mirrors OpenSearch's "z_score supports only arithmetic_mean".)
-        if (NORMALIZATION_Z_SCORE.equals(normalization) && TECHNIQUE_ARITHMETIC_MEAN.equals(combination) == false) {
+        // z_score and l2 normalize by each leg's score distribution/magnitude, so they are only meaningful with the
+        // score-based arithmetic_mean combination (rank-based RRF ignores scores). Reject the incoherent pairing
+        // rather than silently ignoring it. (Mirrors OpenSearch's "z_score supports only arithmetic_mean".)
+        boolean scoreOnlyNorm = NORMALIZATION_Z_SCORE.equals(normalization) || NORMALIZATION_L2.equals(normalization);
+        if (scoreOnlyNorm && TECHNIQUE_ARITHMETIC_MEAN.equals(combination) == false) {
             throw new IllegalArgumentException(
                 String.format(
                     Locale.ROOT,
                     "[%s] normalization [%s] is only supported with combination technique [%s], got [%s]",
                     NAME,
-                    NORMALIZATION_Z_SCORE,
+                    normalization,
                     TECHNIQUE_ARITHMETIC_MEAN,
                     combination
                 )

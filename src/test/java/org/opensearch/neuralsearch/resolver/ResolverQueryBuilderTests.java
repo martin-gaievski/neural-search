@@ -290,6 +290,31 @@ public class ResolverQueryBuilderTests extends OpenSearchTestCase {
         assertEquals(ResolverQueryBuilder.NORMALIZATION_Z_SCORE, deserialized.normalization());
     }
 
+    public void testL2NormalizationParsesAndSerializes() throws Exception {
+        // POC v2: l2 normalization + arithmetic_mean (parity with OS hybrid processor / ES l2_norm).
+        String json = "{\"queries\":[{\"match\":{\"title\":\"a\"}},{\"match\":{\"body\":\"b\"}}],"
+            + "\"normalization\":{\"technique\":\"l2\"},\"combination\":{\"technique\":\"arithmetic_mean\"}}";
+        XContentParser parser = createParser(JsonXContent.jsonXContent, json);
+        parser.nextToken();
+        ResolverQueryBuilder builder = ResolverQueryBuilder.fromXContent(parser);
+        assertEquals(ResolverQueryBuilder.NORMALIZATION_L2, builder.normalization());
+        assertEquals(ResolverQueryBuilder.TECHNIQUE_ARITHMETIC_MEAN, builder.technique());
+        ResolverQueryBuilder deserialized = copyWriteable(builder, namedWriteableRegistry(), ResolverQueryBuilder::new);
+        assertEquals(builder, deserialized);
+        assertEquals(ResolverQueryBuilder.NORMALIZATION_L2, deserialized.normalization());
+    }
+
+    public void testL2NormalizationRejectedWithRrf() throws Exception {
+        // l2 normalizes by score magnitude, incoherent with rank-based RRF (which ignores scores).
+        String json = "{\"queries\":[{\"match\":{\"title\":\"a\"}},{\"match\":{\"body\":\"b\"}}],"
+            + "\"technique\":\"rrf\",\"normalization\":{\"technique\":\"l2\"}}";
+        XContentParser parser = createParser(JsonXContent.jsonXContent, json);
+        parser.nextToken();
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> ResolverQueryBuilder.fromXContent(parser));
+        assertTrue(e.getMessage().contains("l2"));
+        assertTrue(e.getMessage().contains(ResolverQueryBuilder.TECHNIQUE_ARITHMETIC_MEAN));
+    }
+
     public void testSerializationRoundTripWithPerShardFields() throws Exception {
         ResolverQueryBuilder original = new ResolverQueryBuilder(
             List.of(new MatchQueryBuilder("title", "a"), new MatchQueryBuilder("body", "b")),
