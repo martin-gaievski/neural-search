@@ -495,6 +495,28 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
                 )
             );
         }
+        // Nested resolver (a resolver used as a LEG of this resolver — fusion-of-fusion): the inner resolver's
+        // rank_window_size must be >= this (outer) one. The inner resolver self-erases to a RankDocsQuery that returns
+        // at most its own rank_window_size docs; if that is smaller than the outer window, the outer fusion is silently
+        // under-fed (it can never see more than the inner window from that leg). Enforce parent<=child, mirroring ES's
+        // CompoundRetrieverBuilder rank_window_size monotonicity check. Only direct-leg nesting is checked (deeper
+        // levels are validated when their own parse runs).
+        for (QueryBuilder leg : queries) {
+            if (leg instanceof ResolverQueryBuilder nested && nested.rankWindowSize() < rankWindowSize) {
+                throw new IllegalArgumentException(
+                    String.format(
+                        Locale.ROOT,
+                        "[%s] a nested %s leg's %s (%d) must be >= the enclosing %s (%d), else the outer fusion is under-fed",
+                        NAME,
+                        NAME,
+                        RANK_WINDOW_SIZE_FIELD,
+                        nested.rankWindowSize(),
+                        RANK_WINDOW_SIZE_FIELD,
+                        rankWindowSize
+                    )
+                );
+            }
+        }
     }
 
     @Override

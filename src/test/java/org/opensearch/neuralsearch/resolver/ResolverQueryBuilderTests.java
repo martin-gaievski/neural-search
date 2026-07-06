@@ -29,7 +29,19 @@ public class ResolverQueryBuilderTests extends OpenSearchTestCase {
 
     @Override
     protected NamedXContentRegistry xContentRegistry() {
-        return new NamedXContentRegistry(new SearchModule(Settings.EMPTY, List.of()).getNamedXContents());
+        // SearchModule defaults (match/term/etc.) PLUS the resolver entry, so a nested resolver leg
+        // ({"resolver": {...}} inside a resolver's queries[]) parses in unit tests too.
+        java.util.List<NamedXContentRegistry.Entry> entries = new java.util.ArrayList<>(
+            new SearchModule(Settings.EMPTY, List.of()).getNamedXContents()
+        );
+        entries.add(
+            new NamedXContentRegistry.Entry(
+                QueryBuilder.class,
+                new org.opensearch.core.ParseField(ResolverQueryBuilder.NAME),
+                ResolverQueryBuilder::fromXContent
+            )
+        );
+        return new NamedXContentRegistry(entries);
     }
 
     private NamedWriteableRegistry namedWriteableRegistry() {
@@ -312,6 +324,35 @@ public class ResolverQueryBuilderTests extends OpenSearchTestCase {
         parser.nextToken();
         ResolverQueryBuilder builder = ResolverQueryBuilder.fromXContent(parser);
         assertArrayEquals(new float[] { 5.0f, 1.5f }, builder.weights(), 1e-6f);
+    }
+
+    public void testNestedResolverRejectsSmallerInnerWindow() throws Exception {
+        // Fusion-of-fusion: an inner resolver leg with a SMALLER rank_window_size than the outer under-feeds the outer
+        // fusion (the inner RankDocsQuery returns at most its own window). Reject it (ES-style parent<=child).
+        String json = "{\"queries\":["
+            + "{\"match\":{\"title\":\"a\"}},"
+            + "{\"resolver\":{\"queries\":[{\"match\":{\"title\":\"g\"}},{\"match\":{\"body\":\"y\"}}],"
+            + "\"combination\":{\"technique\":\"rrf\"},\"rank_window_size\":10}}"
+            + "],\"combination\":{\"technique\":\"rrf\"},\"rank_window_size\":100}";
+        XContentParser parser = createParser(JsonXContent.jsonXContent, json);
+        parser.nextToken();
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> ResolverQueryBuilder.fromXContent(parser));
+        assertTrue(e.getMessage().contains("nested"));
+        assertTrue(e.getMessage().contains("rank_window_size"));
+    }
+
+    public void testNestedResolverAcceptsEqualOrLargerInnerWindow() throws Exception {
+        // Inner window >= outer window is fine (the inner leg can feed the whole outer window).
+        String json = "{\"queries\":["
+            + "{\"match\":{\"title\":\"a\"}},"
+            + "{\"resolver\":{\"queries\":[{\"match\":{\"title\":\"g\"}},{\"match\":{\"body\":\"y\"}}],"
+            + "\"combination\":{\"technique\":\"rrf\"},\"rank_window_size\":100}}"
+            + "],\"combination\":{\"technique\":\"rrf\"},\"rank_window_size\":100}";
+        XContentParser parser = createParser(JsonXContent.jsonXContent, json);
+        parser.nextToken();
+        ResolverQueryBuilder builder = ResolverQueryBuilder.fromXContent(parser);
+        assertEquals(2, builder.queries().size());
+        assertTrue("inner leg is itself a resolver", builder.queries().get(1) instanceof ResolverQueryBuilder);
     }
 
     public void testZScoreNormalizationParses() throws Exception {

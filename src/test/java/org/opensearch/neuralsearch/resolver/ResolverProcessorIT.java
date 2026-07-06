@@ -737,6 +737,33 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
         }
     }
 
+    /**
+     * CLAIM (POC v2): a resolver used as a LEG of another resolver (fusion-of-fusion) genuinely executes and fuses —
+     * the inner resolver self-erases in its own leg sub-search (its own coordinator rewrite round). Decisive setup on
+     * the rankdocs index (r1 title=apple/body=banana; r2 title="apple pie"/content="cooking notes"; r3
+     * body="banana split"; r4 neither):
+     *   outer = RRF( leg1 = match title:apple  [matches r1, r2],
+     *                leg2 = INNER resolver RRF( match body:banana [r1, r3], match content:cooking [r2] ) )
+     * The inner resolver's fused union is {r1, r3, r2}; so the outer union is {r1, r2, r3}. Crucially **r3 can only
+     * appear if the inner resolver actually fused body:banana** — leg1 (title:apple) never matches r3. r3 in the
+     * result set therefore proves the nested resolver executed, not a degenerate fallback. (Inner rank_window_size >=
+     * outer, per the parent<=child validation.)
+     */
+    @SneakyThrows
+    public void testResolver_nestedAsLeg_fusionOfFusion_innerActuallyFuses() {
+        initRankDocsIndexIfNeeded();
+        String body = "{\"size\":10,\"track_total_hits\":false,\"query\":{\"resolver\":{\"queries\":["
+            + "{\"match\":{\"title\":\"apple\"}},"
+            + "{\"resolver\":{\"queries\":[{\"match\":{\"body\":\"banana\"}},{\"match\":{\"content\":\"cooking\"}}],"
+            + "\"combination\":{\"technique\":\"rrf\",\"parameters\":{\"rank_constant\":60}},\"rank_window_size\":100}}"
+            + "],\"combination\":{\"technique\":\"rrf\",\"parameters\":{\"rank_constant\":60}},\"rank_window_size\":100}}}";
+        java.util.Set<String> ids = new HashSet<>(ids(searchNoPipeline(RANKDOCS_INDEX, body)));
+        // Union across the outer legs: leg1 {r1,r2} ∪ inner-fused {r1,r3,r2} = {r1,r2,r3}; r4 matches nothing.
+        assertEquals("fusion-of-fusion returns the union of both legs (inner leg genuinely fused)", Set.of("r1", "r2", "r3"), ids);
+        assertTrue("r3 appears ONLY via the inner resolver fusing body:banana — proves the nested resolver executed", ids.contains("r3"));
+        assertFalse(ids.contains("r4"));
+    }
+
     @SneakyThrows
     private void initRankDocsIndexIfNeeded() {
         if (indexExists(RANKDOCS_INDEX)) {
