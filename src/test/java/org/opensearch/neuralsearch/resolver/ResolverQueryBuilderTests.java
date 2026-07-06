@@ -76,6 +76,44 @@ public class ResolverQueryBuilderTests extends OpenSearchTestCase {
         );
     }
 
+    /**
+     * sort, search_after, from-beyond-window, and profile each require the standard (stage-B) path — the fabricated
+     * fast-path response cannot honor them — so each must disqualify the fast path. (min_score does NOT, per C1.)
+     */
+    public void testFastPathEligible_standardPathFeaturesDisqualify() {
+        ResolverQueryBuilder r = new ResolverQueryBuilder(
+            List.of(new MatchQueryBuilder("title", "a"), new MatchQueryBuilder("body", "b")),
+            ResolverQueryBuilder.TECHNIQUE_ARITHMETIC_MEAN,
+            ResolverQueryBuilder.NORMALIZATION_MIN_MAX,
+            ResolverQueryBuilder.DEFAULT_RANK_CONSTANT,
+            100,
+            new float[0]
+        );
+        assertFalse(
+            "a top-level sort must take the standard path (fabricated response cannot sort the fused set)",
+            ResolverOrchestrator.fastPathEligible(new SearchSourceBuilder().size(10).trackTotalHits(false).sort("price"), r)
+        );
+        assertFalse(
+            "search_after must take the standard path",
+            ResolverOrchestrator.fastPathEligible(
+                new SearchSourceBuilder().size(10).trackTotalHits(false).searchAfter(new Object[] { 50 }),
+                r
+            )
+        );
+        assertFalse(
+            "profile must take the standard path (no profile tree can be fabricated)",
+            ResolverOrchestrator.fastPathEligible(new SearchSourceBuilder().size(10).trackTotalHits(false).profile(true), r)
+        );
+        assertFalse(
+            "a page extending beyond the fused window (from+size > rank_window_size) cannot be served from the window",
+            ResolverOrchestrator.fastPathEligible(new SearchSourceBuilder().from(95).size(10).trackTotalHits(false), r)
+        );
+        assertTrue(
+            "min_score is NOT a disqualifier (C1) — a threshold on the fused score the fast path already holds",
+            ResolverOrchestrator.fastPathEligible(new SearchSourceBuilder().size(10).trackTotalHits(false).minScore(0.5f), r)
+        );
+    }
+
     private ResolverQueryBuilder sampleBuilder() {
         return new ResolverQueryBuilder(
             List.of(new MatchQueryBuilder("title", "neural search"), new MatchQueryBuilder("body", "vector fusion")),

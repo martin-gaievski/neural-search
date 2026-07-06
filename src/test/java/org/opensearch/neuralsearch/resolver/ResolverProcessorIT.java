@@ -46,6 +46,8 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     private static final String DIVERGE_INDEX = "resolver-poc-diverge-index";
     private static final String PERSHARD_INDEX = "resolver-poc-pershard-index";
     private static final String PERSHARD_PIPELINE = "resolver-poc-mmam-pipeline";
+    private static final String FEATURE_INDEX = "resolver-poc-feature-index";
+    private static final String FEATURE_RERANK_PIPELINE = "resolver-poc-byfield-rerank-pipeline";
 
     @SneakyThrows
     public void testResolverRrf_whenDocMatchesBothLegs_thenRanksFirst() {
@@ -1330,5 +1332,114 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
         ingestDocument(PERSHARD_INDEX, "{\"title\":\"cherry\",\"body\":\"banana banana banana banana\"}", "b2");
         // wb: matches BOTH legs but weakly (TF 1 each) -> outside each leg's global top-2, inside each shard's pool.
         ingestDocument(PERSHARD_INDEX, "{\"title\":\"apple\",\"body\":\"banana\"}", "wb");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Standard-search-feature coverage on a resolver: from/pagination, sort, search_after, profile,
+    // and search-response-processor (by_field rerank) composition. Every one of these forces the
+    // STANDARD path (the resolver self-erases into a RankDocsQuery and a real query phase runs), so
+    // core evaluates the feature over the FUSED set exactly as it would for any scored query. The
+    // FEATURE_INDEX is single-shard for a deterministic fused order. RRF legs = title:apple +
+    // body:banana. Fused order (RRF): f1, f2, f4, f3 (f5 matches neither leg). Prices: f1=50, f2=30,
+    // f3=90, f4=40 — deliberately NOT correlated with the fused rank, so a price sort/rerank reorders
+    // the set observably.
+    // ---------------------------------------------------------------------------------------------
+
+    /** CLAIM: from/size paging walks the fused ranking (page 2 of the fused list, not a re-fused page). */
+    @SneakyThrows
+    public void testResolver_fromPagination_walksFusedRanking() {
+        initFeatureIndexIfNeeded();
+        // Fused order is f1,f2,f4,f3; from=2 size=2 -> the third and fourth fused docs.
+        String body = "{\"from\":2,\"size\":2,\"query\":{" + featureResolver() + "}}";
+        Map<String, Object> response = searchRaw(FEATURE_INDEX, body);
+        assertEquals(4, totalHits(response)); // full fused set size, independent of the page window
+        assertEquals(List.of("f4", "f3"), ids(response));
+    }
+
+    /** CLAIM: a top-level sort orders the WHOLE fused match set by the field (not by fused score). */
+    @SneakyThrows
+    public void testResolver_sortByField_ordersFullFusedSet() {
+        initFeatureIndexIfNeeded();
+        String body = "{\"size\":10,\"sort\":[{\"price\":\"desc\"}],\"query\":{" + featureResolver() + "}}";
+        Map<String, Object> response = searchRaw(FEATURE_INDEX, body);
+        assertEquals(4, totalHits(response));
+        // Price desc over the fused set {f1:50,f2:30,f3:90,f4:40} -> f3,f1,f4,f2. f5 (no leg match) absent.
+        assertEquals(List.of("f3", "f1", "f4", "f2"), ids(response));
+    }
+
+    /** CLAIM: search_after paginates a sorted resolver by the sort key (deep paging without from). */
+    @SneakyThrows
+    public void testResolver_searchAfter_paginatesSortedFusedSet() {
+        initFeatureIndexIfNeeded();
+        // Sort price desc, resume after price=50 -> only docs with price<50 remain: f4:40, f2:30.
+        String body = "{\"size\":10,\"sort\":[{\"price\":\"desc\"}],\"search_after\":[50],\"query\":{" + featureResolver() + "}}";
+        Map<String, Object> response = searchRaw(FEATURE_INDEX, body);
+        assertEquals(List.of("f4", "f2"), ids(response));
+    }
+
+    /** CLAIM: profile forces the standard path and returns a real profile tree over the executed query. */
+    @SneakyThrows
+    public void testResolver_profile_forcesStandardPathAndReturnsProfileTree() {
+        initFeatureIndexIfNeeded();
+        String body = "{\"size\":3,\"profile\":true,\"query\":{" + featureResolver() + "}}";
+        Map<String, Object> response = searchRaw(FEATURE_INDEX, body);
+        assertEquals(List.of("f1", "f2", "f4"), ids(response)); // fused order preserved
+        @SuppressWarnings("unchecked")
+        Map<String, Object> profile = (Map<String, Object>) response.get("profile");
+        assertNotNull("profile section must be present (fast path cannot carry it)", profile);
+        @SuppressWarnings("unchecked")
+        List<Object> shards = (List<Object>) profile.get("shards");
+        assertFalse("profile must contain per-shard query timings", shards.isEmpty());
+    }
+
+    /** CLAIM: a search-response processor (by_field rerank) composes with the resolver and reorders the fused set. */
+    @SneakyThrows
+    public void testResolver_byFieldRerankProcessor_reordersFusedSet() {
+        initFeatureIndexIfNeeded();
+        createByFieldRerankPipelineIfNeeded();
+        String body = "{\"size\":10,\"query\":{" + featureResolver() + "}}";
+        Map<String, Object> response = searchWithPipeline(FEATURE_INDEX, body, FEATURE_RERANK_PIPELINE);
+        // by_field rerank sorts the fused hits by 'price' desc -> f3:90,f1:50,f4:40,f2:30.
+        assertEquals(List.of("f3", "f1", "f4", "f2"), ids(response));
+    }
+
+    private String featureResolver() {
+        return "\"resolver\":{\"queries\":[{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
+            + "\"technique\":\"rrf\",\"rank_constant\":60,\"rank_window_size\":100}";
+    }
+
+    @SneakyThrows
+    private void createByFieldRerankPipelineIfNeeded() {
+        String pipeline = "{\"response_processors\":[{\"rerank\":{\"by_field\":"
+            + "{\"target_field\":\"price\",\"remove_target_field\":false}}}]}";
+        makeRequest(
+            client(),
+            "PUT",
+            "/_search/pipeline/" + FEATURE_RERANK_PIPELINE,
+            Map.of(),
+            toHttpEntity(pipeline),
+            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+        );
+    }
+
+    @SneakyThrows
+    private void initFeatureIndexIfNeeded() {
+        if (indexExists(FEATURE_INDEX)) {
+            return;
+        }
+        // Single shard so the fused RRF order is deterministic.
+        String mapping = "{"
+            + "\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}},"
+            + "\"mappings\":{\"properties\":{"
+            + "\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"},\"price\":{\"type\":\"integer\"}}}"
+            + "}";
+        createIndex(FEATURE_INDEX, mapping);
+        // f1 matches both legs strongly -> RRF #1. f2 leg1-heavy; f4 leg2-only; f3 weak-both; f5 neither.
+        // price is intentionally uncorrelated with fused rank so sort/rerank reorder observably.
+        ingestDocument(FEATURE_INDEX, "{\"title\":\"apple apple apple\",\"body\":\"banana banana banana\",\"price\":50}", "f1");
+        ingestDocument(FEATURE_INDEX, "{\"title\":\"apple apple\",\"body\":\"grape\",\"price\":30}", "f2");
+        ingestDocument(FEATURE_INDEX, "{\"title\":\"apple\",\"body\":\"grape\",\"price\":90}", "f3");
+        ingestDocument(FEATURE_INDEX, "{\"title\":\"cherry\",\"body\":\"banana banana\",\"price\":40}", "f4");
+        ingestDocument(FEATURE_INDEX, "{\"title\":\"durian\",\"body\":\"kiwi\",\"price\":10}", "f5");
     }
 }
