@@ -26,7 +26,8 @@ import java.util.function.Supplier;
  * {@link ResolverQueryBuilder#doRewrite} (the {@code registerAsyncAction} self-erase); this filter is intentionally
  * NOT a general request interceptor. It fires ONLY when a search's top-level query is a {@link ResolverQueryBuilder}
  * AND the request is {@link ResolverOrchestrator#fastPathEligible fast-path eligible} (plain top-K, no
- * aggs/explain/highlight/sort/collapse/rescore/post_filter/search_after/min_score and no accurate-totals-beyond-window).
+ * aggs/explain/highlight/sort/collapse/rescore/post_filter/search_after and no accurate-totals-beyond-window;
+ * {@code min_score} IS supported — applied as a post-fusion threshold in the fabricated response, C1).
  * In that case it fires the legs with {@code _source} enabled and <b>fabricates the {@link SearchResponse} directly
  * from the fused window</b> — {@code listener.onResponse(...)} with NO {@code chain.proceed}, so the stage-B distributed
  * query phase is skipped (the below-hybrid-latency win). Skipping stage B requires sitting at the request/response

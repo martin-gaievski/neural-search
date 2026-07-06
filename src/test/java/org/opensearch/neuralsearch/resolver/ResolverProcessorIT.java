@@ -658,6 +658,42 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     }
 
     /**
+     * CLAIM (POC v2, C1): {@code min_score} is applied as a clean post-fusion threshold ON THE FAST PATH — the request
+     * keeps the stage-B-free fast path (hits carry _source) instead of falling back. min_max+AM on the rankdocs index:
+     * r1 (both legs) scores highest, r2/r3 (single leg) lower. A threshold between them keeps only r1; every returned
+     * hit is >= min_score, carries _source (proving the fast path ran), and total_hits reflects the filtered count.
+     */
+    @SneakyThrows
+    public void testFastPath_minScore_filtersFusedWindow() {
+        initRankDocsIndexIfNeeded();
+        String base = "\"track_total_hits\":false,\"query\":{\"resolver\":{"
+            + "\"queries\":[{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
+            + "\"rank_window_size\":100,\"normalization\":{\"technique\":\"min_max\"},"
+            + "\"combination\":{\"technique\":\"arithmetic_mean\"}}}";
+
+        // Baseline (no min_score): the full fused union {r1,r2,r3}; capture the #1 and #2 scores.
+        List<Map<String, Object>> baseHits = readHits(searchNoPipeline(RANKDOCS_INDEX, "{\"size\":10," + base + "}"));
+        assertEquals("baseline fuses the 3 leg matches", 3, baseHits.size());
+        double topScore = ((Number) baseHits.get(0).get("_score")).doubleValue();
+        double secondScore = ((Number) baseHits.get(1).get("_score")).doubleValue();
+        assertTrue("need a score gap to place a threshold between rank 1 and 2", topScore > secondScore);
+        double threshold = (topScore + secondScore) / 2.0;
+
+        // With min_score between rank 1 and rank 2: only the top doc survives, ON the fast path.
+        String withMin = "{\"size\":10,\"min_score\":" + threshold + "," + base + "}";
+        Map<String, Object> response = searchNoPipeline(RANKDOCS_INDEX, withMin);
+        List<Map<String, Object>> hits = readHits(response);
+
+        assertEquals("min_score keeps only the above-threshold fused docs", 1, hits.size());
+        assertEquals("r1", hits.get(0).get("_id"));
+        assertNotNull("fast-path hit must carry _source (proves min_score stayed on the fast path)", hits.get(0).get("_source"));
+        for (Map<String, Object> hit : hits) {
+            assertTrue("every returned hit must be >= min_score", ((Number) hit.get("_score")).doubleValue() >= threshold);
+        }
+        assertEquals("total_hits reflects the post-threshold count", 1, totalHits(response));
+    }
+
+    /**
      * CLAIM: the fast path also works with PER-SHARD collection on a multi-shard index — the per-shard leg
      * sub-searches hydrate {@code _source}, so the fabricated window carries source (regression guard: per-shard
      * leg builds must honor the fetchSource flag, not just the coordinator legs).

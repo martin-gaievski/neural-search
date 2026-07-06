@@ -287,14 +287,16 @@ public final class ResolverOrchestrator {
             || Boolean.TRUE.equals(source.seqNoAndPrimaryTerm())) {
             return false;
         }
+        // min_score (C1): NOT a disqualifier. It is a pure threshold on the FUSED score, which the fast path has in
+        // hand — fabricateFastPathResponse filters the fused window by it (no real collection needed). ES applies
+        // min_score the same way (after fusion). So min_score requests keep the fast-path latency win.
         boolean hasSort = source.sorts() != null && source.sorts().isEmpty() == false;
         boolean hasRescore = source.rescores() != null && source.rescores().isEmpty() == false;
         return hasSort == false
             && hasRescore == false
             && source.collapse() == null
             && source.postFilter() == null
-            && source.searchAfter() == null
-            && source.minScore() == null;
+            && source.searchAfter() == null;
     }
 
     /**
@@ -303,6 +305,10 @@ public final class ResolverOrchestrator {
      * doc's already-fetched hit, override its {@code _score} with the fused score, sort by score desc, page to
      * {@code [from, from+size)}, and attach a leg-union {@code total_hits}. {@code template} is any of the leg
      * responses, used only to copy shard-count / took / clusters envelope fields.
+     *
+     * <p>{@code min_score} (C1): applied as a threshold on the fused score. Because the ranked ids are score-desc,
+     * the passing docs are a prefix, so total_hits is the count of window docs at or above the threshold (EXACT when
+     * the threshold cuts inside the window; the ordinary leg-union total is only used when NO threshold is set).
      */
     public static SearchResponse fabricateFastPathResponse(
         SearchRequest request,
@@ -328,11 +334,21 @@ public final class ResolverOrchestrator {
             }
         }
 
+        Float minScore = source.minScore();
         int from = Math.max(0, source.from());
         int size = source.size() < 0 ? 10 : source.size();
+        // Count fused docs at/above min_score (a score-desc prefix). This is the fabricated response's total_hits when
+        // a threshold is set — every doc it counts is inside the fused window, so it's exact within the window.
+        int passing = 0;
+        for (int rank = 0; rank < ranked.ids.length; rank++) {
+            if (minScore != null && ranked.scores[rank] < minScore) {
+                break; // score-desc: the first sub-threshold doc ends the passing prefix
+            }
+            passing++;
+        }
         List<SearchHit> page = new ArrayList<>();
         float maxScore = Float.NaN;
-        for (int rank = from; rank < ranked.ids.length && page.size() < size; rank++) {
+        for (int rank = from; rank < passing && page.size() < size; rank++) {
             SearchHit hit = hitById.get(ranked.ids[rank]);
             if (hit == null) {
                 continue; // fused id whose hit wasn't hydrated (shouldn't happen with fetchSource legs) — skip
@@ -344,10 +360,16 @@ public final class ResolverOrchestrator {
             page.add(hit);
         }
 
-        // total_hits: exact/capped leg-union when derivable, else the size of the fused id set (a lower bound).
-        TotalHits total = legUnionTotalHits(items);
-        if (total == null) {
-            total = new TotalHits(ranked.ids.length, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+        // total_hits: with min_score, the count of window docs passing the threshold (exact within the window). Without
+        // it, exact/capped leg-union when derivable, else the size of the fused id set (a lower bound).
+        TotalHits total;
+        if (minScore != null) {
+            total = new TotalHits(passing, TotalHits.Relation.EQUAL_TO);
+        } else {
+            total = legUnionTotalHits(items);
+            if (total == null) {
+                total = new TotalHits(ranked.ids.length, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+            }
         }
 
         SearchHits searchHits = new SearchHits(page.toArray(new SearchHit[0]), total, maxScore);
