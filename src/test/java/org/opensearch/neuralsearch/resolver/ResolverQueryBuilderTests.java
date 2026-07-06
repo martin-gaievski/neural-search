@@ -36,6 +36,34 @@ public class ResolverQueryBuilderTests extends OpenSearchTestCase {
         return new NamedWriteableRegistry(new SearchModule(Settings.EMPTY, List.of()).getNamedWriteables());
     }
 
+    /** fast path eligibility for the totals gate: track_total_hits:false is eligible; the DEFAULT (accurate totals
+     *  beyond the window) is NOT — the fast path fires legs at size=rank_window_size so it cannot faithfully
+     *  reconstruct an index-wide total larger than the window; that request must take the standard (Tail) path.
+     *  (See ResolverOrchestrator.fastPathEligible: the widening to the default shape is a documented follow-up that
+     *  needs a leg-side accurate count independent of the retrieved window size.) */
+    public void testFastPathEligible_totalsGate() {
+        ResolverQueryBuilder r = new ResolverQueryBuilder(
+            List.of(new MatchQueryBuilder("title", "a"), new MatchQueryBuilder("body", "b")),
+            ResolverQueryBuilder.TECHNIQUE_ARITHMETIC_MEAN,
+            ResolverQueryBuilder.NORMALIZATION_MIN_MAX,
+            ResolverQueryBuilder.DEFAULT_RANK_CONSTANT,
+            100,
+            new float[0]
+        );
+        assertTrue(
+            "track_total_hits:false + plain top-K is fast-path eligible",
+            ResolverOrchestrator.fastPathEligible(new SearchSourceBuilder().size(10).trackTotalHits(false), r)
+        );
+        assertFalse(
+            "default (accurate totals beyond the window) is NOT fast-path eligible — must take the Tail path",
+            ResolverOrchestrator.fastPathEligible(new SearchSourceBuilder().size(10), r)
+        );
+        assertTrue(
+            "a finite track_total_hits cap within the window is fast-path eligible",
+            ResolverOrchestrator.fastPathEligible(new SearchSourceBuilder().size(10).trackTotalHitsUpTo(10), r)
+        );
+    }
+
     private ResolverQueryBuilder sampleBuilder() {
         return new ResolverQueryBuilder(
             List.of(new MatchQueryBuilder("title", "neural search"), new MatchQueryBuilder("body", "vector fusion")),

@@ -643,6 +643,27 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
     }
 
     /**
+     * CLAIM: the DEFAULT query shape — NO {@code track_total_hits} — returns correct results and an accurate total.
+     * With default (accurate) track_total_hits, this takes the standard RankDocsQuery + Tail path (the fast path is
+     * gated off accurate-totals-beyond-window, since it fires legs at size=rank_window_size and cannot faithfully
+     * count beyond the window). End-to-end guard that the common default shape fuses correctly and reports the exact
+     * leg-union total.
+     */
+    @SneakyThrows
+    public void testResolver_defaultTrackTotalHits_correctResultAndTotal() {
+        initRankDocsIndexIfNeeded();
+        String body = "{\"size\":10,\"query\":{\"resolver\":{"
+            + "\"queries\":[{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
+            + "\"rank_window_size\":100,\"normalization\":{\"technique\":\"min_max\"},"
+            + "\"combination\":{\"technique\":\"arithmetic_mean\"}}}}";
+        Map<String, Object> response = searchNoPipeline(RANKDOCS_INDEX, body);
+        List<Map<String, Object>> hits = readHits(response);
+        assertEquals("fused union of the 3 leg matches", 3, hits.size());
+        assertEquals("accurate total over all leg matches", 3, totalHits(response));
+        assertEquals("r1", hits.get(0).get("_id")); // both-legs doc ranks first
+    }
+
+    /**
      * CLAIM: the fast path is GATED OFF when a {@code suggest} section is present (a fabricated response would drop
      * it). The request takes the standard path and the suggest section is returned alongside the fused hits.
      */

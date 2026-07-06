@@ -266,9 +266,16 @@ public final class ResolverOrchestrator {
         if (from + size > resolver.rankWindowSize()) {
             return false; // page extends beyond the fused window — the window cannot serve it
         }
-        // Accurate total_hits BEYOND the fused window cannot be reconstructed from a window-sized fabricated response
-        // (the legs retrieve only rankWindowSize hits, so a leg with more matches than the window would undercount);
-        // that case needs the Tail / leg-union path. Only serve the fast path when totals need not exceed the window.
+        // Accurate total_hits BEYOND the fused window cannot be faithfully reconstructed from a window-sized fabricated
+        // response. The fast path fires the coordinator legs at size=rank_window_size, so a leg with more matches than
+        // the window is only PARTIALLY retrieved; legUnionTotalHits then lands in its "middle band" (uncapped +
+        // partially retrieved) and can only return a LOOSE GTE(fused-size), which differs from the standard-path Tail's
+        // EXACT count. Silently serving the fast path there would DEGRADE total_hits precision for a request that asked
+        // for it (default/accurate track_total_hits) — so keep the window gate on BOTH plans: the fast path serves only
+        // when totals need not exceed the window (track_total_hits:false, or a finite cap <= the fused window). NOTE:
+        // widening this to the default shape needs a leg-side accurate count that is independent of the retrieved
+        // window size (or an ActionFilter-level fall-back to stage B when the middle band is hit) — a real follow-up,
+        // not a safe pure-eligibility change (a small-window accurate-totals request would otherwise undercount).
         if (wantsTotalsBeyondWindow(source, size)) {
             return false;
         }
@@ -346,25 +353,32 @@ public final class ResolverOrchestrator {
             }
             passing++;
         }
+        // max_score is the global top fused score (ranked is score-desc), independent of the page window — matches how
+        // core/hybrid report max_score on later (from>0) pages. NaN only when nothing passed.
+        float maxScore = passing > 0 ? ranked.scores[0] : Float.NaN;
         List<SearchHit> page = new ArrayList<>();
-        float maxScore = Float.NaN;
         for (int rank = from; rank < passing && page.size() < size; rank++) {
             SearchHit hit = hitById.get(ranked.ids[rank]);
             if (hit == null) {
                 continue; // fused id whose hit wasn't hydrated (shouldn't happen with fetchSource legs) — skip
             }
             hit.score(ranked.scores[rank]);
-            if (Float.isNaN(maxScore)) {
-                maxScore = ranked.scores[rank];
-            }
             page.add(hit);
         }
 
-        // total_hits: with min_score, the count of window docs passing the threshold (exact within the window). Without
-        // it, exact/capped leg-union when derivable, else the size of the fused id set (a lower bound).
+        // total_hits (all branches are correctly-relational — never an overclaim):
+        // - min_score: count of window docs >= threshold. EXACT (EQUAL_TO) only when the threshold cut INSIDE the
+        // fused set (passing < fused size, so every above-threshold doc is captured); when the whole fused set
+        // passed AND was truncated to the window (passing == ranked.ids.length), above-threshold docs may exist
+        // beyond the window -> GTE, not EQUAL_TO (fixes the C1 overclaim).
+        // - no min_score: legUnionTotalHits derives GTE (a leg capped) or EXACT (all matches retrieved) from the
+        // legs' own totals; null (uncapped middle band) falls back to the fused-set size as a GTE lower bound.
         TotalHits total;
         if (minScore != null) {
-            total = new TotalHits(passing, TotalHits.Relation.EQUAL_TO);
+            TotalHits.Relation rel = passing < ranked.ids.length
+                ? TotalHits.Relation.EQUAL_TO
+                : TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO;
+            total = new TotalHits(passing, rel);
         } else {
             total = legUnionTotalHits(items);
             if (total == null) {
