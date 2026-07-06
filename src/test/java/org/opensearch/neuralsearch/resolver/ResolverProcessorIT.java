@@ -764,6 +764,138 @@ public class ResolverProcessorIT extends BaseNeuralSearchIT {
         assertFalse(ids.contains("r4"));
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Collapse + inner_hits with the resolver. Collapse forces the standard (stage-B) path (it is excluded from the
+    // fast path), so the resolver self-erases into a RankDocsQuery and collapse is evaluated by core over that standard
+    // query at the fetch phase — so top-level collapse (with or without inner_hits) works. Leg-level inner_hits do NOT
+    // survive (the leg becomes a constant_score(_id) Top clause) and are rejected at parse time.
+    // ---------------------------------------------------------------------------------------------
+
+    private static final String COLLAPSE_INDEX = "resolver-poc-collapse-index";
+
+    @SneakyThrows
+    private void initCollapseIndexIfNeeded() {
+        if (indexExists(COLLAPSE_INDEX)) {
+            return;
+        }
+        // Single shard for deterministic collapse; `group` keyword to collapse on, `passages` nested for the reject IT.
+        String mapping = "{"
+            + "\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}},"
+            + "\"mappings\":{\"properties\":{"
+            + "\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"},\"group\":{\"type\":\"keyword\"},"
+            + "\"passages\":{\"type\":\"nested\",\"properties\":{\"text\":{\"type\":\"text\"}}}}}"
+            + "}";
+        createIndex(COLLAPSE_INDEX, mapping);
+        // g1: c1 (both legs), c2 (title only); g2: c3 (body only), c4 (neither leg).
+        ingestDocument(
+            COLLAPSE_INDEX,
+            "{\"title\":\"apple\",\"body\":\"banana\",\"group\":\"g1\",\"passages\":[{\"text\":\"apple orchard\"}]}",
+            "c1"
+        );
+        ingestDocument(
+            COLLAPSE_INDEX,
+            "{\"title\":\"apple pie\",\"body\":\"grape\",\"group\":\"g1\",\"passages\":[{\"text\":\"apple tart\"}]}",
+            "c2"
+        );
+        ingestDocument(
+            COLLAPSE_INDEX,
+            "{\"title\":\"cherry\",\"body\":\"banana split\",\"group\":\"g2\",\"passages\":[{\"text\":\"banana milk\"}]}",
+            "c3"
+        );
+        ingestDocument(
+            COLLAPSE_INDEX,
+            "{\"title\":\"durian\",\"body\":\"kiwi\",\"group\":\"g2\",\"passages\":[{\"text\":\"kiwi juice\"}]}",
+            "c4"
+        );
+    }
+
+    private String collapseResolverFragment() {
+        return "\"resolver\":{\"queries\":[{\"match\":{\"title\":\"apple\"}},{\"match\":{\"body\":\"banana\"}}],"
+            + "\"combination\":{\"technique\":\"rrf\",\"parameters\":{\"rank_constant\":60}},\"rank_window_size\":100}";
+    }
+
+    @SuppressWarnings("unchecked")
+    private String groupOf(final Map<String, Object> hit) {
+        Object f = hit.get("fields");
+        if (f instanceof Map) {
+            Object g = ((Map<String, Object>) f).get("group");
+            if (g instanceof List && ((List<?>) g).isEmpty() == false) {
+                return String.valueOf(((List<?>) g).get(0));
+            }
+        }
+        return null;
+    }
+
+    /**
+     * CLAIM (POC v2): top-level {@code collapse} WITHOUT inner_hits works with the resolver — collapse forces the
+     * standard path, and core collapses the fused hits by field at the fetch phase → one representative per group.
+     */
+    @SneakyThrows
+    public void testResolver_collapse_withoutInnerHits() {
+        initCollapseIndexIfNeeded();
+        String body = "{\"size\":10,\"query\":{" + collapseResolverFragment() + "},\"collapse\":{\"field\":\"group\"}}";
+        List<Map<String, Object>> hits = readHits(searchNoPipeline(COLLAPSE_INDEX, body));
+        // legs match c1,c2 (title:apple) + c1,c3 (body:banana) = union {c1,c2,c3} across groups g1,g2 → collapse to 2.
+        Set<String> groups = new HashSet<>();
+        for (Map<String, Object> h : hits) {
+            groups.add(groupOf(h));
+        }
+        assertEquals("collapse returns one representative per group", Set.of("g1", "g2"), groups);
+        assertEquals("exactly one hit per group", 2, hits.size());
+    }
+
+    /**
+     * CLAIM (POC v2): top-level {@code collapse} WITH inner_hits works — the group members are returned in inner_hits
+     * (fetch-phase machinery over the executed standard query; independent of the resolver's query rewrite).
+     */
+    @SneakyThrows
+    public void testResolver_collapse_withInnerHits() {
+        initCollapseIndexIfNeeded();
+        String body = "{\"size\":10,\"query\":{"
+            + collapseResolverFragment()
+            + "},\"collapse\":{\"field\":\"group\",\"inner_hits\":{\"name\":\"members\",\"size\":10}}}";
+        List<Map<String, Object>> hits = readHits(searchNoPipeline(COLLAPSE_INDEX, body));
+        assertEquals(2, hits.size());
+        boolean sawG1Members = false;
+        for (Map<String, Object> h : hits) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> ih = (Map<String, Object>) h.get("inner_hits");
+            assertNotNull("collapse inner_hits must be present on each group rep", ih);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> members = (Map<String, Object>) ih.get("members");
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> memberHits = (List<Map<String, Object>>) ((Map<String, Object>) members.get("hits")).get("hits");
+            List<String> ids = memberHits.stream().map(m -> (String) m.get("_id")).toList();
+            // g1's rep (c1) collapses c1 + c2 (both are group g1 and match a leg); g2 collapses c3.
+            if ("g1".equals(groupOf(h))) {
+                sawG1Members = true;
+                assertTrue("g1 collapse must include both g1 leg-matches c1 and c2", ids.contains("c1") && ids.contains("c2"));
+            }
+        }
+        assertTrue("expected a g1 group with collapsed members", sawG1Members);
+    }
+
+    /**
+     * CLAIM (POC v2): inner_hits declared INSIDE a resolver leg are rejected at parse time (they cannot be produced —
+     * the leg self-erases into a constant_score(_id) Top clause). Fails with a clear 4xx, not a silent drop.
+     */
+    @SneakyThrows
+    public void testResolver_legInnerHits_rejected() {
+        initCollapseIndexIfNeeded();
+        String body = "{\"size\":10,\"query\":{\"resolver\":{\"queries\":["
+            + "{\"match\":{\"title\":\"apple\"}},"
+            + "{\"nested\":{\"path\":\"passages\",\"query\":{\"match\":{\"passages.text\":\"apple\"}},\"inner_hits\":{}}}"
+            + "],\"combination\":{\"technique\":\"rrf\"},\"rank_window_size\":100}}}";
+        org.opensearch.client.Request request = new org.opensearch.client.Request("POST", "/" + COLLAPSE_INDEX + "/_search");
+        request.setJsonEntity(body);
+        org.opensearch.client.ResponseException e = expectThrows(
+            org.opensearch.client.ResponseException.class,
+            () -> client().performRequest(request)
+        );
+        assertEquals(400, e.getResponse().getStatusLine().getStatusCode());
+        assertTrue("error must mention inner_hits", EntityUtils.toString(e.getResponse().getEntity()).contains("inner_hits"));
+    }
+
     @SneakyThrows
     private void initRankDocsIndexIfNeeded() {
         if (indexExists(RANKDOCS_INDEX)) {

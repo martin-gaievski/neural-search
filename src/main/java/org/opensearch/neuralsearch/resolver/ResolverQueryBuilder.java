@@ -14,6 +14,7 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.query.AbstractQueryBuilder;
+import org.opensearch.index.query.InnerHitContextBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryCoordinatorContext;
 import org.opensearch.index.query.QueryRewriteContext;
@@ -22,6 +23,7 @@ import org.opensearch.index.query.QueryShardContext;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -513,6 +515,27 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
                         nested.rankWindowSize(),
                         RANK_WINDOW_SIZE_FIELD,
                         rankWindowSize
+                    )
+                );
+            }
+        }
+        // inner_hits on a leg query (e.g. a nested/has_child leg with "inner_hits") cannot be produced by the
+        // resolver: the leg is replaced by a constant_score(_id) Top clause that carries no inner_hits, and the
+        // RankDocsQuery does not propagate them. Rather than SILENTLY DROP them (a wrong-result surprise), reject at
+        // parse time. (Top-level collapse.inner_hits is unaffected — that is fetch-phase machinery over the executed
+        // query, not leg inner_hits, and works fine.) Detected by the same walk core uses to harvest inner_hits.
+        for (QueryBuilder leg : queries) {
+            Map<String, InnerHitContextBuilder> legInnerHits = new HashMap<>();
+            InnerHitContextBuilder.extractInnerHits(leg, legInnerHits);
+            if (legInnerHits.isEmpty() == false) {
+                throw new IllegalArgumentException(
+                    String.format(
+                        Locale.ROOT,
+                        "[%s] inner_hits inside a sub-query (leg) are not supported (the resolver self-erases each leg "
+                            + "into a scored id clause, which carries no inner_hits); found inner_hits %s. "
+                            + "Top-level collapse.inner_hits is supported.",
+                        NAME,
+                        legInnerHits.keySet()
                     )
                 );
             }

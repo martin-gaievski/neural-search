@@ -326,6 +326,19 @@ public class ResolverQueryBuilderTests extends OpenSearchTestCase {
         assertArrayEquals(new float[] { 5.0f, 1.5f }, builder.weights(), 1e-6f);
     }
 
+    public void testRejectsInnerHitsInsideALeg() throws Exception {
+        // inner_hits on a leg query cannot be produced by the resolver (the leg becomes a constant_score(_id) Top
+        // clause that carries no inner_hits). Reject at parse time rather than silently dropping them.
+        String json = "{\"queries\":["
+            + "{\"match\":{\"title\":\"a\"}},"
+            + "{\"nested\":{\"path\":\"passages\",\"query\":{\"match\":{\"passages.text\":\"a\"}},\"inner_hits\":{}}}"
+            + "],\"combination\":{\"technique\":\"rrf\"},\"rank_window_size\":100}";
+        XContentParser parser = createParser(JsonXContent.jsonXContent, json);
+        parser.nextToken();
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> ResolverQueryBuilder.fromXContent(parser));
+        assertTrue(e.getMessage().contains("inner_hits"));
+    }
+
     public void testNestedResolverRejectsSmallerInnerWindow() throws Exception {
         // Fusion-of-fusion: an inner resolver leg with a SMALLER rank_window_size than the outer under-feeds the outer
         // fusion (the inner RankDocsQuery returns at most its own window). Reject it (ES-style parent<=child).
