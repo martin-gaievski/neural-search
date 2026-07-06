@@ -254,6 +254,38 @@ public class ResolverQueryBuilderTests extends OpenSearchTestCase {
         assertArrayEquals(builder.weights(), deserialized.weights(), 1e-6f);
     }
 
+    public void testWeightsRejectNegative() throws Exception {
+        // A negative weight yields a negative fused score -> crashes core checkNegativeBoost on the standard path
+        // and silently mis-ranks on the fast path. Must be rejected at parse time.
+        String json = "{\"queries\":[{\"match\":{\"title\":\"a\"}},{\"match\":{\"body\":\"b\"}}],"
+            + "\"normalization\":{\"technique\":\"min_max\"},\"combination\":{\"technique\":\"arithmetic_mean\",\"parameters\":{\"weights\":[-1.0,2.0]}}}";
+        XContentParser parser = createParser(JsonXContent.jsonXContent, json);
+        parser.nextToken();
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> ResolverQueryBuilder.fromXContent(parser));
+        assertTrue(e.getMessage().contains("weights"));
+        assertTrue(e.getMessage().contains(">= 0"));
+    }
+
+    public void testWeightsRejectAllZero() throws Exception {
+        // All-zero weights make the arithmetic-mean denominator 0 -> every score forced to 0 (relevance wipeout).
+        String json = "{\"queries\":[{\"match\":{\"title\":\"a\"}},{\"match\":{\"body\":\"b\"}}],"
+            + "\"normalization\":{\"technique\":\"min_max\"},\"combination\":{\"technique\":\"arithmetic_mean\",\"parameters\":{\"weights\":[0.0,0.0]}}}";
+        XContentParser parser = createParser(JsonXContent.jsonXContent, json);
+        parser.nextToken();
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> ResolverQueryBuilder.fromXContent(parser));
+        assertTrue(e.getMessage().contains("all zero"));
+    }
+
+    public void testWeightsAcceptValidNonNegative() throws Exception {
+        // Arbitrary non-negative weights (not constrained to sum=1, matching ES) are accepted.
+        String json = "{\"queries\":[{\"match\":{\"title\":\"a\"}},{\"match\":{\"body\":\"b\"}}],"
+            + "\"normalization\":{\"technique\":\"min_max\"},\"combination\":{\"technique\":\"arithmetic_mean\",\"parameters\":{\"weights\":[5.0,1.5]}}}";
+        XContentParser parser = createParser(JsonXContent.jsonXContent, json);
+        parser.nextToken();
+        ResolverQueryBuilder builder = ResolverQueryBuilder.fromXContent(parser);
+        assertArrayEquals(new float[] { 5.0f, 1.5f }, builder.weights(), 1e-6f);
+    }
+
     public void testZScoreNormalizationParses() throws Exception {
         // POC v2 adaptive-fusion #1: z_score (DBSF-style) normalization + arithmetic_mean.
         String json = "{\"queries\":[{\"match\":{\"title\":\"a\"}},{\"match\":{\"body\":\"b\"}}],"

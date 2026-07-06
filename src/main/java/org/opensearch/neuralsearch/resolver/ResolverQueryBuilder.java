@@ -424,6 +424,33 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
                 )
             );
         }
+        // Each weight must be finite and non-negative (like ES's weight >= 0), and at least one must be > 0.
+        // Without this a negative weight yields a negative fused score — which crashes the standard path via core's
+        // checkNegativeBoost (the RankDocsQuery Top applies the fused score as a boost) AND silently mis-ranks on the
+        // fast path (fabricated _score is unchecked); an all-zero vector makes the arithmetic-mean denominator 0 and
+        // wipes all relevance to 0. Reject at parse time rather than fail deep in fusion.
+        if (weights.length > 0) {
+            float weightSum = 0.0f;
+            for (float w : weights) {
+                if (Float.isFinite(w) == false || w < 0.0f) {
+                    throw new IllegalArgumentException(
+                        String.format(
+                            Locale.ROOT,
+                            "[%s] each %s must be a finite value >= 0, got [%s]",
+                            NAME,
+                            WEIGHTS_FIELD,
+                            Arrays.toString(weights)
+                        )
+                    );
+                }
+                weightSum += w;
+            }
+            if (weightSum == 0.0f) {
+                throw new IllegalArgumentException(
+                    String.format(Locale.ROOT, "[%s] %s must not be all zero (at least one weight must be > 0)", NAME, WEIGHTS_FIELD)
+                );
+            }
+        }
         if (COLLECTION_COORDINATOR.equals(collection) == false && COLLECTION_PER_SHARD.equals(collection) == false) {
             throw new IllegalArgumentException(
                 String.format(
