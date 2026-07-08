@@ -43,6 +43,8 @@ import lombok.AllArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 
 import static org.opensearch.neuralsearch.plugin.NeuralSearch.EXPLANATION_RESPONSE_KEY;
+import static org.opensearch.neuralsearch.plugin.NeuralSearch.RAW_SUBQUERY_SCORES_KEY;
+import static org.opensearch.neuralsearch.plugin.NeuralSearch.RAW_SUBQUERY_COMBINED_KEY;
 import static org.opensearch.neuralsearch.search.util.HybridSearchSortUtil.evaluateSortCriteria;
 import static org.opensearch.neuralsearch.search.util.HybridSearchCollapseUtil.getCollapseFieldType;
 
@@ -86,6 +88,11 @@ public class NormalizationProcessorWorkflow {
 
         explain(request, queryTopDocs, isSingleShard);
 
+        // POC: snapshot RAW per-sub-query scores (pre-normalization, pre-combination) keyed by (shard, docId).
+        // Captured here — after getQueryTopDocs holds every shard's per-sub-query TopDocs, BEFORE normalizeScores
+        // overwrites them in place. Coordinator-heap only; no data-node read (that is what sank PR #1369).
+        Map<SearchShard, Map<Integer, float[]>> rawSubQueryScores = captureRawSubQueryScores(queryTopDocs);
+
         // Data transfer object for score normalization used to pass nullable rankConstant which is only used in RRF
         NormalizeScoresDTO normalizeScoresDTO = NormalizeScoresDTO.builder()
             .queryTopDocs(queryTopDocs)
@@ -111,6 +118,12 @@ public class NormalizationProcessorWorkflow {
         // combine
         log.debug("Do score combination");
         scoreCombiner.combineScores(combineScoresDTO);
+
+        // POC: now that combine() has produced each shard's final score-ordered doc list, reorder the raw scores
+        // into a per-shard ORDERED List<float[]> aligned to that final order, and stash it on the request-scoped
+        // PipelineProcessingContext. The coordinator-side response processor attaches it positionally per shard
+        // (keyed by SearchShard, NOT the transient SearchHit.docId). Both halves run in the coordinator JVM.
+        stashRawSubQueryScores(request, queryTopDocs, rawSubQueryScores);
 
         // post-process data
         log.debug("Post-process query results after score normalization and combination");
@@ -213,6 +226,75 @@ public class NormalizationProcessorWorkflow {
             PipelineProcessingContext pipelineProcessingContext = request.getPipelineProcessingContext();
             pipelineProcessingContext.setAttribute(EXPLANATION_RESPONSE_KEY, explanationPayload);
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // POC: raw sub-query scores (multi-node-safe, coordinator-side). See PR #1369 / revert #1476.
+    // ---------------------------------------------------------------------------------------------
+
+    /** Snapshot the RAW per-sub-query score of every candidate doc, per shard, BEFORE normalize() overwrites them.
+     *  Keyed by (shard, shard-local docId); value = float[numSubQueries]. Coordinator heap only. */
+    private Map<SearchShard, Map<Integer, float[]>> captureRawSubQueryScores(final List<CompoundTopDocs> queryTopDocs) {
+        Map<SearchShard, Map<Integer, float[]>> byShard = new HashMap<>();
+        for (CompoundTopDocs shardDocs : queryTopDocs) {
+            if (Objects.isNull(shardDocs) || Objects.isNull(shardDocs.getSearchShard())) {
+                continue;
+            }
+            List<TopDocs> perSubQuery = shardDocs.getTopDocs(); // one TopDocs per sub-query (magic numbers stripped)
+            int numSubQueries = perSubQuery.size();
+            Map<Integer, float[]> byDoc = new HashMap<>();
+            for (int subQueryIndex = 0; subQueryIndex < numSubQueries; subQueryIndex++) {
+                for (ScoreDoc scoreDoc : perSubQuery.get(subQueryIndex).scoreDocs) {
+                    float[] scores = byDoc.computeIfAbsent(scoreDoc.doc, k -> newNaNArray(numSubQueries));
+                    scores[subQueryIndex] = scoreDoc.score; // RAW score, captured before normalize mutates it
+                }
+            }
+            byShard.put(shardDocs.getSearchShard(), byDoc);
+        }
+        return byShard;
+    }
+
+    /** After combine() set each shard's final score-ordered docs, project the captured raw scores into that order
+     *  and stash a per-shard ordered List<float[]> on the request context for the response processor to attach. */
+    private void stashRawSubQueryScores(
+        final NormalizationProcessorWorkflowExecuteRequest request,
+        final List<CompoundTopDocs> queryTopDocs,
+        final Map<SearchShard, Map<Integer, float[]>> rawSubQueryScores
+    ) {
+        if (Objects.isNull(request.getPipelineProcessingContext())) {
+            return; // no pipeline context -> nothing consumes it (e.g. no response processor); skip cheaply
+        }
+        Map<SearchShard, List<float[]>> orderedByShard = new HashMap<>();
+        Map<SearchShard, float[]> combinedByShard = new HashMap<>();
+        for (CompoundTopDocs shardDocs : queryTopDocs) {
+            if (Objects.isNull(shardDocs) || Objects.isNull(shardDocs.getSearchShard())) {
+                continue;
+            }
+            Map<Integer, float[]> byDoc = rawSubQueryScores.getOrDefault(shardDocs.getSearchShard(), Map.of());
+            List<ScoreDoc> finalOrder = shardDocs.getScoreDocs();
+            // getScoreDocs() is the shard's final, score-ordered, sentinel-free combined list — the same order (and
+            // combined scores) as the SearchHits this shard contributes. We keep the raw float[] in that order AND
+            // the parallel combined scores, so the response processor can locate the right slice of this list even
+            // when a global `from` offset has paginated away the leading entries (align by combined _score, not by
+            // a naive 0-based position — that mis-attributes under from>0 on multi-shard).
+            List<float[]> ordered = new ArrayList<>(finalOrder.size());
+            float[] combined = new float[finalOrder.size()];
+            for (int i = 0; i < finalOrder.size(); i++) {
+                ScoreDoc scoreDoc = finalOrder.get(i);
+                ordered.add(byDoc.get(scoreDoc.doc));
+                combined[i] = scoreDoc.score;
+            }
+            orderedByShard.put(shardDocs.getSearchShard(), ordered);
+            combinedByShard.put(shardDocs.getSearchShard(), combined);
+        }
+        request.getPipelineProcessingContext().setAttribute(RAW_SUBQUERY_SCORES_KEY, orderedByShard);
+        request.getPipelineProcessingContext().setAttribute(RAW_SUBQUERY_COMBINED_KEY, combinedByShard);
+    }
+
+    private static float[] newNaNArray(final int size) {
+        float[] arr = new float[size];
+        Arrays.fill(arr, Float.NaN); // NaN = "this sub-query did not match this doc" (vs a genuine 0.0 score)
+        return arr;
     }
 
     /**

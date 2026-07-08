@@ -196,6 +196,10 @@ public class NeuralSearch extends Plugin
     private final ScoreNormalizationFactory scoreNormalizationFactory = new ScoreNormalizationFactory();
     private final ScoreCombinationFactory scoreCombinationFactory = new ScoreCombinationFactory();
     public static final String EXPLANATION_RESPONSE_KEY = "explanation_response";
+    // POC: request-context keys carrying per-shard ordered raw sub-query scores + parallel combined scores
+    // (multi-node-safe; combined scores let the response processor align under from>0). See PR #1369/#1476.
+    public static final String RAW_SUBQUERY_SCORES_KEY = "raw_subquery_scores_response";
+    public static final String RAW_SUBQUERY_COMBINED_KEY = "raw_subquery_combined_response";
     public static final String NEURAL_BASE_URI = "/_plugins/_neural";
 
     public NeuralSearch() {
@@ -403,7 +407,9 @@ public class NeuralSearch extends Plugin
             ExplanationResponseProcessor.TYPE,
             new ExplanationResponseProcessorFactory(),
             AgenticContextResponseProcessor.TYPE,
-            new AgenticContextResponseProcessor.Factory()
+            new AgenticContextResponseProcessor.Factory(),
+            org.opensearch.neuralsearch.processor.RawSubQueryScoresResponseProcessor.TYPE,
+            new org.opensearch.neuralsearch.processor.factory.RawSubQueryScoresResponseProcessorFactory()
         );
     }
 
