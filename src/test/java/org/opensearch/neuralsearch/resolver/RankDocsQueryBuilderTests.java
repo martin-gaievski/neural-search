@@ -41,4 +41,29 @@ public class RankDocsQueryBuilderTests extends OpenSearchTestCase {
         // Internal query created by the resolver processor; must not be parseable from a request.
         expectThrows(UnsupportedOperationException.class, () -> RankDocsQueryBuilder.fromXContent(null));
     }
+
+    public void testRawSubQueryScoresSurviveSerialization() throws Exception {
+        // POC standard path: raw per-leg scores are carried INSIDE this (serialized-to-data-nodes) query.
+        java.util.Map<String, float[]> raw = new java.util.HashMap<>();
+        raw.put("d1", new float[] { 12.44f, 0.83f });
+        raw.put("d2", new float[] { Float.NaN, 1.20f }); // leg-0 did not match d2
+        RankDocsQueryBuilder original = new RankDocsQueryBuilder(
+            new String[] { "d1", "d2" },
+            new float[] { 0.032f, 0.016f },
+            List.of(new MatchQueryBuilder("title", "apple"), new MatchQueryBuilder("body", "banana")),
+            raw
+        );
+        RankDocsQueryBuilder deserialized = copyWriteable(original, namedWriteableRegistry(), RankDocsQueryBuilder::new);
+        assertEquals(original, deserialized);
+        java.util.Map<String, float[]> got = deserialized.rawSubQueryScoresById();
+        assertNotNull("raw scores map must survive the wire", got);
+        assertArrayEquals(new float[] { 12.44f, 0.83f }, got.get("d1"), 0.0f);
+        assertArrayEquals(new float[] { Float.NaN, 1.20f }, got.get("d2"), 0.0f); // NaN preserved on the wire
+    }
+
+    public void testNullRawScoresSerializesAsAbsent() throws Exception {
+        // Opt-out (null payload) must round-trip as null — the common no-sub-query-scores case pays nothing.
+        RankDocsQueryBuilder deserialized = copyWriteable(sample(), namedWriteableRegistry(), RankDocsQueryBuilder::new);
+        assertNull(deserialized.rawSubQueryScoresById());
+    }
 }

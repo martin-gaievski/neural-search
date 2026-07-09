@@ -15,12 +15,14 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
+import org.opensearch.common.document.DocumentField;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.internal.InternalSearchResponse;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -217,7 +219,13 @@ public final class ResolverOrchestrator {
         // The Tail re-runs the legs at the query phase (stage B). Only include legs that SURVIVED stage A — a leg that
         // failed (its legHits slot is null, B1 graceful degradation) would fail again in the Tail and error the whole
         // search, defeating the fallback. So the Tail matches the same surviving-leg set the fusion used.
-        return new RankDocsQueryBuilder(ranked.ids, ranked.scores, topOnly ? List.of() : survivingLegQueries(resolver, legHits));
+        List<QueryBuilder> tail = topOnly ? List.of() : survivingLegQueries(resolver, legHits);
+        // POC: on the standard path the raw per-leg scores are captured here in coordinator heap but the query then
+        // self-erases into RankDocsQueryBuilder and is FETCHED on data nodes. Carry the raw scores keyed by _id INSIDE
+        // the (serialized) RankDocsQueryBuilder so a data-node FetchSubPhase can attach them there — multi-node-safe
+        // because the payload rides the query object to the node, not a coordinator-only side channel.
+        Map<String, float[]> rawById = resolver.subQueryScores() ? rawScoresById(legHits, resolver.queries().size()) : null;
+        return new RankDocsQueryBuilder(ranked.ids, ranked.scores, tail, rawById);
     }
 
     /** The resolver's leg queries, restricted to legs that survived stage A (non-null {@code legHits} slot). Used for
@@ -356,6 +364,9 @@ public final class ResolverOrchestrator {
         // max_score is the global top fused score (ranked is score-desc), independent of the page window — matches how
         // core/hybrid report max_score on later (from>0) pages. NaN only when nothing passed.
         float maxScore = passing > 0 ? ranked.scores[0] : Float.NaN;
+        // POC: raw per-leg scores for the fused window (opt-in). Coordinator-heap, keyed by _id — no data-node read,
+        // so this is multi-node-safe by construction (fast path fabricates + returns entirely on the coordinator).
+        Map<String, float[]> rawById = resolver.subQueryScores() ? rawScoresById(legHits, resolver.queries().size()) : null;
         List<SearchHit> page = new ArrayList<>();
         for (int rank = from; rank < passing && page.size() < size; rank++) {
             SearchHit hit = hitById.get(ranked.ids[rank]);
@@ -363,6 +374,9 @@ public final class ResolverOrchestrator {
                 continue; // fused id whose hit wasn't hydrated (shouldn't happen with fetchSource legs) — skip
             }
             hit.score(ranked.scores[rank]);
+            if (rawById != null) {
+                attachSubQueryScores(hit, rawById.get(ranked.ids[rank]));
+            }
             page.add(hit);
         }
 
@@ -503,6 +517,58 @@ public final class ResolverOrchestrator {
             );
         }
         return legHits;
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // POC: raw per-leg (pre-fusion) scores. Shared by the fast path (coordinator fabricate) and the
+    // standard path (carried in RankDocsQueryBuilder, attached at data-node fetch). Field name is the
+    // response fields.<SUB_QUERY_SCORES_FIELD_NAME> float array, positionally aligned to queries[].
+    // ---------------------------------------------------------------------------------------------
+
+    /** Response field under which the raw per-leg scores are emitted. */
+    public static final String SUB_QUERY_SCORES_FIELD_NAME = "sub_query_scores";
+
+    /** Build id -> raw per-leg scores from the per-leg candidate hits. Slot i = leg i's raw _score for that doc,
+     *  NaN when leg i did not return the doc. Each leg hit carries its own raw _score in BOTH coordinator and
+     *  per_shard modes (per_shard unions each shard's local hits, all pre-fusion). */
+    static Map<String, float[]> rawScoresById(SearchHit[][] legHits, int legCount) {
+        Map<String, float[]> byId = new HashMap<>();
+        for (int leg = 0; leg < legHits.length; leg++) {
+            SearchHit[] hits = legHits[leg];
+            if (hits == null) {
+                continue; // dropped leg (graceful failure) — leaves NaN in that slot
+            }
+            for (SearchHit hit : hits) {
+                String id = hit.getId();
+                if (id == null) {
+                    continue;
+                }
+                float[] scores = byId.computeIfAbsent(id, k -> nanArray(legCount));
+                // Keep the max if a leg returned the same id more than once (per_shard union across shards).
+                if (Float.isNaN(scores[leg]) || hit.getScore() > scores[leg]) {
+                    scores[leg] = hit.getScore();
+                }
+            }
+        }
+        return byId;
+    }
+
+    private static float[] nanArray(int size) {
+        float[] a = new float[size];
+        Arrays.fill(a, Float.NaN);
+        return a;
+    }
+
+    /** Attach the raw per-leg scores to a hit as a fields.<name> float array (null -> skip, e.g. an unhydrated id). */
+    static void attachSubQueryScores(SearchHit hit, float[] raw) {
+        if (raw == null) {
+            return;
+        }
+        List<Object> values = new ArrayList<>(raw.length);
+        for (float score : raw) {
+            values.add(score);
+        }
+        hit.setDocumentField(SUB_QUERY_SCORES_FIELD_NAME, new DocumentField(SUB_QUERY_SCORES_FIELD_NAME, values));
     }
 
     private static MultiSearchResponse.Item firstFailure(MultiSearchResponse.Item[] items) {

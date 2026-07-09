@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -50,11 +51,25 @@ public class RankDocsQueryBuilder extends AbstractQueryBuilder<RankDocsQueryBuil
     private final String[] ids;
     private final float[] scores;
     private final List<QueryBuilder> sourceQueries;
+    // POC: raw per-leg (pre-fusion) scores keyed by _id, positionally aligned to the resolver's queries[]. Null when
+    // the sub_query_scores opt-in is off. Carried INSIDE this (NamedWriteable, serialized-to-data-nodes) query so a
+    // data-node FetchSubPhase can attach it to each hit — multi-node-safe (no coordinator-only side channel).
+    private final Map<String, float[]> rawSubQueryScoresById;
 
     public RankDocsQueryBuilder(String[] ids, float[] scores, List<QueryBuilder> sourceQueries) {
+        this(ids, scores, sourceQueries, null);
+    }
+
+    public RankDocsQueryBuilder(
+        String[] ids,
+        float[] scores,
+        List<QueryBuilder> sourceQueries,
+        Map<String, float[]> rawSubQueryScoresById
+    ) {
         this.ids = ids;
         this.scores = scores;
         this.sourceQueries = sourceQueries == null ? new ArrayList<>() : sourceQueries;
+        this.rawSubQueryScoresById = rawSubQueryScoresById;
     }
 
     public RankDocsQueryBuilder(StreamInput in) throws IOException {
@@ -62,6 +77,7 @@ public class RankDocsQueryBuilder extends AbstractQueryBuilder<RankDocsQueryBuil
         this.ids = in.readStringArray();
         this.scores = in.readFloatArray();
         this.sourceQueries = in.readNamedWriteableList(QueryBuilder.class);
+        this.rawSubQueryScoresById = in.readBoolean() ? in.readMap(StreamInput::readString, StreamInput::readFloatArray) : null;
     }
 
     @Override
@@ -69,6 +85,17 @@ public class RankDocsQueryBuilder extends AbstractQueryBuilder<RankDocsQueryBuil
         out.writeStringArray(ids);
         out.writeFloatArray(scores);
         out.writeNamedWriteableList(sourceQueries);
+        if (rawSubQueryScoresById == null) {
+            out.writeBoolean(false);
+        } else {
+            out.writeBoolean(true);
+            out.writeMap(rawSubQueryScoresById, StreamOutput::writeString, StreamOutput::writeFloatArray);
+        }
+    }
+
+    /** POC: raw per-leg scores keyed by _id (null when the opt-in is off). Read by the data-node FetchSubPhase. */
+    public Map<String, float[]> rawSubQueryScoresById() {
+        return rawSubQueryScoresById;
     }
 
     @Override
@@ -81,7 +108,7 @@ public class RankDocsQueryBuilder extends AbstractQueryBuilder<RankDocsQueryBuil
             changed |= r != q;
         }
         if (changed) {
-            RankDocsQueryBuilder rewrittenBuilder = new RankDocsQueryBuilder(ids, scores, rewritten);
+            RankDocsQueryBuilder rewrittenBuilder = new RankDocsQueryBuilder(ids, scores, rewritten, rawSubQueryScoresById);
             rewrittenBuilder.boost(boost());
             rewrittenBuilder.queryName(queryName());
             return rewrittenBuilder;
@@ -105,17 +132,46 @@ public class RankDocsQueryBuilder extends AbstractQueryBuilder<RankDocsQueryBuil
             }
             composite.filter(tail);
         }
-        return composite.toQuery(context);
+        Query built = composite.toQuery(context);
+        // POC: when raw sub-query scores were requested, wrap the executed query so the payload reaches the data-node
+        // fetch phase (see RawScoreCarryingQuery + RawSubQueryScoresFetchSubPhase). Scoring/matching are unchanged.
+        if (rawSubQueryScoresById != null) {
+            return new RawScoreCarryingQuery(built, rawSubQueryScoresById);
+        }
+        return built;
     }
 
     @Override
     protected boolean doEquals(RankDocsQueryBuilder other) {
-        return Arrays.equals(ids, other.ids) && Arrays.equals(scores, other.scores) && Objects.equals(sourceQueries, other.sourceQueries);
+        return Arrays.equals(ids, other.ids)
+            && Arrays.equals(scores, other.scores)
+            && Objects.equals(sourceQueries, other.sourceQueries)
+            && rawScoreMapsEqual(rawSubQueryScoresById, other.rawSubQueryScoresById);
+    }
+
+    private static boolean rawScoreMapsEqual(Map<String, float[]> a, Map<String, float[]> b) {
+        if (a == b) {
+            return true;
+        }
+        if (a == null || b == null || a.size() != b.size()) {
+            return false;
+        }
+        for (Map.Entry<String, float[]> e : a.entrySet()) {
+            if (!b.containsKey(e.getKey()) || !Arrays.equals(e.getValue(), b.get(e.getKey()))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     @Override
     protected int doHashCode() {
-        return Objects.hash(Arrays.hashCode(ids), Arrays.hashCode(scores), sourceQueries);
+        return Objects.hash(
+            Arrays.hashCode(ids),
+            Arrays.hashCode(scores),
+            sourceQueries,
+            rawSubQueryScoresById == null ? 0 : rawSubQueryScoresById.size()
+        );
     }
 
     @Override

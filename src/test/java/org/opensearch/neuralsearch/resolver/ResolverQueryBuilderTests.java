@@ -232,6 +232,27 @@ public class ResolverQueryBuilderTests extends OpenSearchTestCase {
         assertEquals(50, builder.rankWindowSize());
     }
 
+    public void testSubQueryScoresFlag_parseDefaultAndRoundTrip() throws Exception {
+        // default off
+        String defaultJson = "{\"queries\":[{\"match\":{\"title\":\"a\"}},{\"match\":{\"body\":\"b\"}}]}";
+        XContentParser defaultParser = createParser(JsonXContent.jsonXContent, defaultJson);
+        defaultParser.nextToken();
+        assertFalse("sub_query_scores defaults to false", ResolverQueryBuilder.fromXContent(defaultParser).subQueryScores());
+
+        // explicit opt-in parses
+        String optInJson = "{\"queries\":[{\"match\":{\"title\":\"a\"}},{\"match\":{\"body\":\"b\"}}],"
+            + "\"technique\":\"rrf\",\"rank_window_size\":100,\"sub_query_scores\":true}";
+        XContentParser optInParser = createParser(JsonXContent.jsonXContent, optInJson);
+        optInParser.nextToken();
+        ResolverQueryBuilder optedIn = ResolverQueryBuilder.fromXContent(optInParser);
+        assertTrue("sub_query_scores:true parses", optedIn.subQueryScores());
+
+        // survives wire serialization (transported to data nodes on the standard path)
+        ResolverQueryBuilder deserialized = copyWriteable(optedIn, namedWriteableRegistry(), ResolverQueryBuilder::new);
+        assertTrue("sub_query_scores survives serialization", deserialized.subQueryScores());
+        assertEquals(optedIn, deserialized);
+    }
+
     public void testFromXContentDefaults() throws Exception {
         String json = "{\"queries\":[{\"match\":{\"title\":\"a\"}},{\"match\":{\"body\":\"b\"}}]}";
         XContentParser parser = createParser(JsonXContent.jsonXContent, json);

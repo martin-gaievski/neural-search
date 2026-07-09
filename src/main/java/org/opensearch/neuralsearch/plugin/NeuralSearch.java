@@ -269,6 +269,12 @@ public class NeuralSearch extends Plugin
     }
 
     @Override
+    public List<org.opensearch.search.fetch.FetchSubPhase> getFetchSubPhases(SearchPlugin.FetchPhaseConstructionContext context) {
+        // POC: attaches raw per-leg scores on the resolver's standard (shard-fanout) path; no-op otherwise.
+        return List.of(new org.opensearch.neuralsearch.resolver.RawSubQueryScoresFetchSubPhase());
+    }
+
+    @Override
     public List<RestHandler> getRestHandlers(
         Settings settings,
         RestController restController,

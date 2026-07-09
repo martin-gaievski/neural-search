@@ -106,6 +106,8 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
     private static final String WEIGHTS_FIELD = "weights";
     private static final String COLLECTION_FIELD = "collection";
     private static final String CANDIDATE_DEPTH_FIELD = "candidate_depth";
+    // POC: opt-in to emit each leg's RAW (pre-fusion) score on every returned hit under fields.sub_query_scores.
+    private static final String SUB_QUERY_SCORES_FIELD = "sub_query_scores";
 
     private final List<QueryBuilder> queries;
     private final String technique;        // combination technique: rrf | arithmetic_mean
@@ -115,6 +117,7 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
     private final float[] weights;         // per-leg weights for arithmetic_mean AND rrf (v2); empty => unweighted
     private final String collection;       // candidate collection: coordinator | per_shard
     private final int candidateDepth;      // per-shard local top-K depth; CANDIDATE_DEPTH_UNSET => rankWindowSize
+    private final boolean subQueryScores;  // POC opt-in: attach raw per-leg scores to each hit (no pipeline/processor)
 
     /**
      * Transient result of the coordinator-rewrite async orchestration: the standard query this marker self-erases into
@@ -152,7 +155,7 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         String collection,
         int candidateDepth
     ) {
-        this(queries, technique, normalization, rankConstant, rankWindowSize, weights, collection, candidateDepth, null);
+        this(queries, technique, normalization, rankConstant, rankWindowSize, weights, collection, candidateDepth, false, null);
     }
 
     /** Full constructor incl. the transient {@link #fusedSupplier} (set only by {@link #doRewrite}'s async self-erase). */
@@ -165,6 +168,7 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         float[] weights,
         String collection,
         int candidateDepth,
+        boolean subQueryScores,
         Supplier<QueryBuilder> fusedSupplier
     ) {
         this.queries = queries == null ? new ArrayList<>() : queries;
@@ -175,6 +179,7 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         this.weights = weights == null ? new float[0] : weights;
         this.collection = collection == null ? COLLECTION_COORDINATOR : collection;
         this.candidateDepth = candidateDepth;
+        this.subQueryScores = subQueryScores;
         this.fusedSupplier = fusedSupplier;
     }
 
@@ -188,6 +193,7 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         this.weights = in.readFloatArray();
         this.collection = in.readString();
         this.candidateDepth = in.readInt();
+        this.subQueryScores = in.readBoolean();
         this.fusedSupplier = null; // never serialized — the wire form is always the parsed marker
     }
 
@@ -201,6 +207,7 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         out.writeFloatArray(weights);
         out.writeString(collection);
         out.writeInt(candidateDepth);
+        out.writeBoolean(subQueryScores);
     }
 
     public List<QueryBuilder> queries() {
@@ -241,6 +248,11 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         return COLLECTION_PER_SHARD.equals(collection) && TECHNIQUE_ARITHMETIC_MEAN.equals(technique);
     }
 
+    /** POC opt-in: attach each leg's raw pre-fusion score to every returned hit (fields.sub_query_scores). */
+    public boolean subQueryScores() {
+        return subQueryScores;
+    }
+
     @SuppressWarnings("unchecked")
     public static ResolverQueryBuilder fromXContent(XContentParser parser) throws IOException {
         List<QueryBuilder> queries = new ArrayList<>();
@@ -251,6 +263,7 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         float[] weights = new float[0];
         String collection = COLLECTION_COORDINATOR;
         int candidateDepth = CANDIDATE_DEPTH_UNSET;
+        boolean subQueryScores = false;
         float boost = DEFAULT_BOOST;
         String queryName = null;
 
@@ -305,6 +318,8 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
                     collection = parser.text();
                 } else if (CANDIDATE_DEPTH_FIELD.equals(currentFieldName)) {
                     candidateDepth = parser.intValue();
+                } else if (SUB_QUERY_SCORES_FIELD.equals(currentFieldName)) {
+                    subQueryScores = parser.booleanValue();
                 } else if (TECHNIQUE_FIELD.equals(currentFieldName)) {
                     combination = parser.text();
                 } else if (BOOST_FIELD.match(currentFieldName, parser.getDeprecationHandler())) {
@@ -340,7 +355,9 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
             rankWindowSize,
             weights,
             collection,
-            candidateDepth
+            candidateDepth,
+            subQueryScores,
+            null
         );
         queryBuilder.boost(boost);
         queryBuilder.queryName(queryName);
@@ -554,6 +571,9 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
         if (COLLECTION_COORDINATOR.equals(collection) == false) {
             builder.field(COLLECTION_FIELD, collection);
         }
+        if (subQueryScores) {
+            builder.field(SUB_QUERY_SCORES_FIELD, true);
+        }
         if (candidateDepth != CANDIDATE_DEPTH_UNSET) {
             builder.field(CANDIDATE_DEPTH_FIELD, candidateDepth);
         }
@@ -650,6 +670,7 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
             weights,
             collection,
             candidateDepth,
+            subQueryScores,
             fused::get
         );
     }
@@ -676,7 +697,8 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
             && rankWindowSize == other.rankWindowSize
             && Arrays.equals(weights, other.weights)
             && Objects.equals(collection, other.collection)
-            && candidateDepth == other.candidateDepth;
+            && candidateDepth == other.candidateDepth
+            && subQueryScores == other.subQueryScores;
     }
 
     @Override
@@ -689,7 +711,8 @@ public class ResolverQueryBuilder extends AbstractQueryBuilder<ResolverQueryBuil
             rankWindowSize,
             Arrays.hashCode(weights),
             collection,
-            candidateDepth
+            candidateDepth,
+            subQueryScores
         );
     }
 
