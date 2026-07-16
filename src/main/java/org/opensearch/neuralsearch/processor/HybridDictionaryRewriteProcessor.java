@@ -14,6 +14,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import org.opensearch.action.search.SearchRequest;
+import org.opensearch.common.logging.HeaderWarning;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.BoostingQueryBuilder;
 import org.opensearch.index.query.ConstantScoreQueryBuilder;
@@ -139,16 +140,21 @@ public class HybridDictionaryRewriteProcessor extends AbstractProcessor implemen
 
         // 2. Classify each leg; keep lexical, drop semantic, decline on mixed/unknown.
         final List<QueryBuilder> lexicalLegs = new ArrayList<>();
-        for (final QueryBuilder leg : hybrid.queries()) {
+        for (int i = 0; i < hybrid.queries().size(); i++) {
+            final QueryBuilder leg = hybrid.queries().get(i);
             final Verdict verdict = HybridLegClassifier.classify(leg);
             if (verdict == Verdict.LEXICAL) {
                 lexicalLegs.add(leg);
             } else if (verdict == Verdict.MIXED || verdict == Verdict.UNKNOWN) {
                 // Cannot faithfully extract a lexical-only query from a blended/unrecognized leg — decline, do not guess.
-                log.debug(
-                    "[{}] declining lexical rewrite: hybrid leg classified [{}], which cannot be safely reduced to lexical",
-                    TYPE,
-                    verdict
+                declineRewrite(
+                    String.format(
+                        Locale.ROOT,
+                        "hybrid leg [%d] (query type [%s]) classified [%s], which cannot be safely reduced to a lexical query",
+                        i,
+                        leg == null ? "null" : leg.getWriteableName(),
+                        verdict
+                    )
                 );
                 return searchRequest;
             }
@@ -156,13 +162,24 @@ public class HybridDictionaryRewriteProcessor extends AbstractProcessor implemen
         }
 
         if (lexicalLegs.isEmpty()) {
-            log.debug("[{}] declining lexical rewrite: hybrid query has no lexical leg to keep", TYPE);
+            declineRewrite("hybrid query matched the dictionary but has no lexical leg to keep");
             return searchRequest;
         }
 
         // 3. Collapse to a NON-hybrid query so the score-combination path is bypassed entirely.
         source.query(collapseToNonHybrid(lexicalLegs));
         return searchRequest;
+    }
+
+    /**
+     * Emit an observable "matched but declined" signal. A dictionary rule fired but the rewrite could not be applied
+     * safely, so the request is left as a normal hybrid query. This is surfaced as a response Warning header (visible to
+     * managed-service customers who cannot read node logs) in addition to a debug log line.
+     */
+    private void declineRewrite(final String reason) {
+        final String message = String.format(Locale.ROOT, "[%s] skipped lexical rewrite: %s", TYPE, reason);
+        log.debug(message);
+        HeaderWarning.addWarning(message);
     }
 
     private QueryBuilder collapseToNonHybrid(final List<QueryBuilder> lexicalLegs) {

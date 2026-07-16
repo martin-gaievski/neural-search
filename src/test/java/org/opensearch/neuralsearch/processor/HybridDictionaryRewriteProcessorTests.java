@@ -122,6 +122,11 @@ public class HybridDictionaryRewriteProcessorTests extends OpenSearchQueryTestCa
         SearchRequest out = proc.processRequest(req);
 
         assertTrue("MIXED leg must cause a fail-safe no-op", out.source().query() instanceof HybridQueryBuilder);
+        // the decline must be observable as a response Warning header (consumes it for the test harness too)
+        assertWarnings(
+            "[hybrid_dictionary_rewrite] skipped lexical rewrite: hybrid leg [0] (query type [bool]) classified [MIXED], "
+                + "which cannot be safely reduced to a lexical query"
+        );
     }
 
     public void testNoLexicalLegDeclinesRewrite() {
@@ -132,6 +137,9 @@ public class HybridDictionaryRewriteProcessorTests extends OpenSearchQueryTestCa
         SearchRequest out = proc.processRequest(req);
 
         assertTrue(out.source().query() instanceof HybridQueryBuilder);
+        assertWarnings(
+            "[hybrid_dictionary_rewrite] skipped lexical rewrite: hybrid query matched the dictionary but has no lexical leg to keep"
+        );
     }
 
     public void testNonHybridTopQueryIsUntouched() {

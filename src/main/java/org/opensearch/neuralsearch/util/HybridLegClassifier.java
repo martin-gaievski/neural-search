@@ -229,14 +229,17 @@ public final class HybridLegClassifier {
      * purpose: an unrecognized type is {@link Verdict#UNKNOWN}, never silently lexical.
      */
     static final Set<String> LEXICAL_QUERY_NAMES = Set.of(
+        // full-text
         "match",
         "match_phrase",
         "match_phrase_prefix",
         "match_bool_prefix",
         "multi_match",
+        "combined_fields",
         "common",
         "query_string",
         "simple_query_string",
+        // term-level
         "term",
         "terms",
         "terms_set",
@@ -246,7 +249,20 @@ public final class HybridLegClassifier {
         "fuzzy",
         "range",
         "intervals",
+        "distance_feature",
+        // span queries (all lexical/positional over analyzed text)
+        "span_term",
+        "span_near",
+        "span_or",
+        "span_first",
+        "span_not",
+        "span_within",
+        "span_containing",
+        "span_multi",
+        "span_field_masking",
+        // match-set / structural leaves that carry no semantic retrieval
         "match_all",
+        "match_none",
         "exists",
         "ids"
     );

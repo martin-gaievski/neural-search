@@ -98,6 +98,21 @@ public class HybridLegClassifierTests extends OpenSearchQueryTestCase {
         assertEquals(Verdict.LEXICAL, HybridLegClassifier.classify(new MatchAllQueryBuilder()));
     }
 
+    public void testExpandedLexicalTypesAreLexical() {
+        // spot-check some of the broader lexical allow-list added for coverage
+        assertEquals(
+            Verdict.LEXICAL,
+            HybridLegClassifier.classify(new org.opensearch.index.query.WildcardQueryBuilder(TEXT_FIELD, "med*"))
+        );
+        assertEquals(Verdict.LEXICAL, HybridLegClassifier.classify(new org.opensearch.index.query.PrefixQueryBuilder(TEXT_FIELD, "med")));
+        assertEquals(
+            Verdict.LEXICAL,
+            HybridLegClassifier.classify(new org.opensearch.index.query.SpanTermQueryBuilder(TEXT_FIELD, "medicare"))
+        );
+        assertEquals(Verdict.LEXICAL, HybridLegClassifier.classify(new org.opensearch.index.query.MatchNoneQueryBuilder()));
+        assertEquals(Verdict.LEXICAL, HybridLegClassifier.classify(new org.opensearch.index.query.ExistsQueryBuilder(TEXT_FIELD)));
+    }
+
     public void testNeuralIsSemantic() {
         assertEquals(Verdict.SEMANTIC, HybridLegClassifier.classify(neural()));
     }
@@ -286,5 +301,40 @@ public class HybridLegClassifierTests extends OpenSearchQueryTestCase {
         assertEquals(Verdict.MIXED, Verdict.MIXED.join(Verdict.LEXICAL));
         assertEquals(Verdict.UNKNOWN, Verdict.UNKNOWN.join(Verdict.LEXICAL));
         assertEquals(Verdict.UNKNOWN, Verdict.MIXED.join(Verdict.UNKNOWN));
+    }
+
+    // ---- CI drift guard ------------------------------------------------------------------------------------------
+
+    /**
+     * Guards against a future neural-search query type being added to the plugin's query registry without being taught
+     * to the classifier. Every registered query type must be either (a) a recognized SEMANTIC leaf, or (b) an
+     * explicitly acknowledged non-leg query ({@code hybrid} — never nested in itself; {@code agentic} — top-level only).
+     * If this test fails, a new query type was registered: decide whether it is semantic (add it to
+     * {@code HybridLegClassifier.SEMANTIC_QUERY_NAMES} / the instanceof checks) or lexical/other, and update this
+     * acknowledgement set — do NOT let it silently fall to UNKNOWN.
+     */
+    public void testEveryRegisteredNeuralSearchQueryTypeIsCategorized() {
+        // hybrid is never a leg of itself; agentic is a top-level-only marker query, not a retrieval leg.
+        final java.util.Set<String> nonLegQueryNames = java.util.Set.of("hybrid", "agentic");
+
+        final java.util.List<String> registeredNames = new org.opensearch.neuralsearch.plugin.NeuralSearch().getQueries()
+            .stream()
+            .map(spec -> spec.getName().getPreferredName())
+            .collect(java.util.stream.Collectors.toList());
+        assertFalse("plugin should register query types", registeredNames.isEmpty());
+
+        for (final String name : registeredNames) {
+            if (nonLegQueryNames.contains(name)) {
+                continue;
+            }
+            // Any registered query type that CAN be a hybrid leg must be recognized as semantic by the name set.
+            // (neural, neural_sparse, neural_knn are all semantic; this is the drift tripwire.)
+            assertTrue(
+                "registered neural-search query type ["
+                    + name
+                    + "] is not categorized by HybridLegClassifier; classify it as semantic or acknowledge it as a non-leg",
+                HybridLegClassifier.SEMANTIC_QUERY_NAMES.contains(name)
+            );
+        }
     }
 }
