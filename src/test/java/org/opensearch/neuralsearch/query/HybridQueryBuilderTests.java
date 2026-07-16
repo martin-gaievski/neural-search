@@ -960,9 +960,12 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         assertEquals(1, query.queries().size());
         assertEquals(2, query.boostConditions().size());
         // order is preserved: campaign filter first (tier 0), in_stock filter second (tier 1)
-        assertTrue(query.boostConditions().get(0) instanceof TermQueryBuilder);
-        assertEquals("campaign_id", ((TermQueryBuilder) query.boostConditions().get(0)).fieldName());
-        assertEquals("in_stock", ((TermQueryBuilder) query.boostConditions().get(1)).fieldName());
+        assertTrue(query.boostConditions().get(0).getFilter() instanceof TermQueryBuilder);
+        assertEquals("campaign_id", ((TermQueryBuilder) query.boostConditions().get(0).getFilter()).fieldName());
+        assertEquals("in_stock", ((TermQueryBuilder) query.boostConditions().get(1).getFilter()).fieldName());
+        // order mode: factor reserved and null on every condition
+        assertNull(query.boostConditions().get(0).getFactor());
+        assertNull(query.boostConditions().get(1).getFactor());
     }
 
     @SneakyThrows
@@ -988,6 +991,25 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         HybridQueryBuilder copy = new HybridQueryBuilder(filterStreamInput);
         assertEquals(2, copy.boostConditions().size());
         assertEquals(original, copy);
+    }
+
+    @SneakyThrows
+    public void testBoostCondition_whenSerialized_thenFactorSlotRoundTrips() {
+        // Forward-compat: the reserved factor slot round-trips for BOTH null (order mode, today) and a non-null
+        // value (the future factor mode) with no wire-format change — proving the slot is already in the layout.
+        NamedWriteableRegistry registry = new NamedWriteableRegistry(
+            List.of(new NamedWriteableRegistry.Entry(QueryBuilder.class, TermQueryBuilder.NAME, TermQueryBuilder::new))
+        );
+        for (Float factor : new Float[] { null, 2.5f }) {
+            BoostCondition original = new BoostCondition(QueryBuilders.termQuery("campaign_id", "SUMMER-2026"), factor);
+            BytesStreamOutput out = new BytesStreamOutput();
+            original.writeTo(out);
+            FilterStreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), registry);
+            BoostCondition copy = new BoostCondition(in);
+            assertEquals(factor, copy.getFactor());
+            assertEquals(original, copy);
+            assertTrue(copy.getFilter() instanceof TermQueryBuilder);
+        }
     }
 
     public void testBoostConditions_whenDifferent_thenNotEqual() {

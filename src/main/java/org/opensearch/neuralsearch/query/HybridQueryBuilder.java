@@ -62,6 +62,8 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     private static final ParseField PAGINATION_DEPTH_FIELD = new ParseField("pagination_depth");
     private static final ParseField BOOST_CONDITIONS_FIELD = new ParseField("boost_conditions");
     private static final ParseField BOOST_CONDITION_FILTER_FIELD = new ParseField("filter");
+    // reserved for a future multiplicative-boost mode; not parsed in the current order-only mode
+    private static final ParseField BOOST_CONDITION_FACTOR_FIELD = new ParseField("factor");
 
     private final List<QueryBuilder> queries = new ArrayList<>();
 
@@ -70,7 +72,7 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     // Ordered list of result-boost conditions. Documents matching boostConditions[0] are promoted into the
     // top tier band, boostConditions[1] the next, and so on; non-matching docs stay organic. This does NOT
     // restrict the result set (contrast with {@link #filter(QueryBuilder)}), it only reorders the final ranking.
-    private final List<QueryBuilder> boostConditions = new ArrayList<>();
+    private final List<BoostCondition> boostConditions = new ArrayList<>();
 
     public static final int MAX_NUMBER_OF_SUB_QUERIES = 5;
     public static final int MAX_NUMBER_OF_BOOST_CONDITIONS = 10;
@@ -91,7 +93,7 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             paginationDepth = in.readOptionalInt();
         }
         if (isClusterOnOrAfterMinReqVersionForBoostConditions()) {
-            boostConditions.addAll(in.readNamedWriteableList(QueryBuilder.class));
+            boostConditions.addAll(in.readList(BoostCondition::new));
         }
     }
 
@@ -107,7 +109,7 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             out.writeOptionalInt(paginationDepth);
         }
         if (isClusterOnOrAfterMinReqVersionForBoostConditions()) {
-            out.writeNamedWriteableList(boostConditions);
+            out.writeList(boostConditions);
         }
     }
 
@@ -134,7 +136,8 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         if (queryBuilder == null) {
             throw new IllegalArgumentException(String.format(Locale.ROOT, "boost condition clause cannot be null in %s query", NAME));
         }
-        boostConditions.add(queryBuilder);
+        // order/tier mode: no factor (reserved for a later multiplicative-boost mode)
+        boostConditions.add(new BoostCondition(queryBuilder, null));
         return this;
     }
 
@@ -178,10 +181,15 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         }
         if (boostConditions.isEmpty() == false) {
             builder.startArray(BOOST_CONDITIONS_FIELD.getPreferredName());
-            for (QueryBuilder condition : boostConditions) {
+            for (BoostCondition condition : boostConditions) {
                 builder.startObject();
                 builder.field(BOOST_CONDITION_FILTER_FIELD.getPreferredName());
-                condition.toXContent(builder, params);
+                condition.getFilter().toXContent(builder, params);
+                // factor is reserved (null in order mode) and intentionally omitted while null, keeping the
+                // rendered request byte-identical to today's order-only output
+                if (condition.getFactor() != null) {
+                    builder.field(BOOST_CONDITION_FACTOR_FIELD.getPreferredName(), condition.getFactor());
+                }
                 builder.endObject();
             }
             builder.endArray();
@@ -203,7 +211,9 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             return Queries.newMatchNoDocsQuery(String.format(Locale.ROOT, "no clauses for %s query", NAME));
         }
         validatePaginationDepth(paginationDepth, queryShardContext);
-        List<Query> compiledBoostConditions = new ArrayList<>(toQueries(boostConditions, queryShardContext));
+        // unwrap each condition's filter before compiling (toQueries is shared with the sub-query path)
+        List<QueryBuilder> boostConditionFilters = boostConditions.stream().map(BoostCondition::getFilter).collect(Collectors.toList());
+        List<Query> compiledBoostConditions = new ArrayList<>(toQueries(boostConditionFilters, queryShardContext));
         HybridQueryContext hybridQueryContext = HybridQueryContext.builder()
             .paginationDepth(paginationDepth)
             .boostConditionQueries(compiledBoostConditions)
@@ -379,13 +389,14 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         }
         // Rewrite boost conditions independently; if any sub-query or condition changed we must carry the
         // (rewritten) conditions onto the new builder, otherwise they are silently dropped on rewrite.
-        List<QueryBuilder> rewrittenBoostConditions = new ArrayList<>(boostConditions.size());
-        for (QueryBuilder condition : boostConditions) {
-            QueryBuilder result = condition.rewrite(queryShardContext);
-            if (result != condition) {
+        List<BoostCondition> rewrittenBoostConditions = new ArrayList<>(boostConditions.size());
+        for (BoostCondition condition : boostConditions) {
+            QueryBuilder result = condition.getFilter().rewrite(queryShardContext);
+            if (result != condition.getFilter()) {
                 changed = true;
             }
-            rewrittenBoostConditions.add(result);
+            // preserve the (reserved) factor across rewrite
+            rewrittenBoostConditions.add(new BoostCondition(result, condition.getFactor()));
         }
         if (changed) {
             newBuilder.queryName(queryName);
@@ -393,9 +404,7 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             if (isClusterOnOrAfterMinReqVersionForPaginationInHybridQuery()) {
                 newBuilder.paginationDepth(paginationDepth);
             }
-            for (QueryBuilder condition : rewrittenBoostConditions) {
-                newBuilder.addBoostCondition(condition);
-            }
+            newBuilder.boostConditions.addAll(rewrittenBoostConditions);
             return newBuilder;
         } else {
             return this;
