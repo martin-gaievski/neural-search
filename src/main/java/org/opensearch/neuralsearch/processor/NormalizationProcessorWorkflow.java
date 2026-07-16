@@ -112,6 +112,11 @@ public class NormalizationProcessorWorkflow {
         log.debug("Do score combination");
         scoreCombiner.combineScores(combineScoresDTO);
 
+        // conditional result boost: promote docs matching the ordered boost conditions into tier bands, encoded
+        // into ScoreDoc.score so the promotion survives the cross-shard merge. Runs after combine (so it operates
+        // on final combined scores) and before pagination trim (so promoted order holds across all pages).
+        applyConditionalBoost(queryTopDocs);
+
         // post-process data
         log.debug("Post-process query results after score normalization and combination");
         updateOriginalQueryResults(combineScoresDTO, fetchSearchResultOptional.isPresent());
@@ -121,6 +126,89 @@ public class NormalizationProcessorWorkflow {
             unprocessedDocIds,
             combineScoresDTO.getFromValueForSingleShard()
         );
+    }
+
+    /**
+     * Apply conditional result boost. For each shard, look up the per-doc tier (produced shard-side by the
+     * collector and delivered here via {@link HybridBoostTierRegistry}) and rewrite eligible docs' scores into a
+     * globally-dominant tier band so the promotion survives the cross-shard merge which orders purely by score.
+     *
+     * <p>POC scope: the tier map is delivered through a JVM-local registry, which is correct only when shard
+     * collection and this coordinator step share a JVM (single-node). See {@link HybridBoostTierRegistry}.
+     */
+    private void applyConditionalBoost(final List<CompoundTopDocs> queryTopDocs) {
+        Map<SearchShard, HybridBoostTierRegistry.ShardTiers> tiersByShard = new HashMap<>();
+        int maxNumConditions = 0;
+        for (CompoundTopDocs compoundTopDocs : queryTopDocs) {
+            if (Objects.isNull(compoundTopDocs)) {
+                continue;
+            }
+            HybridBoostTierRegistry.ShardTiers shardTiers = HybridBoostTierRegistry.takeAndClear(compoundTopDocs.getSearchShard());
+            if (Objects.nonNull(shardTiers) && shardTiers.getDocIdToTier().isEmpty() == false) {
+                tiersByShard.put(compoundTopDocs.getSearchShard(), shardTiers);
+                maxNumConditions = Math.max(maxNumConditions, shardTiers.getNumConditions());
+            }
+        }
+        if (tiersByShard.isEmpty()) {
+            return;
+        }
+        applyConditionalBoost(queryTopDocs, tiersByShard, maxNumConditions);
+    }
+
+    /**
+     * Core band-rewrite, extracted so it can be unit tested with an injected tier map (no transport required).
+     * Encodes tier promotion into ScoreDoc.score: eligible docs get {@code combinedScore + (numConditions - tier) *
+     * band} where {@code band = globalMaxCombinedScore + 1}, so tier 0 sits strictly above tier 1, above organic,
+     * across all shards, while preserving combined-score order within each band.
+     *
+     * @param queryTopDocs per-shard combined results (score-descending) to rewrite in place
+     * @param tiersByShard per-shard doc-id -> tier map (tier 0 = highest priority)
+     * @param numConditions number of boost conditions (tiers); docs with tier &gt;= numConditions stay organic
+     */
+    void applyConditionalBoost(
+        final List<CompoundTopDocs> queryTopDocs,
+        final Map<SearchShard, HybridBoostTierRegistry.ShardTiers> tiersByShard,
+        final int numConditions
+    ) {
+        if (tiersByShard.isEmpty() || numConditions <= 0) {
+            return;
+        }
+        // Global max combined score across all shards' current (post-combine) scoreDocs.
+        float globalMax = 0.0f;
+        for (CompoundTopDocs compoundTopDocs : queryTopDocs) {
+            if (Objects.isNull(compoundTopDocs) || Objects.isNull(compoundTopDocs.getScoreDocs())) {
+                continue;
+            }
+            for (ScoreDoc scoreDoc : compoundTopDocs.getScoreDocs()) {
+                globalMax = Math.max(globalMax, scoreDoc.score);
+            }
+        }
+        final float band = globalMax + 1.0f;
+
+        for (CompoundTopDocs compoundTopDocs : queryTopDocs) {
+            if (Objects.isNull(compoundTopDocs) || Objects.isNull(compoundTopDocs.getScoreDocs())) {
+                continue;
+            }
+            HybridBoostTierRegistry.ShardTiers shardTiers = tiersByShard.get(compoundTopDocs.getSearchShard());
+            if (Objects.isNull(shardTiers)) {
+                continue;
+            }
+            Map<Integer, Integer> docIdToTier = shardTiers.getDocIdToTier();
+            boolean anyBoosted = false;
+            for (ScoreDoc scoreDoc : compoundTopDocs.getScoreDocs()) {
+                Integer tier = docIdToTier.get(scoreDoc.doc);
+                if (Objects.nonNull(tier) && tier < numConditions) {
+                    scoreDoc.score = scoreDoc.score + (numConditions - tier) * band;
+                    anyBoosted = true;
+                }
+            }
+            if (anyBoosted) {
+                // Re-sort this shard's list by the rewritten scores (descending) so downstream consumers that
+                // read scoreDocs order (single-shard fetch, collapse) reflect the promotion; multi-shard relies
+                // on core's by-score merge which the band encoding already satisfies.
+                compoundTopDocs.getScoreDocs().sort((a, b) -> Float.compare(b.score, a.score));
+            }
+        }
     }
 
     private boolean getIsSingleShard(final NormalizationProcessorWorkflowExecuteRequest request) {

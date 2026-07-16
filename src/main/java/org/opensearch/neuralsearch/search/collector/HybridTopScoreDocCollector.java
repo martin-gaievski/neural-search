@@ -7,8 +7,10 @@ package org.opensearch.neuralsearch.search.collector;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 
 import lombok.Getter;
@@ -20,9 +22,12 @@ import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
+import org.apache.lucene.search.Weight;
+import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.PriorityQueue;
 
 import lombok.extern.log4j.Log4j2;
+import org.opensearch.common.lucene.Lucene;
 import org.opensearch.neuralsearch.query.HybridSubQueryScorer;
 import org.opensearch.neuralsearch.search.HitsThresholdChecker;
 
@@ -43,15 +48,38 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
     @Getter
     private float maxScore = 0.0f;
 
+    // POC (conditional result boost): compiled Lucene weights for the ordered boost conditions, one per condition.
+    // Empty when the feature is not used, in which case the per-doc tier logic below is a no-op.
+    private final List<Weight> boostConditionWeights;
+    // Maps a shard-local Lucene docId (doc + docBase, matching the value stored in ScoreDoc.doc) to the index of
+    // the first boost condition it matched (tier 0 = highest priority). Docs matching no condition are absent.
+    @Getter
+    private final Map<Integer, Integer> docIdToTier = new HashMap<>();
+
     public HybridTopScoreDocCollector(int numHits, HitsThresholdChecker hitsThresholdChecker) {
+        this(numHits, hitsThresholdChecker, List.of());
+    }
+
+    public HybridTopScoreDocCollector(int numHits, HitsThresholdChecker hitsThresholdChecker, List<Weight> boostConditionWeights) {
         numOfHits = numHits;
         this.hitsThresholdChecker = hitsThresholdChecker;
+        this.boostConditionWeights = boostConditionWeights == null ? List.of() : boostConditionWeights;
     }
 
     @Override
-    public LeafCollector getLeafCollector(LeafReaderContext context) {
+    public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
         docBase = context.docBase;
-        return new HybridTopScoreLeafCollector();
+        // Build one sequential-access Bits per boost condition for this segment. asSequentialAccessBits requires
+        // that get(doc) be called with monotonically increasing docIds, which the collect() contract satisfies
+        // (Lucene invokes collect() in ascending docId order per leaf). A null scorerSupplier (condition matches
+        // nothing on this segment) yields a MatchNoBits, so get() is always safe to call.
+        final List<Bits> conditionBits = new ArrayList<>(boostConditionWeights.size());
+        for (Weight weight : boostConditionWeights) {
+            conditionBits.add(
+                Lucene.asSequentialAccessBits(context.reader().maxDoc(), weight == null ? null : weight.scorerSupplier(context))
+            );
+        }
+        return new HybridTopScoreLeafCollector(conditionBits);
     }
 
     @Override
@@ -121,6 +149,15 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
      */
     protected class HybridTopScoreLeafCollector extends HybridLeafCollector {
         float[] minScoreThresholds;
+        private final List<Bits> conditionBits;
+
+        HybridTopScoreLeafCollector() {
+            this(List.of());
+        }
+
+        HybridTopScoreLeafCollector(List<Bits> conditionBits) {
+            this.conditionBits = conditionBits;
+        }
 
         @Override
         public void setScorer(Scorable scorer) throws IOException {
@@ -145,6 +182,16 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
             totalHits++;
             float[] scores = compoundQueryScorer.getSubQueryScores();
             int docWithBase = doc + docBase;
+            // Determine the boost tier for this doc: the index of the first matching condition (0 = highest
+            // priority). Read each condition's Bits with the SEGMENT-LOCAL doc (not docWithBase). Docs matching
+            // no condition stay organic and are left out of the map. Read once per doc to honor the
+            // sequential-access (ascending) contract of asSequentialAccessBits.
+            for (int conditionIndex = 0; conditionIndex < conditionBits.size(); conditionIndex++) {
+                if (conditionBits.get(conditionIndex).get(doc)) {
+                    docIdToTier.put(docWithBase, conditionIndex);
+                    break;
+                }
+            }
             for (int subQueryIndex = 0; subQueryIndex < scores.length; subQueryIndex++) {
                 float score = scores[subQueryIndex];
                 if (isNonCompetitiveScore(score, subQueryIndex)) {

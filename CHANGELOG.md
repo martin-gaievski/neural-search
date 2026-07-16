@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased 3.x](https://github.com/opensearch-project/neural-search/compare/main...HEAD)
 
 ### Features
+* [Hybrid Query] POC: condition-based result boost via ordered `boost_conditions` (promote docs matching per-campaign filters into tier bands, no per-doc fields)
 
 ### Enhancements
 * Improve hybrid query filter validation error message ([#1870](https://github.com/opensearch-project/neural-search/pull/1870))

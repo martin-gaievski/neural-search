@@ -908,6 +908,144 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         assertEquals(original, copy);
     }
 
+    @SneakyThrows
+    public void testBoostConditions_whenFromXContent_thenParsedInOrder() {
+        setUpClusterService();
+        XContentBuilder xContentBuilder = XContentFactory.jsonBuilder()
+            .startObject()
+            .startArray("queries")
+            .startObject()
+            .startObject(TermQueryBuilder.NAME)
+            .field(TEXT_FIELD_NAME, TERM_QUERY_TEXT)
+            .endObject()
+            .endObject()
+            .endArray()
+            .field("pagination_depth", 100)
+            .startArray("boost_conditions")
+            .startObject()
+            .startObject("filter")
+            .startObject(TermQueryBuilder.NAME)
+            .field("campaign_id", "SUMMER-2026")
+            .endObject()
+            .endObject()
+            .endObject()
+            .startObject()
+            .startObject("filter")
+            .startObject(TermQueryBuilder.NAME)
+            .field("in_stock", "true")
+            .endObject()
+            .endObject()
+            .endObject()
+            .endArray()
+            .endObject();
+
+        NamedXContentRegistry namedXContentRegistry = new NamedXContentRegistry(
+            List.of(
+                new NamedXContentRegistry.Entry(QueryBuilder.class, new ParseField(TermQueryBuilder.NAME), TermQueryBuilder::fromXContent),
+                new NamedXContentRegistry.Entry(
+                    QueryBuilder.class,
+                    new ParseField(HybridQueryBuilder.NAME),
+                    HybridQueryBuilder::fromXContent
+                )
+            )
+        );
+        XContentParser contentParser = createParser(
+            namedXContentRegistry,
+            xContentBuilder.contentType().xContent(),
+            BytesReference.bytes(xContentBuilder)
+        );
+        contentParser.nextToken();
+
+        HybridQueryBuilder query = HybridQueryBuilder.fromXContent(contentParser);
+        assertEquals(1, query.queries().size());
+        assertEquals(2, query.boostConditions().size());
+        // order is preserved: campaign filter first (tier 0), in_stock filter second (tier 1)
+        assertTrue(query.boostConditions().get(0) instanceof TermQueryBuilder);
+        assertEquals("campaign_id", ((TermQueryBuilder) query.boostConditions().get(0)).fieldName());
+        assertEquals("in_stock", ((TermQueryBuilder) query.boostConditions().get(1)).fieldName());
+    }
+
+    @SneakyThrows
+    public void testBoostConditions_whenWrittenToStream_thenRoundTrips() {
+        setUpClusterService();
+        HybridQueryBuilder original = new HybridQueryBuilder();
+        original.add(QueryBuilders.termQuery(TEXT_FIELD_NAME, TERM_QUERY_TEXT));
+        original.addBoostCondition(QueryBuilders.termQuery("campaign_id", "SUMMER-2026"));
+        original.addBoostCondition(QueryBuilders.termQuery("in_stock", "true"));
+
+        BytesStreamOutput streamOutput = new BytesStreamOutput();
+        original.writeTo(streamOutput);
+
+        FilterStreamInput filterStreamInput = new NamedWriteableAwareStreamInput(
+            streamOutput.bytes().streamInput(),
+            new NamedWriteableRegistry(
+                List.of(
+                    new NamedWriteableRegistry.Entry(QueryBuilder.class, TermQueryBuilder.NAME, TermQueryBuilder::new),
+                    new NamedWriteableRegistry.Entry(QueryBuilder.class, HybridQueryBuilder.NAME, HybridQueryBuilder::new)
+                )
+            )
+        );
+        HybridQueryBuilder copy = new HybridQueryBuilder(filterStreamInput);
+        assertEquals(2, copy.boostConditions().size());
+        assertEquals(original, copy);
+    }
+
+    public void testBoostConditions_whenDifferent_thenNotEqual() {
+        setUpClusterService();
+        HybridQueryBuilder a = new HybridQueryBuilder();
+        a.add(QueryBuilders.termQuery(TEXT_FIELD_NAME, TERM_QUERY_TEXT));
+        HybridQueryBuilder b = new HybridQueryBuilder();
+        b.add(QueryBuilders.termQuery(TEXT_FIELD_NAME, TERM_QUERY_TEXT));
+        assertEquals(a, b);
+        a.addBoostCondition(QueryBuilders.termQuery("campaign_id", "SUMMER-2026"));
+        assertNotEquals(a, b);
+        assertNotEquals(a.hashCode(), b.hashCode());
+    }
+
+    @SneakyThrows
+    public void testBoostConditions_whenExceedsMax_thenThrows() {
+        setUpClusterService();
+        XContentBuilder xContentBuilder = XContentFactory.jsonBuilder()
+            .startObject()
+            .startArray("queries")
+            .startObject()
+            .startObject(TermQueryBuilder.NAME)
+            .field(TEXT_FIELD_NAME, TERM_QUERY_TEXT)
+            .endObject()
+            .endObject()
+            .endArray()
+            .startArray("boost_conditions");
+        for (int i = 0; i < HybridQueryBuilder.MAX_NUMBER_OF_BOOST_CONDITIONS + 1; i++) {
+            xContentBuilder.startObject()
+                .startObject("filter")
+                .startObject(TermQueryBuilder.NAME)
+                .field("campaign_id", "C" + i)
+                .endObject()
+                .endObject()
+                .endObject();
+        }
+        xContentBuilder.endArray().endObject();
+
+        NamedXContentRegistry namedXContentRegistry = new NamedXContentRegistry(
+            List.of(
+                new NamedXContentRegistry.Entry(QueryBuilder.class, new ParseField(TermQueryBuilder.NAME), TermQueryBuilder::fromXContent),
+                new NamedXContentRegistry.Entry(
+                    QueryBuilder.class,
+                    new ParseField(HybridQueryBuilder.NAME),
+                    HybridQueryBuilder::fromXContent
+                )
+            )
+        );
+        XContentParser contentParser = createParser(
+            namedXContentRegistry,
+            xContentBuilder.contentType().xContent(),
+            BytesReference.bytes(xContentBuilder)
+        );
+        contentParser.nextToken();
+
+        expectThrows(ParsingException.class, () -> HybridQueryBuilder.fromXContent(contentParser));
+    }
+
     public void testHashAndEquals_whenSameOrIdenticalObject_thenReturnEqual() {
         setUpClusterService();
         HybridQueryBuilder hybridQueryBuilderBaseline = new HybridQueryBuilder();

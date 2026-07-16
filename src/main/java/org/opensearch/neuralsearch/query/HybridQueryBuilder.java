@@ -43,6 +43,7 @@ import org.opensearch.neuralsearch.stats.events.EventStatName;
 import org.opensearch.neuralsearch.stats.events.EventStatsManager;
 
 import static org.opensearch.neuralsearch.common.MinClusterVersionUtil.isClusterOnOrAfterMinReqVersionForPaginationInHybridQuery;
+import static org.opensearch.neuralsearch.common.MinClusterVersionUtil.isClusterOnOrAfterMinReqVersionForBoostConditions;
 
 /**
  * Class abstract creation of a Query type "hybrid". Hybrid query will allow execution of multiple sub-queries and
@@ -59,12 +60,22 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     private static final ParseField QUERIES_FIELD = new ParseField("queries");
     private static final ParseField FILTER_FIELD = new ParseField("filter");
     private static final ParseField PAGINATION_DEPTH_FIELD = new ParseField("pagination_depth");
+    private static final ParseField BOOST_CONDITIONS_FIELD = new ParseField("boost_conditions");
+    private static final ParseField BOOST_CONDITION_FILTER_FIELD = new ParseField("filter");
 
     private final List<QueryBuilder> queries = new ArrayList<>();
 
     private Integer paginationDepth;
 
+    // Ordered list of result-boost conditions. Documents matching boostConditions[0] are promoted into the
+    // top tier band, boostConditions[1] the next, and so on; non-matching docs stay organic. This does NOT
+    // restrict the result set (contrast with {@link #filter(QueryBuilder)}), it only reorders the final ranking.
+    private final List<QueryBuilder> boostConditions = new ArrayList<>();
+
     public static final int MAX_NUMBER_OF_SUB_QUERIES = 5;
+    public static final int MAX_NUMBER_OF_BOOST_CONDITIONS = 10;
+    public static final String ERROR_MSG_MAX_BOOST_CONDITIONS_EXCEEDED =
+        "Number of boost_conditions exceeds maximum supported by [%s] query";
     private static final int LOWER_BOUND_OF_PAGINATION_DEPTH = 0;
 
     // Error message templates for reuse across REST and gRPC paths
@@ -79,6 +90,9 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         if (isClusterOnOrAfterMinReqVersionForPaginationInHybridQuery()) {
             paginationDepth = in.readOptionalInt();
         }
+        if (isClusterOnOrAfterMinReqVersionForBoostConditions()) {
+            boostConditions.addAll(in.readNamedWriteableList(QueryBuilder.class));
+        }
     }
 
     /**
@@ -92,6 +106,9 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         if (isClusterOnOrAfterMinReqVersionForPaginationInHybridQuery()) {
             out.writeOptionalInt(paginationDepth);
         }
+        if (isClusterOnOrAfterMinReqVersionForBoostConditions()) {
+            out.writeNamedWriteableList(boostConditions);
+        }
     }
 
     /**
@@ -104,6 +121,20 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             throw new IllegalArgumentException(String.format(Locale.ROOT, "inner %s query clause cannot be null", NAME));
         }
         queries.add(queryBuilder);
+        return this;
+    }
+
+    /**
+     * Add one ordered result-boost condition. Documents matching earlier conditions are promoted above those
+     * matching later conditions; the condition does not restrict the result set.
+     * @param queryBuilder the condition query (the inner query of a {@code {"filter": ...}} wrapper)
+     * @return HybridQueryBuilder itself
+     */
+    public HybridQueryBuilder addBoostCondition(QueryBuilder queryBuilder) {
+        if (queryBuilder == null) {
+            throw new IllegalArgumentException(String.format(Locale.ROOT, "boost condition clause cannot be null in %s query", NAME));
+        }
+        boostConditions.add(queryBuilder);
         return this;
     }
 
@@ -145,6 +176,16 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         if (Objects.nonNull(paginationDepth)) {
             builder.field(PAGINATION_DEPTH_FIELD.getPreferredName(), paginationDepth);
         }
+        if (boostConditions.isEmpty() == false) {
+            builder.startArray(BOOST_CONDITIONS_FIELD.getPreferredName());
+            for (QueryBuilder condition : boostConditions) {
+                builder.startObject();
+                builder.field(BOOST_CONDITION_FILTER_FIELD.getPreferredName());
+                condition.toXContent(builder, params);
+                builder.endObject();
+            }
+            builder.endArray();
+        }
         printBoostAndQueryName(builder);
         builder.endObject();
     }
@@ -162,7 +203,11 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             return Queries.newMatchNoDocsQuery(String.format(Locale.ROOT, "no clauses for %s query", NAME));
         }
         validatePaginationDepth(paginationDepth, queryShardContext);
-        HybridQueryContext hybridQueryContext = HybridQueryContext.builder().paginationDepth(paginationDepth).build();
+        List<Query> compiledBoostConditions = new ArrayList<>(toQueries(boostConditions, queryShardContext));
+        HybridQueryContext hybridQueryContext = HybridQueryContext.builder()
+            .paginationDepth(paginationDepth)
+            .boostConditionQueries(compiledBoostConditions)
+            .build();
         return new HybridQuery(queryCollection, hybridQueryContext);
     }
 
@@ -218,6 +263,7 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
 
         Integer paginationDepth = null;
         final List<QueryBuilder> queries = new ArrayList<>();
+        final List<QueryBuilder> boostConditions = new ArrayList<>();
         QueryBuilder filter = null;
         String queryName = null;
 
@@ -244,6 +290,18 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                             );
                         }
                         queries.add(parseInnerQueryBuilder(parser));
+                        token = parser.nextToken();
+                    }
+                } else if (BOOST_CONDITIONS_FIELD.match(currentFieldName, parser.getDeprecationHandler())) {
+                    token = parser.nextToken();
+                    while (token != XContentParser.Token.END_ARRAY) {
+                        if (boostConditions.size() == MAX_NUMBER_OF_BOOST_CONDITIONS) {
+                            throw new ParsingException(
+                                parser.getTokenLocation(),
+                                String.format(Locale.ROOT, ERROR_MSG_MAX_BOOST_CONDITIONS_EXCEEDED, NAME)
+                            );
+                        }
+                        boostConditions.add(parseBoostCondition(parser));
                         token = parser.nextToken();
                     }
                 } else if (FILTER_FIELD.match(currentFieldName, parser.getDeprecationHandler())) {
@@ -281,6 +339,11 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         if (isClusterOnOrAfterMinReqVersionForPaginationInHybridQuery()) {
             compoundQueryBuilder.paginationDepth(paginationDepth);
         }
+        if (isClusterOnOrAfterMinReqVersionForBoostConditions()) {
+            for (QueryBuilder condition : boostConditions) {
+                compoundQueryBuilder.addBoostCondition(condition);
+            }
+        }
 
         boolean hasInnerHits = false;
         for (QueryBuilder query : queries) {
@@ -314,11 +377,24 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             }
             newBuilder.add(result);
         }
+        // Rewrite boost conditions independently; if any sub-query or condition changed we must carry the
+        // (rewritten) conditions onto the new builder, otherwise they are silently dropped on rewrite.
+        List<QueryBuilder> rewrittenBoostConditions = new ArrayList<>(boostConditions.size());
+        for (QueryBuilder condition : boostConditions) {
+            QueryBuilder result = condition.rewrite(queryShardContext);
+            if (result != condition) {
+                changed = true;
+            }
+            rewrittenBoostConditions.add(result);
+        }
         if (changed) {
             newBuilder.queryName(queryName);
             newBuilder.boost(boost);
             if (isClusterOnOrAfterMinReqVersionForPaginationInHybridQuery()) {
                 newBuilder.paginationDepth(paginationDepth);
+            }
+            for (QueryBuilder condition : rewrittenBoostConditions) {
+                newBuilder.addBoostCondition(condition);
             }
             return newBuilder;
         } else {
@@ -342,6 +418,7 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         EqualsBuilder equalsBuilder = new EqualsBuilder();
         equalsBuilder.append(queries, obj.queries);
         equalsBuilder.append(paginationDepth, obj.paginationDepth);
+        equalsBuilder.append(boostConditions, obj.boostConditions);
         return equalsBuilder.isEquals();
     }
 
@@ -351,7 +428,7 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      */
     @Override
     protected int doHashCode() {
-        return Objects.hash(queries, paginationDepth);
+        return Objects.hash(queries, paginationDepth, boostConditions);
     }
 
     /**
@@ -445,6 +522,38 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         if (hasInnerHits) {
             EventStatsManager.increment(EventStatName.HYBRID_QUERY_INNER_HITS_REQUESTS);
         }
+    }
+
+    /**
+     * Parse a single boost-condition element of the shape {@code { "filter": <query> }}. On entry the parser is
+     * positioned at the wrapper START_OBJECT; on return it is positioned at the wrapper END_OBJECT.
+     * @param parser the content parser
+     * @return the parsed condition query
+     */
+    private static QueryBuilder parseBoostCondition(XContentParser parser) throws IOException {
+        if (parser.currentToken() != XContentParser.Token.START_OBJECT) {
+            throw new ParsingException(
+                parser.getTokenLocation(),
+                String.format(Locale.ROOT, "[%s] boost_conditions element must be an object with a single [filter] clause", NAME)
+            );
+        }
+        XContentParser.Token token = parser.nextToken();
+        if (token != XContentParser.Token.FIELD_NAME
+            || BOOST_CONDITION_FILTER_FIELD.match(parser.currentName(), parser.getDeprecationHandler()) == false) {
+            throw new ParsingException(
+                parser.getTokenLocation(),
+                String.format(Locale.ROOT, "[%s] boost_conditions element requires a single [filter] clause", NAME)
+            );
+        }
+        QueryBuilder condition = parseInnerQueryBuilder(parser);
+        // after the inner query, the wrapper object must close immediately (only a single 'filter' key is allowed)
+        if (parser.nextToken() != XContentParser.Token.END_OBJECT) {
+            throw new ParsingException(
+                parser.getTokenLocation(),
+                String.format(Locale.ROOT, "[%s] boost_conditions element supports only a single [filter] clause", NAME)
+            );
+        }
+        return condition;
     }
 
     private static void throwUnsupportedFilterParsingException(XContentParser parser) {

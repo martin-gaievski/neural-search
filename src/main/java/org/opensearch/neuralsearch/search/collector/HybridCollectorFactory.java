@@ -77,7 +77,7 @@ public class HybridCollectorFactory {
             }
         } else {
             if (sortAndFormats == null) {
-                return new HybridTopScoreDocCollector(numHits, hitsThresholdChecker);
+                return new HybridTopScoreDocCollector(numHits, hitsThresholdChecker, hybridCollectorFactoryDTO.getBoostConditionWeights());
             } else {
                 // Sorting is applied
                 if (after == null) {
