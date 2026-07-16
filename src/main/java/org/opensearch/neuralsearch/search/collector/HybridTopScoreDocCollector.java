@@ -66,6 +66,15 @@ public class HybridTopScoreDocCollector implements HybridSearchCollector {
         this.boostConditionWeights = boostConditionWeights == null ? List.of() : boostConditionWeights;
     }
 
+    /**
+     * Whether this collector was configured with result-boost conditions. Used to decide whether the sentinel
+     * envelope must carry a (possibly empty) tier section — it must be emitted symmetrically across all segment
+     * collectors of a query so the concurrent-segment merger keeps its section lockstep.
+     */
+    public boolean hasBoostConditions() {
+        return boostConditionWeights.isEmpty() == false;
+    }
+
     @Override
     public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
         docBase = context.docBase;

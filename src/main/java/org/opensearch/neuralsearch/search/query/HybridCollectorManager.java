@@ -19,8 +19,6 @@ import org.apache.lucene.search.Weight;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.lucene.search.FilteredCollector;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
-import org.opensearch.neuralsearch.processor.HybridBoostTierRegistry;
-import org.opensearch.neuralsearch.processor.SearchShard;
 import org.opensearch.neuralsearch.query.HybridQuery;
 import org.opensearch.neuralsearch.search.HitsThresholdChecker;
 import org.opensearch.neuralsearch.search.collector.HybridCollapsingTopDocsCollector;
@@ -38,9 +36,7 @@ import org.opensearch.search.sort.SortAndFormats;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
@@ -175,29 +171,7 @@ public class HybridCollectorManager implements CollectorManager<Collector, Reduc
         if (hybridSearchCollectors.isEmpty()) {
             throw new IllegalStateException("cannot collect results of hybrid search query, there are no proper collectors");
         }
-        publishBoostTiers(hybridSearchCollectors);
         return reduceSearchResults(getSearchResults(hybridSearchCollectors));
-    }
-
-    /**
-     * POC (conditional result boost, single-node only): publish each collector's per-doc tier map to the JVM-local
-     * {@link HybridBoostTierRegistry}, keyed by this shard, so the coordinator normalization workflow can apply the
-     * tier bands. No-op when no boost conditions were configured (map is empty). See {@link HybridBoostTierRegistry}
-     * for the multi-node limitation.
-     */
-    private void publishBoostTiers(final List<HybridSearchCollector> hybridSearchCollectors) {
-        if (boostConditionWeights == null || boostConditionWeights.isEmpty()) {
-            return;
-        }
-        Map<Integer, Integer> merged = new HashMap<>();
-        for (HybridSearchCollector collector : hybridSearchCollectors) {
-            if (collector instanceof HybridTopScoreDocCollector) {
-                merged.putAll(((HybridTopScoreDocCollector) collector).getDocIdToTier());
-            }
-        }
-        if (merged.isEmpty() == false) {
-            HybridBoostTierRegistry.put(SearchShard.createSearchShard(searchContext.shardTarget()), merged, boostConditionWeights.size());
-        }
     }
 
     private List<ReduceableSearchResult> getSearchResults(final List<HybridSearchCollector> hybridSearchCollectors) throws IOException {

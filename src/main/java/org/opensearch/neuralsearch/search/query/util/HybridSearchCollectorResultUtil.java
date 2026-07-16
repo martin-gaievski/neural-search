@@ -29,9 +29,14 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 
+import java.util.Map;
+
+import org.opensearch.neuralsearch.search.collector.HybridTopScoreDocCollector;
+
 import static org.opensearch.neuralsearch.search.util.HybridSearchResultFormatUtil.createCollapseValueDelimiterElementForHybridSearchResults;
 import static org.opensearch.neuralsearch.search.util.HybridSearchResultFormatUtil.createCollapseValueStartStopElementForHybridSearchResults;
 import static org.opensearch.neuralsearch.search.util.HybridSearchResultFormatUtil.createDelimiterElementForHybridSearchResults;
+import static org.opensearch.neuralsearch.search.util.HybridSearchResultFormatUtil.createTierDelimiterElementForHybridSearchResults;
 import static org.opensearch.neuralsearch.search.util.HybridSearchResultFormatUtil.createFieldDocDelimiterElementForHybridSearchResults;
 import static org.opensearch.neuralsearch.search.util.HybridSearchResultFormatUtil.createFieldDocStartStopElementForHybridSearchResults;
 import static org.opensearch.neuralsearch.search.util.HybridSearchResultFormatUtil.createSortFieldsForDelimiterResults;
@@ -254,10 +259,43 @@ public class HybridSearchCollectorResultUtil {
             result.add(createDelimiterElementForHybridSearchResults(delimiterDocId));
             result.addAll(Arrays.asList(topDoc.scoreDocs));
         }
+        // Result-boost tier section (multi-node transport): when boost conditions are configured, append a
+        // tier-delimiter-bounded section carrying one ScoreDoc(matchedDocId, tier) per boosted doc. It rides the
+        // same sentinel envelope as the sub-query scores, so it reaches the coordinator on every shard including
+        // remote ones. The section is emitted whenever the collector carries boost conditions (even with zero
+        // matches, i.e. just the delimiter) so per-segment envelopes stay structurally symmetric for the merger.
+        appendTierSection(result, delimiterDocId);
         result.add(createStartStopElementForHybridSearchResults(delimiterDocId));
         scoreDocs = result.stream().map(doc -> new ScoreDoc(doc.doc, doc.score, doc.shardIndex)).toArray(ScoreDoc[]::new);
 
         return new TopDocs(totalHits, scoreDocs);
+    }
+
+    /**
+     * Append the result-boost tier section to the sentinel envelope, if the collector carries boost conditions.
+     * Layout: [ TIER_DELIMITER, ScoreDoc(docId0, tier0), ScoreDoc(docId1, tier1), ... ]. The section is placed
+     * after all real sub-query sections and before the final start/stop element, so the existing merger (which
+     * walks section-by-section using the special-element predicate) carries it through unchanged, and the
+     * coordinator re-parse splits it off before normalization/combination.
+     */
+    private void appendTierSection(final List<ScoreDoc> result, final int delimiterDocId) {
+        if ((hybridSearchCollector instanceof HybridTopScoreDocCollector) == false) {
+            return;
+        }
+        HybridTopScoreDocCollector collector = (HybridTopScoreDocCollector) hybridSearchCollector;
+        // Emit the tier delimiter whenever boost conditions are configured, even if this segment matched none, so
+        // per-segment envelopes stay structurally symmetric for the concurrent-segment merger's section lockstep.
+        if (collector.hasBoostConditions() == false) {
+            return;
+        }
+        result.add(createTierDelimiterElementForHybridSearchResults(delimiterDocId));
+        Map<Integer, Integer> docIdToTier = collector.getDocIdToTier();
+        if (docIdToTier != null) {
+            for (Map.Entry<Integer, Integer> entry : docIdToTier.entrySet()) {
+                // encode tier as the score of the row; tier is a small non-negative int, distinct from any magic number
+                result.add(new ScoreDoc(entry.getKey(), (float) entry.getValue()));
+            }
+        }
     }
 
     private int findDelimiterDocId(List<? extends TopDocs> topDocs) {

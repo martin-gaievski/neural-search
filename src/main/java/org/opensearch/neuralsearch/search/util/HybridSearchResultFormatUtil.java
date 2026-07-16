@@ -20,6 +20,10 @@ public class HybridSearchResultFormatUtil {
     // and OpenSearch convention is that scores are positive numbers
     public static final Float MAGIC_NUMBER_START_STOP = -9549511920.4881596047f;
     public static final Float MAGIC_NUMBER_DELIMITER = -4422440593.9791198149f;
+    // third magic number marks the start of the result-boost tier section that rides after the real sub-query
+    // sections in the sentinel envelope. Randomly generated, same large-negative convention so it cannot collide
+    // with a real (positive) Lucene score or with the two existing magic numbers.
+    public static final Float MAGIC_NUMBER_TIER_DELIMITER = -7382190564.2317985031f;
 
     /**
      * Create ScoreDoc object that is a start/stop element in case of hybrid search query results
@@ -57,6 +61,24 @@ public class HybridSearchResultFormatUtil {
         return Objects.nonNull(scoreDoc) && scoreDoc.doc >= 0 && Float.compare(scoreDoc.score, MAGIC_NUMBER_DELIMITER) == 0;
     }
 
+    /**
+     * Create ScoreDoc that marks the beginning of the result-boost tier section in hybrid search query results
+     * @param docId id of one of docs from actual result object, or -1 if there are no matches
+     * @return score doc tier-delimiter element
+     */
+    public static ScoreDoc createTierDelimiterElementForHybridSearchResults(final int docId) {
+        return new ScoreDoc(docId, MAGIC_NUMBER_TIER_DELIMITER);
+    }
+
+    /**
+     * Checking if passed scoreDocs object is the result-boost tier-section delimiter
+     * @param scoreDoc score doc object to check on
+     * @return true if it is a tier-delimiter element
+     */
+    public static boolean isHybridQueryTierDelimiterElement(final ScoreDoc scoreDoc) {
+        return Objects.nonNull(scoreDoc) && scoreDoc.doc >= 0 && Float.compare(scoreDoc.score, MAGIC_NUMBER_TIER_DELIMITER) == 0;
+    }
+
     public static FieldDoc createFieldDocStartStopElementForHybridSearchResults(final int docId, final Object[] fields) {
         return new FieldDoc(docId, MAGIC_NUMBER_START_STOP, fields);
     }
@@ -91,7 +113,9 @@ public class HybridSearchResultFormatUtil {
         if (Objects.isNull(scoreDoc)) {
             return false;
         }
-        return isHybridQueryStartStopElement(scoreDoc) || isHybridQueryDelimiterElement(scoreDoc);
+        return isHybridQueryStartStopElement(scoreDoc)
+            || isHybridQueryDelimiterElement(scoreDoc)
+            || isHybridQueryTierDelimiterElement(scoreDoc);
     }
 
     /**

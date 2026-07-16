@@ -129,30 +129,34 @@ public class NormalizationProcessorWorkflow {
     }
 
     /**
-     * Apply conditional result boost. For each shard, look up the per-doc tier (produced shard-side by the
-     * collector and delivered here via {@link HybridBoostTierRegistry}) and rewrite eligible docs' scores into a
+     * Apply conditional result boost. The per-doc tier is produced shard-side by the collector and delivered here,
+     * multi-node-safe, inside the hybrid sentinel envelope (parsed into {@link CompoundTopDocs#getDocIdToBoostTier()}),
+     * so it is present for every shard including remote ones. Eligible docs' scores are rewritten into a
      * globally-dominant tier band so the promotion survives the cross-shard merge which orders purely by score.
-     *
-     * <p>POC scope: the tier map is delivered through a JVM-local registry, which is correct only when shard
-     * collection and this coordinator step share a JVM (single-node). See {@link HybridBoostTierRegistry}.
      */
     private void applyConditionalBoost(final List<CompoundTopDocs> queryTopDocs) {
-        Map<SearchShard, HybridBoostTierRegistry.ShardTiers> tiersByShard = new HashMap<>();
-        int maxNumConditions = 0;
+        Map<SearchShard, Map<Integer, Integer>> tiersByShard = new HashMap<>();
         for (CompoundTopDocs compoundTopDocs : queryTopDocs) {
             if (Objects.isNull(compoundTopDocs)) {
                 continue;
             }
-            HybridBoostTierRegistry.ShardTiers shardTiers = HybridBoostTierRegistry.takeAndClear(compoundTopDocs.getSearchShard());
-            if (Objects.nonNull(shardTiers) && shardTiers.getDocIdToTier().isEmpty() == false) {
-                tiersByShard.put(compoundTopDocs.getSearchShard(), shardTiers);
-                maxNumConditions = Math.max(maxNumConditions, shardTiers.getNumConditions());
+            Map<Integer, Integer> docIdToTier = compoundTopDocs.getDocIdToBoostTier();
+            if (Objects.nonNull(docIdToTier) && docIdToTier.isEmpty() == false) {
+                tiersByShard.put(compoundTopDocs.getSearchShard(), docIdToTier);
             }
         }
         if (tiersByShard.isEmpty()) {
             return;
         }
-        applyConditionalBoost(queryTopDocs, tiersByShard, maxNumConditions);
+        // Derive the number of tiers from the highest tier observed across all shards (tiers are 0-based), so the
+        // band count need not travel on the wire — the band math only requires numConditions > maxTier.
+        int numConditions = 0;
+        for (Map<Integer, Integer> docIdToTier : tiersByShard.values()) {
+            for (int tier : docIdToTier.values()) {
+                numConditions = Math.max(numConditions, tier + 1);
+            }
+        }
+        applyConditionalBoost(queryTopDocs, tiersByShard, numConditions);
     }
 
     /**
@@ -167,7 +171,7 @@ public class NormalizationProcessorWorkflow {
      */
     void applyConditionalBoost(
         final List<CompoundTopDocs> queryTopDocs,
-        final Map<SearchShard, HybridBoostTierRegistry.ShardTiers> tiersByShard,
+        final Map<SearchShard, Map<Integer, Integer>> tiersByShard,
         final int numConditions
     ) {
         if (tiersByShard.isEmpty() || numConditions <= 0) {
@@ -189,11 +193,10 @@ public class NormalizationProcessorWorkflow {
             if (Objects.isNull(compoundTopDocs) || Objects.isNull(compoundTopDocs.getScoreDocs())) {
                 continue;
             }
-            HybridBoostTierRegistry.ShardTiers shardTiers = tiersByShard.get(compoundTopDocs.getSearchShard());
-            if (Objects.isNull(shardTiers)) {
+            Map<Integer, Integer> docIdToTier = tiersByShard.get(compoundTopDocs.getSearchShard());
+            if (Objects.isNull(docIdToTier)) {
                 continue;
             }
-            Map<Integer, Integer> docIdToTier = shardTiers.getDocIdToTier();
             boolean anyBoosted = false;
             for (ScoreDoc scoreDoc : compoundTopDocs.getScoreDocs()) {
                 Integer tier = docIdToTier.get(scoreDoc.doc);

@@ -55,7 +55,7 @@ public class HybridConditionalBoostWorkflowTests extends OpenSearchTestCase {
 
         // tier 0 = {docB, docE}, tier 1 = {docC}; 2 conditions
         Map<Integer, Integer> docIdToTier = Map.of(docB, 0, docE, 0, docC, 1);
-        Map<SearchShard, HybridBoostTierRegistry.ShardTiers> tiers = Map.of(SHARD, new HybridBoostTierRegistry.ShardTiers(docIdToTier, 2));
+        Map<SearchShard, Map<Integer, Integer>> tiers = Map.of(SHARD, docIdToTier);
 
         workflow.applyConditionalBoost(List.of(compoundTopDocs), tiers, 2);
 
@@ -86,7 +86,7 @@ public class HybridConditionalBoostWorkflowTests extends OpenSearchTestCase {
         );
         compoundTopDocs.setScoreDocs(new java.util.ArrayList<>(List.of(combined)));
 
-        workflow.applyConditionalBoost(List.of(compoundTopDocs), Map.of(), 0);
+        workflow.applyConditionalBoost(List.of(compoundTopDocs), Map.<SearchShard, Map<Integer, Integer>>of(), 0);
 
         List<Integer> order = compoundTopDocs.getScoreDocs().stream().map(sd -> sd.doc).toList();
         assertEquals(List.of(1, 2), order);

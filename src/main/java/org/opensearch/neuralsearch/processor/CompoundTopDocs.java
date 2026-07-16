@@ -11,13 +11,16 @@ import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TopFieldDocs;
 import static org.opensearch.neuralsearch.search.util.HybridSearchResultFormatUtil.isHybridQueryDelimiterElement;
 import static org.opensearch.neuralsearch.search.util.HybridSearchResultFormatUtil.isHybridQueryStartStopElement;
+import static org.opensearch.neuralsearch.search.util.HybridSearchResultFormatUtil.isHybridQueryTierDelimiterElement;
+
+import java.util.HashMap;
+import java.util.Map;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 
-import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.ToString;
@@ -30,7 +33,6 @@ import org.opensearch.search.query.QuerySearchResult;
  * Class stores collection of TopDocs for each sub query from hybrid query. Collection of results is at shard level. We do store
  * list of TopDocs and list of ScoreDoc as well as total hits for the shard.
  */
-@AllArgsConstructor
 @Getter
 @ToString(includeFieldNames = true)
 @Log4j2
@@ -43,6 +45,28 @@ public class CompoundTopDocs {
     private List<ScoreDoc> scoreDocs;
     @Getter
     private SearchShard searchShard;
+    // Result-boost tier map parsed from the sentinel envelope's tier section: shard-local docId -> tier
+    // (0 = highest priority). Empty when the query carries no boost conditions. This is the multi-node-safe
+    // replacement for the JVM-static tier registry.
+    @Getter
+    private Map<Integer, Integer> docIdToBoostTier = new HashMap<>();
+
+    /**
+     * All-args constructor preserved with the pre-boost-tier signature so existing callers keep compiling;
+     * {@link #docIdToBoostTier} defaults to empty and is only populated by the {@link QuerySearchResult} parse
+     * constructor (the sole path that carries a tier section).
+     */
+    public CompoundTopDocs(
+        final TotalHits totalHits,
+        final List<TopDocs> topDocs,
+        final List<ScoreDoc> scoreDocs,
+        final SearchShard searchShard
+    ) {
+        this.totalHits = totalHits;
+        this.topDocs = topDocs;
+        this.scoreDocs = scoreDocs;
+        this.searchShard = searchShard;
+    }
 
     public CompoundTopDocs(
         final TotalHits totalHits,
@@ -104,29 +128,30 @@ public class CompoundTopDocs {
         List<TopDocs> topDocsList = new ArrayList<>();
         List<ScoreDoc> scoreDocList = new ArrayList<>();
         List<Object> collapseValueList = new ArrayList<>();
+        Map<Integer, Integer> boostTiers = new HashMap<>();
+        // once we cross the tier-delimiter, the remaining rows are (docId, tier) pairs, not sub-query hits
+        boolean inTierSection = false;
         for (int index = 2; index < scoreDocs.length; index++) {
             // getting first element of score's series
             ScoreDoc scoreDoc = scoreDocs[index];
-            if (isHybridQueryDelimiterElement(scoreDoc) || isHybridQueryStartStopElement(scoreDoc)) {
+            if (isHybridQueryTierDelimiterElement(scoreDoc)) {
+                // close the current sub-query series (as a normal delimiter would) and switch to tier mode; the
+                // tier rows are intentionally NOT added as a sub-query TopDocs, so normalize/combine never see them
                 ScoreDoc[] subQueryScores = scoreDocList.toArray(new ScoreDoc[0]);
-                TotalHits totalHits = new TotalHits(subQueryScores.length, TotalHits.Relation.EQUAL_TO);
-                TopDocs subQueryTopDocs;
-                if (isCollapseEnabled) {
-                    CollapseTopFieldDocs collapseTopFieldDocs = (CollapseTopFieldDocs) topDocs;
-                    subQueryTopDocs = new CollapseTopFieldDocs(
-                        collapseTopFieldDocs.field,
-                        totalHits,
-                        subQueryScores,
-                        collapseTopFieldDocs.fields,
-                        collapseValueList.toArray(new Object[0])
-                    );
-                    collapseValueList.clear();
-                } else if (isSortEnabled) {
-                    subQueryTopDocs = new TopFieldDocs(totalHits, subQueryScores, ((TopFieldDocs) topDocs).fields);
-                } else {
-                    subQueryTopDocs = new TopDocs(totalHits, subQueryScores);
+                topDocsList.add(buildSubQueryTopDocs(subQueryScores, topDocs, isSortEnabled, isCollapseEnabled, collapseValueList));
+                scoreDocList.clear();
+                collapseValueList.clear();
+                inTierSection = true;
+            } else if (inTierSection) {
+                // tier row: score slot carries the tier value (encoded as float on the data node). The trailing
+                // start/stop element that closes the whole envelope must NOT be treated as a tier row.
+                if (isHybridQueryStartStopElement(scoreDoc) == false) {
+                    boostTiers.put(scoreDoc.doc, Math.round(scoreDoc.score));
                 }
-                topDocsList.add(subQueryTopDocs);
+            } else if (isHybridQueryDelimiterElement(scoreDoc) || isHybridQueryStartStopElement(scoreDoc)) {
+                ScoreDoc[] subQueryScores = scoreDocList.toArray(new ScoreDoc[0]);
+                topDocsList.add(buildSubQueryTopDocs(subQueryScores, topDocs, isSortEnabled, isCollapseEnabled, collapseValueList));
+                collapseValueList.clear();
                 scoreDocList.clear();
             } else {
                 scoreDocList.add(scoreDoc);
@@ -137,6 +162,30 @@ public class CompoundTopDocs {
             }
         }
         initialize(topDocs.totalHits, topDocsList, isSortEnabled, searchShard);
+        this.docIdToBoostTier = boostTiers;
+    }
+
+    private static TopDocs buildSubQueryTopDocs(
+        final ScoreDoc[] subQueryScores,
+        final TopDocs topDocs,
+        final boolean isSortEnabled,
+        final boolean isCollapseEnabled,
+        final List<Object> collapseValueList
+    ) {
+        TotalHits totalHits = new TotalHits(subQueryScores.length, TotalHits.Relation.EQUAL_TO);
+        if (isCollapseEnabled) {
+            CollapseTopFieldDocs collapseTopFieldDocs = (CollapseTopFieldDocs) topDocs;
+            return new CollapseTopFieldDocs(
+                collapseTopFieldDocs.field,
+                totalHits,
+                subQueryScores,
+                collapseTopFieldDocs.fields,
+                collapseValueList.toArray(new Object[0])
+            );
+        } else if (isSortEnabled) {
+            return new TopFieldDocs(totalHits, subQueryScores, ((TopFieldDocs) topDocs).fields);
+        }
+        return new TopDocs(totalHits, subQueryScores);
     }
 
     private List<ScoreDoc> cloneLargestScoreDocs(final List<TopDocs> docs, boolean isSortEnabled) {
