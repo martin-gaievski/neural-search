@@ -109,6 +109,100 @@ public class HybridConditionalBoostIT extends BaseNeuralSearchIT {
         }
     }
 
+    /**
+     * Pagination test: a boost-matching document that naturally sorts BELOW page 1 must be promoted ONTO page 1
+     * once the boost condition is applied. Runs multi-shard (core applies from/size trim AFTER the normalization
+     * processor, ordering by the band-encoded score), which is where the "boost before pagination" property is
+     * load-bearing. pagination_depth is set on every query so the weak target (doc 6) is retrieved into its
+     * shard's collection window and gets a tier (retrieval-not-injection gate).
+     */
+    @SneakyThrows
+    public void testConditionalBoost_whenTargetBelowPageOne_thenPromotedOntoPageOne() {
+        try {
+            initializeIndexIfNotExists();
+            createSearchPipelineWithResultsPostProcessor(SEARCH_PIPELINE);
+
+            HybridQueryBuilder baseline = new HybridQueryBuilder();
+            baseline.add(new MatchQueryBuilder(TEXT_FIELD, "mission"));
+            baseline.add(QueryBuilders.termQuery(TEXT_FIELD, "impossible"));
+            baseline.paginationDepth(10);
+
+            HybridQueryBuilder boosted = new HybridQueryBuilder();
+            boosted.add(new MatchQueryBuilder(TEXT_FIELD, "mission"));
+            boosted.add(QueryBuilders.termQuery(TEXT_FIELD, "impossible"));
+            boosted.addBoostCondition(QueryBuilders.termQuery(CATEGORY_FIELD, "Drama"));
+            boosted.paginationDepth(10);
+
+            // Baseline size=1: the single top hit is a strong "Mission Impossible" doc, NOT the weak Drama doc 6.
+            Map<String, Object> page1Baseline = search(
+                INDEX_NAME,
+                baseline,
+                null,
+                1,
+                Map.of("search_pipeline", SEARCH_PIPELINE),
+                null,
+                null,
+                null,
+                false,
+                null,
+                0,
+                null
+            );
+            assertFalse("baseline: weak target doc 6 must be below page 1", idOrder(page1Baseline).contains("6"));
+
+            // Boosted size=1: the sole tier-0 (Drama) doc must dominate the cross-shard merge and lead page 1.
+            Map<String, Object> page1Boosted = search(
+                INDEX_NAME,
+                boosted,
+                null,
+                1,
+                Map.of("search_pipeline", SEARCH_PIPELINE),
+                null,
+                null,
+                null,
+                false,
+                null,
+                0,
+                null
+            );
+            assertEquals("boost must promote below-page-1 Drama doc 6 to rank 0 of page 1", "6", idOrder(page1Boosted).get(0));
+
+            // from>0 leg: with size=3, doc 6 is on page 1 (promoted) and must NOT reappear on page 2.
+            Map<String, Object> page1Size3 = search(
+                INDEX_NAME,
+                boosted,
+                null,
+                3,
+                Map.of("search_pipeline", SEARCH_PIPELINE),
+                null,
+                null,
+                null,
+                false,
+                null,
+                0,
+                null
+            );
+            Map<String, Object> page2Size3 = search(
+                INDEX_NAME,
+                boosted,
+                null,
+                3,
+                Map.of("search_pipeline", SEARCH_PIPELINE),
+                null,
+                null,
+                null,
+                false,
+                null,
+                3,
+                null
+            );
+            assertTrue("promoted doc 6 must be on page 1 (size=3)", idOrder(page1Size3).contains("6"));
+            assertFalse("promoted doc 6 must not reappear on page 2", idOrder(page2Size3).contains("6"));
+        } finally {
+            wipeOfTestResources(INDEX_NAME, null, null, SEARCH_PIPELINE);
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private List<String> idOrder(Map<String, Object> searchResponseAsMap) {
         List<Map<String, Object>> hits = getNestedHits(searchResponseAsMap);
