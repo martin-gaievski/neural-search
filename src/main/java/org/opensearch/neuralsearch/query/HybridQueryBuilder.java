@@ -18,8 +18,11 @@ import java.util.stream.Collectors;
 import org.apache.commons.lang3.builder.EqualsBuilder;
 import org.apache.lucene.search.BooleanClause.Occur;
 import org.apache.lucene.search.Query;
+import org.opensearch.action.search.SearchRequest;
+import org.opensearch.common.SetOnce;
 import org.opensearch.common.lucene.search.Queries;
 import org.opensearch.core.ParseField;
+import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.ParsingException;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -29,6 +32,7 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.query.AbstractQueryBuilder;
 import org.opensearch.index.query.InnerHitContextBuilder;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.QueryCoordinatorContext;
 import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.QueryShardException;
@@ -43,6 +47,7 @@ import org.opensearch.neuralsearch.stats.events.EventStatName;
 import org.opensearch.neuralsearch.stats.events.EventStatsManager;
 
 import static org.opensearch.neuralsearch.common.MinClusterVersionUtil.isClusterOnOrAfterMinReqVersionForPaginationInHybridQuery;
+import static org.opensearch.neuralsearch.common.MinClusterVersionUtil.isClusterOnOrAfterMinReqVersionForFusedModeInHybridQuery;
 
 /**
  * Class abstract creation of a Query type "hybrid". Hybrid query will allow execution of multiple sub-queries and
@@ -59,13 +64,63 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     private static final ParseField QUERIES_FIELD = new ParseField("queries");
     private static final ParseField FILTER_FIELD = new ParseField("filter");
     private static final ParseField PAGINATION_DEPTH_FIELD = new ParseField("pagination_depth");
+    private static final ParseField MODE_FIELD = new ParseField("mode");
+    private static final ParseField RANK_WINDOW_SIZE_FIELD = new ParseField("rank_window_size");
 
     private final List<QueryBuilder> queries = new ArrayList<>();
 
     private Integer paginationDepth;
 
+    /**
+     * Combination mode. {@link Mode#PIPELINE} (default) is classic hybrid: the query builds a Lucene {@link HybridQuery}
+     * and a normalization search pipeline combines the per-sub-query scores between the query and fetch phases.
+     * {@link Mode#FUSED} self-erases at the coordinator into a standard query (see {@link #doRewrite}); it reads the
+     * SAME normalization/combination config from the attached search pipeline, so an existing hybrid user adopts it by
+     * adding one token with zero migration.
+     */
+    private Mode mode = Mode.PIPELINE;
+
+    /** Fused-mode candidate window: how many top docs each leg contributes to fusion. Ignored in pipeline mode. */
+    private Integer rankWindowSize;
+
+    /**
+     * Transient result of the fused-mode coordinator-rewrite orchestration: the standard query this query self-erases
+     * into once the leg {@code MultiSearch} completes. Populated by the async action registered in {@link #doRewrite};
+     * read on the next rewrite round. NEVER serialized and excluded from {@link #doEquals}/{@link #doHashCode}.
+     */
+    private java.util.function.Supplier<QueryBuilder> fusedSupplier;
+
     public static final int MAX_NUMBER_OF_SUB_QUERIES = 5;
     private static final int LOWER_BOUND_OF_PAGINATION_DEPTH = 0;
+    private static final int DEFAULT_RANK_WINDOW_SIZE = 100;
+
+    /** Hybrid query combination mode. */
+    public enum Mode {
+        /** Classic hybrid: Lucene HybridQuery + normalization search pipeline (default; byte-identical to pre-mode). */
+        PIPELINE,
+        /** Coordinator self-erase into a standard query; reads fusion config from the attached pipeline (zero-migration). */
+        FUSED;
+
+        static Mode fromString(String value) {
+            if (value == null) {
+                return PIPELINE;
+            }
+            switch (value.toLowerCase(Locale.ROOT)) {
+                case "pipeline":
+                    return PIPELINE;
+                case "fused":
+                    return FUSED;
+                default:
+                    throw new IllegalArgumentException(
+                        String.format(Locale.ROOT, "[%s] query [%s] must be one of [pipeline, fused], got [%s]", NAME, "mode", value)
+                    );
+            }
+        }
+
+        String wireValue() {
+            return name().toLowerCase(Locale.ROOT);
+        }
+    }
 
     // Error message templates for reuse across REST and gRPC paths
     public static final String ERROR_MSG_QUERIES_REQUIRED = "[%s] requires 'queries' field with at least one clause";
@@ -79,6 +134,12 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         if (isClusterOnOrAfterMinReqVersionForPaginationInHybridQuery()) {
             paginationDepth = in.readOptionalInt();
         }
+        // Fused-mode fields are gated: only read them when every node in the cluster can write them, else the stream
+        // would misalign. mode defaults to PIPELINE (classic, byte-identical to the pre-mode wire form).
+        if (isClusterOnOrAfterMinReqVersionForFusedModeInHybridQuery()) {
+            mode = Mode.fromString(in.readOptionalString());
+            rankWindowSize = in.readOptionalInt();
+        }
     }
 
     /**
@@ -91,6 +152,10 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         writeQueries(out, queries);
         if (isClusterOnOrAfterMinReqVersionForPaginationInHybridQuery()) {
             out.writeOptionalInt(paginationDepth);
+        }
+        if (isClusterOnOrAfterMinReqVersionForFusedModeInHybridQuery()) {
+            out.writeOptionalString(mode == null ? null : mode.wireValue());
+            out.writeOptionalInt(rankWindowSize);
         }
     }
 
@@ -145,8 +210,19 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         if (Objects.nonNull(paginationDepth)) {
             builder.field(PAGINATION_DEPTH_FIELD.getPreferredName(), paginationDepth);
         }
+        if (mode == Mode.FUSED) {
+            builder.field(MODE_FIELD.getPreferredName(), mode.wireValue());
+            if (Objects.nonNull(rankWindowSize)) {
+                builder.field(RANK_WINDOW_SIZE_FIELD.getPreferredName(), rankWindowSize);
+            }
+        }
         printBoostAndQueryName(builder);
         builder.endObject();
+    }
+
+    /** Fused-mode candidate window (how many top docs each leg contributes), defaulting when unset. */
+    private int effectiveRankWindowSize() {
+        return rankWindowSize == null ? DEFAULT_RANK_WINDOW_SIZE : rankWindowSize;
     }
 
     /**
@@ -157,6 +233,18 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      */
     @Override
     protected Query doToQuery(QueryShardContext queryShardContext) throws IOException {
+        // Fused mode self-erases into a standard query at the coordinator rewrite and must never reach a shard. If it
+        // does, the coordinator rewrite did not run — fail loudly rather than silently building the pipeline-mode query.
+        if (mode == Mode.FUSED) {
+            throw new IllegalStateException(
+                String.format(
+                    Locale.ROOT,
+                    "[%s] query mode=fused is coordinator-only: it must self-erase into a standard query during the "
+                        + "coordinator rewrite (see doRewrite) and must not reach a shard",
+                    NAME
+                )
+            );
+        }
         Collection<Query> queryCollection = toQueries(queries, queryShardContext);
         if (queryCollection.isEmpty()) {
             return Queries.newMatchNoDocsQuery(String.format(Locale.ROOT, "no clauses for %s query", NAME));
@@ -217,6 +305,8 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         float boost = AbstractQueryBuilder.DEFAULT_BOOST;
 
         Integer paginationDepth = null;
+        Mode mode = Mode.PIPELINE;
+        Integer rankWindowSize = null;
         final List<QueryBuilder> queries = new ArrayList<>();
         QueryBuilder filter = null;
         String queryName = null;
@@ -263,6 +353,10 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                     queryName = parser.text();
                 } else if (PAGINATION_DEPTH_FIELD.match(currentFieldName, parser.getDeprecationHandler())) {
                     paginationDepth = parser.intValue();
+                } else if (MODE_FIELD.match(currentFieldName, parser.getDeprecationHandler())) {
+                    mode = Mode.fromString(parser.text());
+                } else if (RANK_WINDOW_SIZE_FIELD.match(currentFieldName, parser.getDeprecationHandler())) {
+                    rankWindowSize = parser.intValue();
                 } else if (FILTER_FIELD.match(currentFieldName, parser.getDeprecationHandler())) {
                     throwUnsupportedFilterParsingException(parser);
                 } else {
@@ -275,9 +369,13 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             throw new ParsingException(parser.getTokenLocation(), String.format(Locale.ROOT, ERROR_MSG_QUERIES_REQUIRED, NAME));
         }
 
+        validateModeParams(parser, mode, paginationDepth, rankWindowSize);
+
         HybridQueryBuilder compoundQueryBuilder = new HybridQueryBuilder();
         compoundQueryBuilder.queryName(queryName);
         compoundQueryBuilder.boost(boost);
+        compoundQueryBuilder.mode(mode);
+        compoundQueryBuilder.rankWindowSize(rankWindowSize);
         if (isClusterOnOrAfterMinReqVersionForPaginationInHybridQuery()) {
             compoundQueryBuilder.paginationDepth(paginationDepth);
         }
@@ -305,6 +403,9 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     }
 
     protected QueryBuilder doRewrite(QueryRewriteContext queryShardContext) throws IOException {
+        if (mode == Mode.FUSED) {
+            return doRewriteFused(queryShardContext);
+        }
         HybridQueryBuilder newBuilder = new HybridQueryBuilder();
         boolean changed = false;
         for (QueryBuilder query : queries) {
@@ -327,6 +428,88 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     }
 
     /**
+     * Fused-mode coordinator self-erase. Runs ONLY at the coordinator rewrite (where
+     * {@link QueryRewriteContext#convertToCoordinatorContext()} is non-null); on the shards it is a no-op so
+     * {@link #doToQuery} stays the safety net. Two-pass lifecycle driven by {@code Rewriteable.rewriteAndFetch}:
+     * <ol>
+     *   <li><b>Round 1</b>: resolve the fusion config from the attached search pipeline (same source as classic hybrid),
+     *       fire the sub-queries as a parallel {@code MultiSearch} via {@link QueryRewriteContext#registerAsyncAction},
+     *       and return a copy carrying a {@link SetOnce}-backed supplier.</li>
+     *   <li><b>Round 2</b>: return the fused standard query ({@link HybridFusionQuery} or {@code match_none}).</li>
+     * </ol>
+     * Because {@code bool}/{@code dis_max}/{@code function_score} recurse rewrite into their children, a nested fused
+     * hybrid self-orchestrates from here too.
+     */
+    private QueryBuilder doRewriteFused(QueryRewriteContext queryRewriteContext) throws IOException {
+        // Round 2: the async self-erase already produced the standard query — swap to it (or stay put until it lands).
+        if (fusedSupplier != null) {
+            QueryBuilder fused = fusedSupplier.get();
+            return fused == null ? this : fused;
+        }
+        QueryCoordinatorContext coordinatorContext = queryRewriteContext.convertToCoordinatorContext();
+        if (coordinatorContext == null) {
+            return this;
+        }
+        if ((coordinatorContext.getSearchRequest() instanceof SearchRequest) == false) {
+            return this;
+        }
+        SearchRequest searchRequest = (SearchRequest) coordinatorContext.getSearchRequest();
+        // Resolve the fusion config from the attached search pipeline (inline body / named param / index default),
+        // reproducing core's precedence. Fail fast if no normalization/score-ranker processor is resolvable rather than
+        // emitting unfused scores.
+        FusionSpec fusion = FusionConfigResolver.resolve(searchRequest);
+        if (fusion == null) {
+            throw new IllegalArgumentException(
+                String.format(
+                    Locale.ROOT,
+                    "[%s] query mode=fused requires a normalization or score-ranker processor in the attached search "
+                        + "pipeline (inline body, ?search_pipeline=, or index.search.default_pipeline), or an inline fusion "
+                        + "block; none was found",
+                    NAME
+                )
+            );
+        }
+        // Whether this query is the whole request (=> conditional Tail for accurate totals/aggs) or nested inside a
+        // container (=> Top-only, so an enclosing filter intersects at the query phase).
+        boolean topLevel = searchRequest.source() != null && searchRequest.source().query() == this;
+        int window = effectiveRankWindowSize();
+        List<QueryBuilder> legs = queries;
+        SetOnce<QueryBuilder> fused = new SetOnce<>();
+        queryRewriteContext.registerAsyncAction(
+            (client, listener) -> client.multiSearch(
+                HybridFusionOrchestrator.buildLegMultiSearch(searchRequest, legs, window),
+                ActionListener.wrap(multiSearchResponse -> {
+                    try {
+                        fused.set(
+                            HybridFusionOrchestrator.buildFusedQuery(
+                                searchRequest.source(),
+                                multiSearchResponse,
+                                legs,
+                                fusion,
+                                window,
+                                topLevel
+                            )
+                        );
+                        listener.onResponse(null);
+                    } catch (Exception e) {
+                        listener.onFailure(e);
+                    }
+                }, listener::onFailure)
+            )
+        );
+        HybridQueryBuilder marker = new HybridQueryBuilder();
+        for (QueryBuilder query : queries) {
+            marker.add(query);
+        }
+        marker.queryName(queryName);
+        marker.boost(boost);
+        marker.mode(Mode.FUSED);
+        marker.rankWindowSize(rankWindowSize);
+        marker.fusedSupplier = fused::get;
+        return marker;
+    }
+
+    /**
      * Indicates whether some other QueryBuilder object of the same type is "equal to" this one.
      * @param obj
      * @return true if objects are equal
@@ -342,6 +525,8 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         EqualsBuilder equalsBuilder = new EqualsBuilder();
         equalsBuilder.append(queries, obj.queries);
         equalsBuilder.append(paginationDepth, obj.paginationDepth);
+        equalsBuilder.append(mode, obj.mode);
+        equalsBuilder.append(rankWindowSize, obj.rankWindowSize);
         return equalsBuilder.isEquals();
     }
 
@@ -351,7 +536,7 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      */
     @Override
     protected int doHashCode() {
-        return Objects.hash(queries, paginationDepth);
+        return Objects.hash(queries, paginationDepth, mode, rankWindowSize);
     }
 
     /**
@@ -380,6 +565,47 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             }
         }).filter(Objects::nonNull).collect(Collectors.toList());
         return queries;
+    }
+
+    /**
+     * Parse-time validation of the mode / fused-mode fields:
+     * <ul>
+     *   <li>{@code rank_window_size} is a fused-mode-only knob — reject it in pipeline mode.</li>
+     *   <li>{@code pagination_depth} is consumed only by the shard-side Lucene {@link HybridQuery} that fused mode never
+     *       builds, so it is inert in fused mode — reject it rather than silently ignore.</li>
+     *   <li>{@code rank_window_size} must be positive.</li>
+     * </ul>
+     */
+    private static void validateModeParams(XContentParser parser, Mode mode, Integer paginationDepth, Integer rankWindowSize) {
+        if (mode != Mode.FUSED && rankWindowSize != null) {
+            throw new ParsingException(
+                parser.getTokenLocation(),
+                String.format(
+                    Locale.ROOT,
+                    "[%s] query [%s] is only supported in mode [fused]",
+                    NAME,
+                    RANK_WINDOW_SIZE_FIELD.getPreferredName()
+                )
+            );
+        }
+        if (mode == Mode.FUSED && paginationDepth != null) {
+            throw new ParsingException(
+                parser.getTokenLocation(),
+                String.format(
+                    Locale.ROOT,
+                    "[%s] query [%s] is not supported in mode [fused]; fused mode pages over its [%s] window instead",
+                    NAME,
+                    PAGINATION_DEPTH_FIELD.getPreferredName(),
+                    RANK_WINDOW_SIZE_FIELD.getPreferredName()
+                )
+            );
+        }
+        if (rankWindowSize != null && rankWindowSize <= 0) {
+            throw new ParsingException(
+                parser.getTokenLocation(),
+                String.format(Locale.ROOT, "[%s] query [%s] must be greater than 0", NAME, RANK_WINDOW_SIZE_FIELD.getPreferredName())
+            );
+        }
     }
 
     private static void validatePaginationDepth(final Integer paginationDepth, final QueryShardContext queryShardContext) {

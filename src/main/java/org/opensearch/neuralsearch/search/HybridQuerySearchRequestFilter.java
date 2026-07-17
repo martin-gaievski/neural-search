@@ -116,7 +116,9 @@ public class HybridQuerySearchRequestFilter implements ActionFilter {
             return false;
         }
 
-        // direct check for HybridQueryBuilder
-        return query instanceof HybridQueryBuilder;
+        // direct check for HybridQueryBuilder — but ONLY classic (pipeline) mode. A fused-mode hybrid self-erases at
+        // the coordinator into a standard query, so it needs neither the DFS reject nor the batched-reduce disable
+        // (both are workarounds for the CompoundTopDocs sentinel format that fused mode never produces).
+        return query instanceof HybridQueryBuilder && ((HybridQueryBuilder) query).mode() != HybridQueryBuilder.Mode.FUSED;
     }
 }

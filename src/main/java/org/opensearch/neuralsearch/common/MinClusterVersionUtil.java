@@ -32,6 +32,7 @@ public final class MinClusterVersionUtil {
     public static final Version MINIMAL_SUPPORTED_VERSION_METRICS_STATS = Version.V_3_3_0;
     private static final Version MINIMAL_SUPPORTED_VERSION_NEURAL_KNN_QUERY_BUILDER = Version.V_3_0_0;
     private static final Version MINIMAL_SUPPORTED_VERSION_AGENTIC_EMBEDDING_MODEL_ID = Version.V_3_6_0;
+    private static final Version MINIMAL_SUPPORTED_VERSION_FUSED_MODE_IN_HYBRID_QUERY = Version.V_3_8_0;
 
     // Constant for neural_knn_query version check
     public static final String NEURAL_KNN_QUERY = "neural_knn_query";
@@ -110,5 +111,16 @@ public final class MinClusterVersionUtil {
      */
     public static boolean isClusterOnOrAfterMinReqVersionForAgenticEmbeddingModelId() {
         return NeuralSearchClusterUtil.instance().getClusterMinVersion().onOrAfter(MINIMAL_SUPPORTED_VERSION_AGENTIC_EMBEDDING_MODEL_ID);
+    }
+
+    /**
+     * Checks if the cluster min version supports the {@code mode} parameter (pipeline|fused) on the hybrid query.
+     * Fused mode self-erases at the coordinator into a standard query, so the extra wire fields must only be
+     * serialized when every node can read them.
+     *
+     * @return true if the cluster version supports hybrid query fused mode
+     */
+    public static boolean isClusterOnOrAfterMinReqVersionForFusedModeInHybridQuery() {
+        return NeuralSearchClusterUtil.instance().getClusterMinVersion().onOrAfter(MINIMAL_SUPPORTED_VERSION_FUSED_MODE_IN_HYBRID_QUERY);
     }
 }

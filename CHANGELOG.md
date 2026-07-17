@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased 3.x](https://github.com/opensearch-project/neural-search/compare/main...HEAD)
 
 ### Features
+* [Hybrid Query] Add `mode: "fused"` to run coordinator-side fusion without a phase-results pipeline, reading normalization/combination config from the attached search pipeline (POC)
 
 ### Enhancements
 * Improve hybrid query filter validation error message ([#1870](https://github.com/opensearch-project/neural-search/pull/1870))
