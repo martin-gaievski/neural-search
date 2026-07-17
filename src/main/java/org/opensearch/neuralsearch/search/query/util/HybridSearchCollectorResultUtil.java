@@ -26,8 +26,10 @@ import org.opensearch.search.rescore.RescoreContext;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 import java.util.Map;
 
@@ -264,7 +266,7 @@ public class HybridSearchCollectorResultUtil {
         // same sentinel envelope as the sub-query scores, so it reaches the coordinator on every shard including
         // remote ones. The section is emitted whenever the collector carries boost conditions (even with zero
         // matches, i.e. just the delimiter) so per-segment envelopes stay structurally symmetric for the merger.
-        appendTierSection(result, delimiterDocId);
+        appendTierSection(result, delimiterDocId, topDocs);
         result.add(createStartStopElementForHybridSearchResults(delimiterDocId));
         scoreDocs = result.stream().map(doc -> new ScoreDoc(doc.doc, doc.score, doc.shardIndex)).toArray(ScoreDoc[]::new);
 
@@ -277,8 +279,16 @@ public class HybridSearchCollectorResultUtil {
      * after all real sub-query sections and before the final start/stop element, so the existing merger (which
      * walks section-by-section using the special-element predicate) carries it through unchanged, and the
      * coordinator re-parse splits it off before normalization/combination.
+     *
+     * <p>The tier map produced by the collector records a tier for EVERY collected doc matching a condition, which
+     * is unbounded (proportional to condition match cardinality, not top-K). The coordinator only ever reads a
+     * tier for docs present in the combined top-K, which is a subset of the emitted per-sub-query top-docs. So we
+     * prune the emitted tier rows to the docIds that actually survive into {@code emittedTopDocs} here. This is
+     * lossless (no boostable doc can be dropped) and bounds the wire payload and coordinator heap to O(top-K)
+     * instead of O(matching docs). The map and the emitted score docs share the same {@code doc + docBase}
+     * id space, so the intersection is a direct docId lookup.
      */
-    private void appendTierSection(final List<ScoreDoc> result, final int delimiterDocId) {
+    private void appendTierSection(final List<ScoreDoc> result, final int delimiterDocId, final List<TopDocs> emittedTopDocs) {
         if ((hybridSearchCollector instanceof HybridTopScoreDocCollector) == false) {
             return;
         }
@@ -290,10 +300,26 @@ public class HybridSearchCollectorResultUtil {
         }
         result.add(createTierDelimiterElementForHybridSearchResults(delimiterDocId));
         Map<Integer, Integer> docIdToTier = collector.getDocIdToTier();
-        if (docIdToTier != null) {
-            for (Map.Entry<Integer, Integer> entry : docIdToTier.entrySet()) {
+        if (docIdToTier == null || docIdToTier.isEmpty()) {
+            return;
+        }
+        // Build the set of docIds that are actually emitted in the sub-query top-docs; only these can ever be
+        // boosted at the coordinator, so tier rows for any other (matched-but-evicted) doc are pure waste.
+        Set<Integer> emittedDocIds = new HashSet<>();
+        for (TopDocs topDoc : emittedTopDocs) {
+            if (Objects.isNull(topDoc) || Objects.isNull(topDoc.scoreDocs)) {
+                continue;
+            }
+            for (ScoreDoc scoreDoc : topDoc.scoreDocs) {
+                emittedDocIds.add(scoreDoc.doc);
+            }
+        }
+        // Iterate the (small) emitted set and look up the tier map, so the cost is O(emitted), not O(map).
+        for (Integer docId : emittedDocIds) {
+            Integer tier = docIdToTier.get(docId);
+            if (tier != null) {
                 // encode tier as the score of the row; tier is a small non-negative int, distinct from any magic number
-                result.add(new ScoreDoc(entry.getKey(), (float) entry.getValue()));
+                result.add(new ScoreDoc(docId, (float) (int) tier));
             }
         }
     }

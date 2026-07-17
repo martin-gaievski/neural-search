@@ -17,12 +17,18 @@ import org.opensearch.search.query.QuerySearchResult;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.opensearch.neuralsearch.search.util.HybridSearchResultFormatUtil.MAGIC_NUMBER_DELIMITER;
 import static org.opensearch.neuralsearch.search.util.HybridSearchResultFormatUtil.MAGIC_NUMBER_START_STOP;
+import static org.opensearch.neuralsearch.search.util.HybridSearchResultFormatUtil.isHybridQueryTierDelimiterElement;
+import static org.opensearch.neuralsearch.search.util.HybridSearchResultFormatUtil.isHybridQuerySpecialElement;
 
 public class HybridSearchCollectorResultUtilTests extends OpenSearchQueryTestCase {
     protected static final float DELTA_FOR_ASSERTION = 0.001f;
@@ -105,5 +111,63 @@ public class HybridSearchCollectorResultUtilTests extends OpenSearchQueryTestCas
         assertEquals(MAGIC_NUMBER_DELIMITER, updatedScoreDocs[1].score, DELTA_FOR_ASSERTION);
         assertEquals(MAGIC_NUMBER_DELIMITER, updatedScoreDocs[6].score, DELTA_FOR_ASSERTION);
         assertEquals(MAGIC_NUMBER_START_STOP, updatedScoreDocs[11].score, DELTA_FOR_ASSERTION);
+    }
+
+    /**
+     * The collector's tier map records a tier for every condition-matching collected doc, including docs later
+     * evicted from the top-K. The emitted envelope's tier section must be pruned to only the docs that actually
+     * survive into the emitted sub-query top-docs, since those are the only docs the coordinator can ever boost.
+     * This keeps the tier section (wire + coordinator heap) bounded by top-K instead of by match cardinality.
+     */
+    public void testGetTopDocsAndMaxScore_whenBoostConditions_thenTierSectionPrunedToEmittedDocs() throws IOException {
+        // emitted sub-query top-docs contain docs 0,1,2,3
+        ScoreDoc[] scoreDocs = new ScoreDoc[] {
+            new ScoreDoc(0, 0.7f),
+            new ScoreDoc(1, 0.3f),
+            new ScoreDoc(2, 0.2f),
+            new ScoreDoc(3, 0.1f) };
+        TopDocs topDocs = new TopDocs(new TotalHits(4, TotalHits.Relation.EQUAL_TO), scoreDocs);
+        List<TopDocs> topDocsList = new ArrayList<>();
+        topDocsList.add(topDocs);
+
+        // tier map has entries for emitted docs (1, 3) AND for docs that never made the top-K (100, 101, 102)
+        Map<Integer, Integer> docIdToTier = new HashMap<>();
+        docIdToTier.put(1, 0);
+        docIdToTier.put(3, 1);
+        docIdToTier.put(100, 0);
+        docIdToTier.put(101, 1);
+        docIdToTier.put(102, 0);
+
+        SearchContext searchContext = mock(SearchContext.class);
+        HybridTopScoreDocCollector collector = mock(HybridTopScoreDocCollector.class);
+        when(collector.topDocs()).thenReturn(topDocsList);
+        when(collector.getTotalHits()).thenReturn(4);
+        when(collector.getMaxScore()).thenReturn(0.7f);
+        when(collector.hasBoostConditions()).thenReturn(true);
+        when(collector.getDocIdToTier()).thenReturn(docIdToTier);
+
+        HybridSearchCollectorResultUtil util = new HybridSearchCollectorResultUtil(
+            new HybridCollectorResultsUtilParams.Builder().searchContext(searchContext).build(),
+            collector
+        );
+
+        TopDocsAndMaxScore topDocsAndMaxScore = util.getTopDocsAndMaxScore();
+        ScoreDoc[] envelope = topDocsAndMaxScore.topDocs.scoreDocs;
+
+        // locate the tier section: everything after the tier delimiter and before the trailing start/stop
+        Set<Integer> tierDocIds = new HashSet<>();
+        boolean inTierSection = false;
+        for (ScoreDoc scoreDoc : envelope) {
+            if (isHybridQueryTierDelimiterElement(scoreDoc)) {
+                inTierSection = true;
+                continue;
+            }
+            if (inTierSection && isHybridQuerySpecialElement(scoreDoc) == false) {
+                tierDocIds.add(scoreDoc.doc);
+            }
+        }
+
+        // only the emitted docs (1, 3) are carried; the evicted docs (100, 101, 102) are pruned away
+        assertEquals(Set.of(1, 3), tierDocIds);
     }
 }

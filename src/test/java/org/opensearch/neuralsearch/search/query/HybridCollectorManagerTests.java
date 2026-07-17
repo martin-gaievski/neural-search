@@ -341,6 +341,70 @@ public class HybridCollectorManagerTests extends OpenSearchQueryTestCase {
     }
 
     @SneakyThrows
+    public void testCreateManager_whenBoostConditionsAndSort_thenFailFast() {
+        SearchContext searchContext = mock(SearchContext.class);
+        SortField sortField = new SortField("_doc", SortField.Type.DOC);
+        Sort sort = new Sort(sortField);
+        DocValueFormat docValueFormat[] = new DocValueFormat[] { DocValueFormat.RAW };
+        when(searchContext.sort()).thenReturn(new SortAndFormats(sort, docValueFormat));
+        when(searchContext.minimumScore()).thenReturn(null);
+        QueryShardContext mockQueryShardContext = mock(QueryShardContext.class);
+        TextFieldMapper.TextFieldType fieldType = (TextFieldMapper.TextFieldType) createMapperService().fieldType(TEXT_FIELD_NAME);
+        when(mockQueryShardContext.fieldMapper(eq(TEXT_FIELD_NAME))).thenReturn(fieldType);
+        TermQueryBuilder termSubQuery = QueryBuilders.termQuery(TEXT_FIELD_NAME, QUERY1);
+        Query boostCondition = QueryBuilders.termQuery(TEXT_FIELD_NAME, QUERY2).toQuery(mockQueryShardContext);
+        HybridQueryContext hybridQueryContext = HybridQueryContext.builder()
+            .paginationDepth(10)
+            .boostConditionQueries(List.of(boostCondition))
+            .build();
+
+        HybridQuery hybridQuery = new HybridQuery(List.of(termSubQuery.toQuery(mockQueryShardContext)), hybridQueryContext);
+
+        when(searchContext.query()).thenReturn(hybridQuery);
+        when(searchContext.mapperService()).thenReturn(createMapperService());
+        ContextIndexSearcher indexSearcher = mock(ContextIndexSearcher.class);
+        when(indexSearcher.getIndexReader()).thenReturn(indexReader);
+        when(searchContext.searcher()).thenReturn(indexSearcher);
+
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> HybridCollectorManager.createHybridCollectorManager(searchContext, hybridQuery)
+        );
+        assertTrue(exception.getMessage().contains("boost_conditions cannot be combined with sort"));
+    }
+
+    @SneakyThrows
+    public void testCreateManager_whenBoostConditionsAndCollapse_thenFailFast() {
+        SearchContext searchContext = mock(SearchContext.class);
+        when(searchContext.sort()).thenReturn(null);
+        CollapseContext collapseContext = mock(CollapseContext.class);
+        when(searchContext.collapse()).thenReturn(collapseContext);
+        QueryShardContext mockQueryShardContext = mock(QueryShardContext.class);
+        TextFieldMapper.TextFieldType fieldType = (TextFieldMapper.TextFieldType) createMapperService().fieldType(TEXT_FIELD_NAME);
+        when(mockQueryShardContext.fieldMapper(eq(TEXT_FIELD_NAME))).thenReturn(fieldType);
+        TermQueryBuilder termSubQuery = QueryBuilders.termQuery(TEXT_FIELD_NAME, QUERY1);
+        Query boostCondition = QueryBuilders.termQuery(TEXT_FIELD_NAME, QUERY2).toQuery(mockQueryShardContext);
+        HybridQueryContext hybridQueryContext = HybridQueryContext.builder()
+            .paginationDepth(10)
+            .boostConditionQueries(List.of(boostCondition))
+            .build();
+
+        HybridQuery hybridQuery = new HybridQuery(List.of(termSubQuery.toQuery(mockQueryShardContext)), hybridQueryContext);
+
+        when(searchContext.query()).thenReturn(hybridQuery);
+        when(searchContext.mapperService()).thenReturn(createMapperService());
+        ContextIndexSearcher indexSearcher = mock(ContextIndexSearcher.class);
+        when(indexSearcher.getIndexReader()).thenReturn(indexReader);
+        when(searchContext.searcher()).thenReturn(indexSearcher);
+
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> HybridCollectorManager.createHybridCollectorManager(searchContext, hybridQuery)
+        );
+        assertTrue(exception.getMessage().contains("boost_conditions cannot be combined with collapse"));
+    }
+
+    @SneakyThrows
     public void testReduce_whenMatchedDocsAndSortingIsApplied_thenSuccessful() {
         SearchContext searchContext = mock(SearchContext.class);
         QueryShardContext mockQueryShardContext = mock(QueryShardContext.class);

@@ -73,6 +73,10 @@ public class HybridCollectorManager implements CollectorManager<Collector, Reduc
         if (searchContext.scrollContext() != null) {
             throw new IllegalArgumentException(String.format(Locale.ROOT, "Scroll operation is not supported in hybrid query"));
         }
+        // Conditional result boost re-orders results into tier bands encoded in the score, which is incompatible
+        // with an explicit field sort or collapse (those route to collectors that never receive the boost weights,
+        // silently disabling the boost). Fail fast so the incompatibility is explicit rather than a silent no-op.
+        validateBoostConditionsCompatibility(searchContext, query);
         final IndexReader reader = searchContext.searcher().getIndexReader();
         final int totalNumDocs = Math.max(0, reader.numDocs());
         int numDocs = Math.min(getSubqueryResultsRetrievalSize(searchContext, query), totalNumDocs);
@@ -215,6 +219,30 @@ public class HybridCollectorManager implements CollectorManager<Collector, Reduc
     private boolean isHybridFilteredCollector(Collector collector) {
         return collector instanceof FilteredCollector
             && VALID_COLLECTOR_TYPES.stream().anyMatch(type -> type.isInstance(((FilteredCollector) collector).getCollector()));
+    }
+
+    /**
+     * Reject {@code boost_conditions} combined with an explicit sort or collapse. Boost promotes matching docs into
+     * score-encoded tier bands; a field sort or collapse bypasses the score-sorted collector that applies the boost,
+     * so the two cannot be honored together. This is the single point where both signals are available: {@code query}
+     * carries the compiled boost conditions and {@code searchContext} exposes sort/collapse.
+     */
+    private static void validateBoostConditionsCompatibility(final SearchContext searchContext, final Query query) {
+        if ((query instanceof HybridQuery) == false) {
+            return;
+        }
+        List<Query> boostConditions = ((HybridQuery) query).getQueryContext().getBoostConditionQueries();
+        if (boostConditions == null || boostConditions.isEmpty()) {
+            return;
+        }
+        if (searchContext.sort() != null) {
+            throw new IllegalArgumentException(
+                "boost_conditions cannot be combined with sort in a hybrid query; the boost re-orders results into tier bands which conflicts with an explicit sort"
+            );
+        }
+        if (searchContext.collapse() != null) {
+            throw new IllegalArgumentException("boost_conditions cannot be combined with collapse in a hybrid query");
+        }
     }
 
     private static void validateSortCriteria(SearchContext searchContext, boolean trackScores, Float minScore) {
