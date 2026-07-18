@@ -57,6 +57,11 @@ final class FusionConfigResolver {
         }
 
         // Step 2: inline body pipeline (ad-hoc; not in cluster state) → read straight off the request source.
+        // CAVEAT (verified): core's resolvePipeline runs BEFORE query rewrite and builds the ad-hoc pipeline via
+        // PipelineWithMetrics.create, whose ConfigurationUtils.readOptionalList(config, "phase_results_processors")
+        // REMOVES the key from this same live map. So by the time this runs, searchPipelineSource() is typically
+        // drained to {} and fromPipelineConfig returns null. Kept for completeness / body forms that survive, but the
+        // inline-body path needs the same core fix as the URL param to be reliable.
         if (inlineConfig != null) {
             return FusionSpec.fromPipelineConfig(inlineConfig);
         }

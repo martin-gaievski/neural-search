@@ -7,7 +7,13 @@ package org.opensearch.neuralsearch.query;
 import java.util.List;
 import java.util.Map;
 
+import org.apache.hc.core5.http.io.entity.EntityUtils;
+import org.opensearch.client.Request;
+import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
+import org.opensearch.common.xcontent.XContentHelper;
+import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.neuralsearch.BaseNeuralSearchIT;
@@ -22,12 +28,17 @@ import lombok.SneakyThrows;
  * <p>Uses two lexical legs on a plain text index so the mechanism (pipeline-read + coordinator fusion + self-erase) is
  * exercised end-to-end without KNN/model plumbing.
  *
- * <p>Config source: these tests use {@code index.search.default_pipeline}, the primary zero-migration case — the
- * pipeline id lives in cluster state and survives to the coordinator rewrite. The named {@code ?search_pipeline=}
- * param is NOT covered here: core wraps the resolved request through the {@code SearchRequest} copy constructor, which
- * does not copy the {@code pipeline} field, so {@code searchRequest.pipeline()} reads null at rewrite time. Reading the
- * named param requires either the (package-private) constructed-pipeline accessor or a small core change; the
- * index-default and inline-body sources need neither.
+ * <p>Config source: {@code index.search.default_pipeline} is the ONLY source that works today with no core change —
+ * the pipeline id lives in cluster state and survives to the coordinator rewrite. The other two sources are pre-req
+ * core gaps (both verified below/here):
+ * <ul>
+ *   <li>The {@code ?search_pipeline=} URL param reads null at rewrite: core wraps the resolved request through the
+ *       {@code SearchRequest} copy constructor, which does not copy the {@code pipeline} field.</li>
+ *   <li>The inline-body {@code search_pipeline} object is drained to empty at rewrite: core's {@code resolvePipeline}
+ *       builds the ad-hoc pipeline (before query rewrite) via {@code ConfigurationUtils.readOptionalList}, which
+ *       {@code remove()}s {@code phase_results_processors} from the same live source map.</li>
+ * </ul>
+ * Both need a small core change; {@code index.search.default_pipeline} needs none.
  */
 public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
 
@@ -134,6 +145,46 @@ public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
             null
         );
         assertEquals(3, getHitCount(response));
+    }
+
+    /**
+     * PRE-REQ GAP (verified): the inline-body pipeline form does NOT reach fused mode. Core's {@code resolvePipeline}
+     * runs before query rewrite and builds the ad-hoc pipeline via {@code PipelineWithMetrics.create}, whose
+     * {@code ConfigurationUtils.readOptionalList(config, "phase_results_processors")} REMOVES the key from the same
+     * live {@code searchPipelineSource} map. So at rewrite the map is drained to empty and the fused resolver finds no
+     * config -> fail-fast 400. This test pins the current behavior; when the core fix lands (see the design doc), flip
+     * it to assert successful fusion.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenInlineBodyPipeline_thenFailsFastUntilCoreFix() {
+        if (indexExists(INDEX_NO_PIPELINE) == false) {
+            createIndex(INDEX_NO_PIPELINE, indexConfigWithDefaultPipeline(null));
+            addFourDocs(INDEX_NO_PIPELINE);
+        }
+        String body = "{"
+            + "\"search_pipeline\": { \"phase_results_processors\": [ { \"normalization-processor\": {"
+            + "  \"normalization\": { \"technique\": \"min_max\" },"
+            + "  \"combination\": { \"technique\": \"arithmetic_mean\" } } } ] },"
+            + "\"query\": { \"hybrid\": { \"mode\": \"fused\", \"queries\": ["
+            + "  { \"match\": { \""
+            + TEXT_FIELD
+            + "\": \"hello\" } },"
+            + "  { \"term\": { \""
+            + TEXT_FIELD
+            + "\": \"place\" } } ] } } }";
+
+        ResponseException e = expectThrows(ResponseException.class, () -> searchWithRawBody(INDEX_NO_PIPELINE, body, 10));
+        assertTrue(e.getMessage().contains("requires a normalization or score-ranker processor") || e.getMessage().contains("mode=fused"));
+    }
+
+    @SneakyThrows
+    private Map<String, Object> searchWithRawBody(String index, String jsonBody, int resultSize) {
+        Request request = new Request("POST", "/" + index + "/_search");
+        request.setJsonEntity(jsonBody);
+        request.addParameter("size", Integer.toString(resultSize));
+        Response response = client().performRequest(request);
+        assertEquals(request.getEndpoint() + ": failed", RestStatus.OK, RestStatus.fromCode(response.getStatusLine().getStatusCode()));
+        return XContentHelper.convertToMap(XContentType.JSON.xContent(), EntityUtils.toString(response.getEntity()), false);
     }
 
     @SuppressWarnings("unchecked")
