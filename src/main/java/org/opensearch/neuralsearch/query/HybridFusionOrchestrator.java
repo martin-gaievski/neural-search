@@ -6,6 +6,7 @@ package org.opensearch.neuralsearch.query;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -17,10 +18,12 @@ import org.opensearch.action.search.MultiSearchRequest;
 import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.index.query.IdsQueryBuilder;
+import org.opensearch.index.query.InnerHitContextBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.pipeline.SearchPipelineService;
 
 /**
  * Coordinator-level fusion for the hybrid query {@code mode: "fused"} path: fire each sub-query as an independent
@@ -42,6 +45,13 @@ final class HybridFusionOrchestrator {
     /**
      * Build the leg MultiSearch: one standalone search per sub-query, each reduced to the global top-{@code
      * rankWindowSize}. Id-only (no {@code _source}); totals disabled (the Tail supplies the full-match-set count).
+     *
+     * <p>Each leg is pinned to the no-op search pipeline ({@code _none}). Otherwise a leg — being a plain
+     * {@link SearchRequest} with no explicit pipeline — would inherit the index's {@code index.search.default_pipeline}
+     * and re-run its request/response processors once per leg. That is redundant at best (e.g. the enricher is already
+     * baked into the sub-query builders) and incorrect at worst (e.g. a {@code rerank} response processor runs per leg
+     * against id-only, {@code fetchSource(false)} hits with no {@code ext.rerank} context). The outer fused request
+     * still carries the pipeline, so top-level request/response processors run exactly once, as intended.
      */
     static MultiSearchRequest buildLegMultiSearch(SearchRequest request, List<QueryBuilder> legs, int rankWindowSize) {
         MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
@@ -51,7 +61,11 @@ final class HybridFusionOrchestrator {
                 .from(0)
                 .fetchSource(false)
                 .trackTotalHits(false);
-            multiSearchRequest.add(new SearchRequest(request.indices()).indicesOptions(request.indicesOptions()).source(legSource));
+            multiSearchRequest.add(
+                new SearchRequest(request.indices()).indicesOptions(request.indicesOptions())
+                    .source(legSource)
+                    .pipeline(SearchPipelineService.NOOP_PIPELINE_ID)
+            );
         }
         return multiSearchRequest;
     }
@@ -82,8 +96,8 @@ final class HybridFusionOrchestrator {
         boolean topOnly;
         if (topLevel == false) {
             topOnly = true; // nested: enclosing filter intersects at the query phase
-        } else if (needsExecutionTail(source)) {
-            topOnly = false; // aggregations / explain / profile / highlight need the full match set IN the query
+        } else if (needsExecutionTail(source) || legsHaveInnerHits(legs)) {
+            topOnly = false; // aggregations / explain / profile / highlight / leg inner_hits need the legs IN the query
         } else if (wantsTotalsBeyondWindow(source, ranked.ids.length)) {
             topOnly = false; // keep the Tail for an accurate index-wide count
         } else {
@@ -352,6 +366,20 @@ final class HybridFusionOrchestrator {
     private static boolean needsExecutionTail(SearchSourceBuilder source) {
         return source != null
             && (source.aggregations() != null || Boolean.TRUE.equals(source.explain()) || source.profile() || source.highlighter() != null);
+    }
+
+    /**
+     * True if any leg declares inner_hits (e.g. a {@code nested} / {@code has_child} sub-query). The Tail must then be
+     * retained so the leg builder survives in the fused query's {@code sourceQueries}, where
+     * {@link HybridFusionQuery#extractInnerHitBuilders} can reach it — otherwise a top-K-only fused query would silently
+     * drop leg-level inner_hits.
+     */
+    private static boolean legsHaveInnerHits(List<QueryBuilder> legs) {
+        Map<String, InnerHitContextBuilder> innerHits = new HashMap<>();
+        for (QueryBuilder leg : legs) {
+            InnerHitContextBuilder.extractInnerHits(leg, innerHits);
+        }
+        return innerHits.isEmpty() == false;
     }
 
     private static boolean wantsTotalsBeyondWindow(SearchSourceBuilder source, int numRankedDocs) {

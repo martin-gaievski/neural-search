@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 import org.apache.lucene.search.Query;
@@ -19,6 +20,7 @@ import org.opensearch.index.query.AbstractQueryBuilder;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ConstantScoreQueryBuilder;
 import org.opensearch.index.query.IdsQueryBuilder;
+import org.opensearch.index.query.InnerHitContextBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.query.QueryShardContext;
@@ -105,6 +107,23 @@ public class HybridFusionQuery extends AbstractQueryBuilder<HybridFusionQuery> {
             composite.filter(tail);
         }
         return composite.toQuery(context);
+    }
+
+    /**
+     * Recurse into the Tail sub-queries so that inner_hits declared on a leg (e.g. a {@code nested} or {@code has_child}
+     * sub-query) are registered and fetched per returned parent hit. Mirrors
+     * {@link HybridQueryBuilder#extractInnerHitBuilders}. Without this override the self-erased query would silently drop
+     * leg-level inner_hits, because {@link AbstractQueryBuilder}'s default implementation is a no-op and the coordinator
+     * self-erase replaces the original {@code hybrid} builder with this one before the shard extracts inner_hits. The
+     * leg builders survive intact in {@code sourceQueries} (only KNN/neural legs are materialized to ids, and those do
+     * not support inner_hits), and the Tail is retained whenever a leg declares inner_hits (see
+     * {@code HybridFusionOrchestrator#buildFusedQuery}), so the definition is always reachable here.
+     */
+    @Override
+    protected void extractInnerHitBuilders(Map<String, InnerHitContextBuilder> innerHits) {
+        for (QueryBuilder sourceQuery : sourceQueries) {
+            InnerHitContextBuilder.extractInnerHits(sourceQuery, innerHits);
+        }
     }
 
     @Override

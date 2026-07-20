@@ -12,6 +12,8 @@ import java.util.List;
 import java.util.Map;
 
 import org.opensearch.Version;
+import org.opensearch.action.search.MultiSearchRequest;
+import org.opensearch.action.search.SearchRequest;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.ParseField;
 import org.opensearch.core.common.ParsingException;
@@ -24,6 +26,7 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
+import org.opensearch.search.pipeline.SearchPipelineService;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.neuralsearch.util.TestUtils;
 
@@ -147,6 +150,25 @@ public class HybridQueryBuilderFusedModeTests extends OpenSearchQueryTestCase {
     }
 
     @SneakyThrows
+    public void testBuildLegMultiSearch_pinsEachLegToNoopPipeline() {
+        SearchRequest request = new SearchRequest("test-index");
+        List<QueryBuilder> legs = List.of(
+            new TermQueryBuilder(TEXT_FIELD_NAME, TERM_QUERY_TEXT),
+            new TermQueryBuilder(TEXT_FIELD_NAME, "other")
+        );
+
+        MultiSearchRequest multiSearchRequest = HybridFusionOrchestrator.buildLegMultiSearch(request, legs, 100);
+
+        assertEquals(legs.size(), multiSearchRequest.requests().size());
+        for (SearchRequest legRequest : multiSearchRequest.requests()) {
+            assertEquals(
+                "each fused leg must be pinned to the no-op pipeline so it does not inherit the index default pipeline",
+                SearchPipelineService.NOOP_PIPELINE_ID,
+                legRequest.pipeline()
+            );
+        }
+    }
+
     public void testDoToQuery_whenFusedModeReachesShard_thenThrows() {
         HybridQueryBuilder query = new HybridQueryBuilder().mode(HybridQueryBuilder.Mode.FUSED);
         query.add(new TermQueryBuilder(TEXT_FIELD_NAME, TERM_QUERY_TEXT));

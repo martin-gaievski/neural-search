@@ -7,6 +7,8 @@ package org.opensearch.neuralsearch.query;
 import lombok.SneakyThrows;
 import org.apache.lucene.search.join.ScoreMode;
 import org.junit.Before;
+import org.opensearch.client.Request;
+import org.opensearch.client.Response;
 import org.opensearch.index.query.InnerHitBuilder;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.index.query.NestedQueryBuilder;
@@ -107,6 +109,309 @@ public class HybridQueryInnerHitsIT extends BaseNeuralSearchIT {
         assertEquals(3, innerHitCountPerFieldName.get(TEST_NESTED_FIELD_NAME_2).get("total").get(0).intValue());
         assertEquals(1, innerHitCountPerFieldName.get(TEST_NESTED_FIELD_NAME_1).get("total").get(1).intValue());
         assertEquals(0, innerHitCountPerFieldName.get(TEST_NESTED_FIELD_NAME_2).get("total").get(1).intValue());
+    }
+
+    /**
+     * Correctness (not just presence) check for fused-mode inner_hits: run the SAME two nested-field sub-queries, on the
+     * SAME index/data, in classic mode (phase-results normalization pipeline) and in {@code mode: "fused"} (self-erase,
+     * reading the same config from the index default pipeline), then assert the per-document inner_hits totals are
+     * IDENTICAL between the two. Keyed by {@code _id} so parent ordering differences don't matter. This uses the classic
+     * hybrid inner_hits behavior as the correctness oracle.
+     */
+    @SneakyThrows
+    @SuppressWarnings("unchecked")
+    public void testInnerHits_whenFusedMode_thenMatchesClassicHybrid() {
+        String index = TEST_MULTI_DOC_WITH_NESTED_FIELDS_MULTIPLE_SHARD_INDEX_NAME;
+        initializeIndexIfNotExist(index);
+        createSearchPipeline(NORMALIZATION_SEARCH_PIPELINE, DEFAULT_NORMALIZATION_METHOD, DEFAULT_COMBINATION_METHOD, Map.of());
+
+        // classic hybrid with the two nested legs + inner_hits, via the named search pipeline (today's behavior)
+        HybridQueryBuilder classic = new HybridQueryBuilder();
+        classic.add(nestedUserJohn());
+        classic.add(nestedLocationCalifornia());
+        Map<String, Object> classicResp = search(index, classic, null, 10, Map.of("search_pipeline", NORMALIZATION_SEARCH_PIPELINE), null);
+        Map<String, Map<String, Integer>> classicInnerHits = innerHitTotalsById(
+            classicResp,
+            List.of(TEST_NESTED_FIELD_NAME_1, TEST_NESTED_FIELD_NAME_2)
+        );
+
+        // sanity: the oracle really produced the documented-correct counts (order-independent)
+        assertTrue(
+            "classic oracle must have a doc with user=2, location=3",
+            classicInnerHits.values().stream().anyMatch(m -> m.get(TEST_NESTED_FIELD_NAME_1) == 2 && m.get(TEST_NESTED_FIELD_NAME_2) == 3)
+        );
+        assertTrue(
+            "classic oracle must have a doc with user=1, location=0",
+            classicInnerHits.values().stream().anyMatch(m -> m.get(TEST_NESTED_FIELD_NAME_1) == 1 && m.get(TEST_NESTED_FIELD_NAME_2) == 0)
+        );
+
+        // same query in fused mode, reading the same config from the index default pipeline (only working source today)
+        try {
+            setIndexDefaultPipeline(index, NORMALIZATION_SEARCH_PIPELINE);
+            HybridQueryBuilder fused = new HybridQueryBuilder().mode(HybridQueryBuilder.Mode.FUSED);
+            fused.add(nestedUserJohn());
+            fused.add(nestedLocationCalifornia());
+            Map<String, Object> fusedResp = search(index, fused, 10);
+            Map<String, Map<String, Integer>> fusedInnerHits = innerHitTotalsById(
+                fusedResp,
+                List.of(TEST_NESTED_FIELD_NAME_1, TEST_NESTED_FIELD_NAME_2)
+            );
+
+            assertEquals("fused and classic must return the same parent hits", classicInnerHits.keySet(), fusedInnerHits.keySet());
+            assertEquals("fused inner_hits totals must be identical to classic hybrid, per document", classicInnerHits, fusedInnerHits);
+        } finally {
+            setIndexDefaultPipeline(index, "_none");
+        }
+    }
+
+    /**
+     * Correctness check for {@code has_child} inner_hits under fused mode: same {@code has_child} sub-query, same index,
+     * classic vs fused, assert per-parent child inner_hits totals are identical.
+     */
+    @SneakyThrows
+    public void testInnerHits_whenFusedMode_parentChild_thenMatchesClassicHybrid() {
+        String index = TEST_MULTI_DOC_WITH_PARENT_CHILD_INDEX_NAME;
+        initializeIndexIfNotExist(index);
+        createSearchPipeline(NORMALIZATION_SEARCH_PIPELINE, DEFAULT_NORMALIZATION_METHOD, DEFAULT_COMBINATION_METHOD, Map.of());
+        List<String> fields = List.of(TEST_PARENT_CHILD_INNER_HITS_FIELD_NAME);
+
+        Map<String, Object> classicResp = search(
+            index,
+            hasChildTextChildQuery(),
+            null,
+            10,
+            Map.of("search_pipeline", NORMALIZATION_SEARCH_PIPELINE),
+            null
+        );
+        Map<String, Map<String, Integer>> classic = innerHitTotalsById(classicResp, fields);
+        assertTrue(
+            "oracle: a parent with child inner_hits total=1",
+            classic.values().stream().anyMatch(m -> m.get(TEST_PARENT_CHILD_INNER_HITS_FIELD_NAME) == 1)
+        );
+
+        try {
+            setIndexDefaultPipeline(index, NORMALIZATION_SEARCH_PIPELINE);
+            Map<String, Object> fusedResp = search(index, hasChildTextChildQuery().mode(HybridQueryBuilder.Mode.FUSED), 10);
+            Map<String, Map<String, Integer>> fused = innerHitTotalsById(fusedResp, fields);
+            assertEquals("fused and classic must return the same parent hits", classic.keySet(), fused.keySet());
+            assertEquals("fused has_child inner_hits totals must be identical to classic hybrid", classic, fused);
+        } finally {
+            setIndexDefaultPipeline(index, "_none");
+        }
+    }
+
+    /**
+     * Deepest inner_hits path: a {@code has_child} sub-query whose child query is itself a {@code nested} query, both
+     * carrying inner_hits — so the parent's child inner_hits contain nested inner_hits. Exercises the recursive
+     * inner-hit extraction. Classic vs fused, assert both the child total and the nested (user) total per parent match.
+     */
+    @SneakyThrows
+    public void testInnerHits_whenFusedMode_nestedInsideParentChild_thenMatchesClassicHybrid() {
+        String index = TEST_MULTI_DOC_WITH_NESTED_PARENT_CHILD_INDEX_NAME;
+        initializeIndexIfNotExist(index);
+        createSearchPipeline(NORMALIZATION_SEARCH_PIPELINE, DEFAULT_NORMALIZATION_METHOD, DEFAULT_COMBINATION_METHOD, Map.of());
+
+        Map<String, Object> classicResp = search(
+            index,
+            hasChildWrappingNestedQuery(),
+            null,
+            10,
+            Map.of("search_pipeline", NORMALIZATION_SEARCH_PIPELINE),
+            null
+        );
+        Map<String, List<Integer>> classic = childThenNestedTotalsById(classicResp);
+        assertTrue(
+            "oracle: a parent with child total=1 and nested user total=1",
+            classic.values().stream().anyMatch(v -> v.equals(List.of(1, 1)))
+        );
+
+        try {
+            setIndexDefaultPipeline(index, NORMALIZATION_SEARCH_PIPELINE);
+            Map<String, Object> fusedResp = search(index, hasChildWrappingNestedQuery().mode(HybridQueryBuilder.Mode.FUSED), 10);
+            Map<String, List<Integer>> fused = childThenNestedTotalsById(fusedResp);
+            assertEquals("fused and classic must return the same parent hits", classic.keySet(), fused.keySet());
+            assertEquals("fused recursive child->nested inner_hits must be identical to classic hybrid", classic, fused);
+        } finally {
+            setIndexDefaultPipeline(index, "_none");
+        }
+    }
+
+    /**
+     * Inner_hits pagination + sort under fused mode: one leg's inner_hits uses {@code from:1}, the other sorts by
+     * {@code _doc} DESC. Classic vs fused, comparing the ORDERED list of inner-hit {@code _source} per field per parent —
+     * so equality proves pagination and sort are applied identically, not just that inner_hits exist.
+     */
+    @SneakyThrows
+    public void testInnerHits_whenFusedMode_withSortingAndPagination_thenMatchesClassicHybrid() {
+        String index = TEST_MULTI_DOC_WITH_NESTED_FIELDS_MULTIPLE_SHARD_INDEX_NAME;
+        initializeIndexIfNotExist(index);
+        createSearchPipeline(NORMALIZATION_SEARCH_PIPELINE, DEFAULT_NORMALIZATION_METHOD, DEFAULT_COMBINATION_METHOD, Map.of());
+        List<String> fields = List.of(TEST_NESTED_FIELD_NAME_1, TEST_NESTED_FIELD_NAME_2);
+
+        Map<String, Object> classicResp = search(
+            index,
+            sortedPaginatedNestedQuery(),
+            null,
+            10,
+            Map.of("search_pipeline", NORMALIZATION_SEARCH_PIPELINE),
+            null
+        );
+        Map<String, Map<String, List<Object>>> classic = innerHitSourcesById(classicResp, fields);
+
+        try {
+            setIndexDefaultPipeline(index, NORMALIZATION_SEARCH_PIPELINE);
+            Map<String, Object> fusedResp = search(index, sortedPaginatedNestedQuery().mode(HybridQueryBuilder.Mode.FUSED), 10);
+            Map<String, Map<String, List<Object>>> fused = innerHitSourcesById(fusedResp, fields);
+            assertEquals("fused and classic must return the same parent hits", classic.keySet(), fused.keySet());
+            assertEquals("fused inner_hits pagination+sort (ordered _source) must be identical to classic hybrid", classic, fused);
+        } finally {
+            setIndexDefaultPipeline(index, "_none");
+        }
+    }
+
+    private HybridQueryBuilder hasChildTextChildQuery() {
+        HasChildQueryBuilder hasChild = new HasChildQueryBuilder("child", new MatchQueryBuilder("text", "child"), ScoreMode.Avg);
+        hasChild.innerHit(new InnerHitBuilder());
+        HybridQueryBuilder hybrid = new HybridQueryBuilder();
+        hybrid.add(hasChild);
+        return hybrid;
+    }
+
+    private HybridQueryBuilder hasChildWrappingNestedQuery() {
+        NestedQueryBuilder nested = new NestedQueryBuilder("user", new MatchQueryBuilder("user.name", "John"), ScoreMode.Avg);
+        nested.innerHit(new InnerHitBuilder());
+        HasChildQueryBuilder hasChild = new HasChildQueryBuilder("child", nested, ScoreMode.Avg);
+        hasChild.innerHit(new InnerHitBuilder());
+        HybridQueryBuilder hybrid = new HybridQueryBuilder();
+        hybrid.add(hasChild);
+        return hybrid;
+    }
+
+    private HybridQueryBuilder sortedPaginatedNestedQuery() {
+        NestedQueryBuilder nested1 = new NestedQueryBuilder("user", new MatchQueryBuilder("user.name", "John"), ScoreMode.Avg);
+        InnerHitBuilder userInnerHit = new InnerHitBuilder();
+        userInnerHit.setFrom(1);
+        nested1.innerHit(userInnerHit);
+        NestedQueryBuilder nested2 = new NestedQueryBuilder(
+            "location",
+            new MatchQueryBuilder("location.state", "California"),
+            ScoreMode.Avg
+        );
+        InnerHitBuilder locationInnerHit = new InnerHitBuilder();
+        locationInnerHit.setSorts(createSortBuilders(Map.of("_doc", SortOrder.DESC), false));
+        nested2.innerHit(locationInnerHit);
+        HybridQueryBuilder hybrid = new HybridQueryBuilder();
+        hybrid.add(nested1);
+        hybrid.add(nested2);
+        return hybrid;
+    }
+
+    /** Parent {@code _id} -> [child inner_hits total, summed nested (user) inner_hits total across child hits]. */
+    @SuppressWarnings("unchecked")
+    private Map<String, List<Integer>> childThenNestedTotalsById(Map<String, Object> response) {
+        Map<String, Object> hitsMap = (Map<String, Object>) response.get("hits");
+        List<Map<String, Object>> hits = (List<Map<String, Object>>) hitsMap.get("hits");
+        Map<String, List<Integer>> byId = new HashMap<>();
+        for (Map<String, Object> hit : hits) {
+            String id = (String) hit.get("_id");
+            Map<String, Object> innerHits = (Map<String, Object>) hit.get("inner_hits");
+            assertNotNull("parent " + id + " must carry inner_hits", innerHits);
+            Map<String, Object> childInner = (Map<String, Object>) innerHits.get(TEST_PARENT_CHILD_INNER_HITS_FIELD_NAME);
+            assertNotNull("parent " + id + " missing child inner_hits", childInner);
+            Map<String, Object> childHitsBlock = (Map<String, Object>) childInner.get("hits");
+            int childTotal = (Integer) ((Map<String, Object>) childHitsBlock.get("total")).get("value");
+            List<Map<String, Object>> childHits = (List<Map<String, Object>>) childHitsBlock.get("hits");
+            int userTotalAcrossChildren = 0;
+            for (Map<String, Object> childHit : childHits) {
+                Map<String, Object> childInnerHits = (Map<String, Object>) childHit.get("inner_hits");
+                if (childInnerHits != null && childInnerHits.get(TEST_NESTED_FIELD_NAME_1) != null) {
+                    Map<String, Object> userBlock = (Map<String, Object>) ((Map<String, Object>) childInnerHits.get(
+                        TEST_NESTED_FIELD_NAME_1
+                    )).get("hits");
+                    userTotalAcrossChildren += (Integer) ((Map<String, Object>) userBlock.get("total")).get("value");
+                }
+            }
+            byId.put(id, List.of(childTotal, userTotalAcrossChildren));
+        }
+        return byId;
+    }
+
+    private NestedQueryBuilder nestedUserJohn() {
+        NestedQueryBuilder nested = new NestedQueryBuilder("user", new MatchQueryBuilder("user.name", "John"), ScoreMode.Avg);
+        nested.innerHit(new InnerHitBuilder());
+        return nested;
+    }
+
+    private NestedQueryBuilder nestedLocationCalifornia() {
+        NestedQueryBuilder nested = new NestedQueryBuilder(
+            "location",
+            new MatchQueryBuilder("location.state", "California"),
+            ScoreMode.Avg
+        );
+        nested.innerHit(new InnerHitBuilder());
+        return nested;
+    }
+
+    /** Map of parent {@code _id} -> {nested field name -> inner_hits total count}. Order-independent oracle key. */
+    @SuppressWarnings("unchecked")
+    private Map<String, Map<String, Integer>> innerHitTotalsById(Map<String, Object> response, List<String> fields) {
+        Map<String, Object> hitsMap = (Map<String, Object>) response.get("hits");
+        List<Map<String, Object>> hits = (List<Map<String, Object>>) hitsMap.get("hits");
+        Map<String, Map<String, Integer>> byId = new HashMap<>();
+        for (Map<String, Object> hit : hits) {
+            String id = (String) hit.get("_id");
+            Map<String, Object> innerHits = (Map<String, Object>) hit.get("inner_hits");
+            assertNotNull("hit " + id + " must carry inner_hits", innerHits);
+            Map<String, Integer> perField = new HashMap<>();
+            for (String field : fields) {
+                Map<String, Object> fieldInner = (Map<String, Object>) innerHits.get(field);
+                assertNotNull("hit " + id + " missing inner_hits for field " + field, fieldInner);
+                Map<String, Object> fieldHits = (Map<String, Object>) fieldInner.get("hits");
+                Map<String, Object> total = (Map<String, Object>) fieldHits.get("total");
+                perField.put(field, (Integer) total.get("value"));
+            }
+            byId.put(id, perField);
+        }
+        return byId;
+    }
+
+    /**
+     * Per parent {@code _id} -> field -> ordered list of inner-hit {@code _source} maps (in returned order). Captures
+     * inner_hits pagination ({@code from}/{@code size}) and sort, so classic-vs-fused equality proves those are applied
+     * identically, not just that inner_hits are present.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Map<String, List<Object>>> innerHitSourcesById(Map<String, Object> response, List<String> fields) {
+        Map<String, Object> hitsMap = (Map<String, Object>) response.get("hits");
+        List<Map<String, Object>> hits = (List<Map<String, Object>>) hitsMap.get("hits");
+        Map<String, Map<String, List<Object>>> byId = new HashMap<>();
+        for (Map<String, Object> hit : hits) {
+            String id = (String) hit.get("_id");
+            Map<String, Object> innerHits = (Map<String, Object>) hit.get("inner_hits");
+            assertNotNull("hit " + id + " must carry inner_hits", innerHits);
+            Map<String, List<Object>> perField = new HashMap<>();
+            for (String field : fields) {
+                Map<String, Object> fieldInner = (Map<String, Object>) innerHits.get(field);
+                assertNotNull("hit " + id + " missing inner_hits for field " + field, fieldInner);
+                Map<String, Object> fieldHits = (Map<String, Object>) fieldInner.get("hits");
+                List<Map<String, Object>> innerHitList = (List<Map<String, Object>>) fieldHits.get("hits");
+                List<Object> sources = new ArrayList<>();
+                for (Map<String, Object> innerHit : innerHitList) {
+                    sources.add(innerHit.get("_source"));
+                }
+                perField.put(field, sources);
+            }
+            byId.put(id, perField);
+        }
+        return byId;
+    }
+
+    @SneakyThrows
+    private void setIndexDefaultPipeline(String indexName, String pipelineId) {
+        Request request = new Request("PUT", "/" + indexName + "/_settings");
+        request.setJsonEntity("{\"index.search.default_pipeline\":\"" + pipelineId + "\"}");
+        Response response = client().performRequest(request);
+        assertEquals(200, response.getStatusLine().getStatusCode());
     }
 
     public void testInnerHits_whenMultipleSubqueriesOnParentChildFields_thenSuccessful() {

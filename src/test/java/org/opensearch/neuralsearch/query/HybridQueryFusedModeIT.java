@@ -43,9 +43,12 @@ import lombok.SneakyThrows;
 public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
 
     private static final String TEXT_FIELD = "text";
+    private static final String TITLE_FIELD = "title";
+    private static final String NESTED_PATH = "user";
     private static final String INDEX_WITH_DEFAULT_NORM = "test-hybrid-fused-default-norm";
     private static final String INDEX_WITH_DEFAULT_RRF = "test-hybrid-fused-default-rrf";
     private static final String INDEX_NO_PIPELINE = "test-hybrid-fused-no-pipeline";
+    private static final String INDEX_NESTED = "test-hybrid-fused-nested-innerhits";
     private static final String NORM_PIPELINE = "fused-mode-norm-pipeline";
     private static final String RRF_PIPELINE = "fused-mode-rrf-pipeline";
 
@@ -185,6 +188,92 @@ public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
         Response response = client().performRequest(request);
         assertEquals(request.getEndpoint() + ": failed", RestStatus.OK, RestStatus.fromCode(response.getStatusLine().getStatusCode()));
         return XContentHelper.convertToMap(XContentType.JSON.xContent(), EntityUtils.toString(response.getEntity()), false);
+    }
+
+    /**
+     * Verifies that leg-level {@code inner_hits} survive the fused-mode self-erase. A {@code nested} sub-query declaring
+     * inner_hits is fused with a lexical leg; the returned parent hits must carry the nested inner_hits. Without the
+     * {@code HybridFusionQuery.extractInnerHitBuilders} override (+ Tail retention when a leg has inner_hits) the
+     * self-erased query silently drops them, since the coordinator replaces the {@code hybrid} builder with
+     * {@code HybridFusionQuery} before the shard extracts inner_hits.
+     */
+    @SneakyThrows
+    @SuppressWarnings("unchecked")
+    public void testFusedMode_whenLegHasNestedInnerHits_thenInnerHitsReturned() {
+        createSearchPipeline(NORM_PIPELINE + "-nested", "min_max", "arithmetic_mean", Map.of());
+        if (indexExists(INDEX_NESTED) == false) {
+            createIndex(INDEX_NESTED, indexConfigNested(NORM_PIPELINE + "-nested"));
+            indexNestedDoc(INDEX_NESTED, "1", "hello world", "alice", "bob");
+            indexNestedDoc(INDEX_NESTED, "2", "hello there", "alice", "carol");
+            indexNestedDoc(INDEX_NESTED, "3", "welcome place", "dave");
+        }
+
+        // mode:fused hybrid — leg 1 lexical (title:hello), leg 2 nested (user.name:alice) with inner_hits.
+        // docs 1 and 2 match both legs; doc 3 matches neither.
+        String body = "{\"query\":{\"hybrid\":{\"mode\":\"fused\",\"queries\":["
+            + "{\"match\":{\""
+            + TITLE_FIELD
+            + "\":\"hello\"}},"
+            + "{\"nested\":{\"path\":\""
+            + NESTED_PATH
+            + "\",\"query\":{\"match\":{\""
+            + NESTED_PATH
+            + ".name\":\"alice\"}},"
+            + "\"inner_hits\":{}}}"
+            + "]}}}";
+
+        Map<String, Object> response = searchWithRawBody(INDEX_NESTED, body, 10);
+
+        List<Map<String, Object>> hits = getNestedHits(response);
+        assertFalse("expected fused hits", hits.isEmpty());
+        int hitsWithInnerHits = 0;
+        for (Map<String, Object> hit : hits) {
+            String id = (String) hit.get("_id");
+            if (id.equals("1") == false && id.equals("2") == false) {
+                continue;
+            }
+            Map<String, Object> innerHits = (Map<String, Object>) hit.get("inner_hits");
+            assertNotNull("hit " + id + " must carry inner_hits", innerHits);
+            Map<String, Object> userInner = (Map<String, Object>) innerHits.get(NESTED_PATH);
+            assertNotNull("hit " + id + " must have '" + NESTED_PATH + "' inner_hits", userInner);
+            List<Map<String, Object>> innerHitList = getNestedHits(userInner);
+            assertFalse("hit " + id + " inner_hits must be non-empty", innerHitList.isEmpty());
+            Map<String, Object> src = (Map<String, Object>) innerHitList.get(0).get("_source");
+            assertEquals("matched nested doc must be the alice comment", "alice", src.get("name"));
+            hitsWithInnerHits++;
+        }
+        assertEquals("both doc 1 and doc 2 must return inner_hits under fused mode", 2, hitsWithInnerHits);
+    }
+
+    private String indexConfigNested(String pipelineId) {
+        return "{\"settings\":{\"number_of_shards\":3,\"number_of_replicas\":0,"
+            + "\"index.search.default_pipeline\":\""
+            + pipelineId
+            + "\"},"
+            + "\"mappings\":{\"properties\":{"
+            + "\""
+            + TITLE_FIELD
+            + "\":{\"type\":\"text\"},"
+            + "\""
+            + NESTED_PATH
+            + "\":{\"type\":\"nested\",\"properties\":{\"name\":{\"type\":\"text\"}}}}}}";
+    }
+
+    @SneakyThrows
+    private void indexNestedDoc(String index, String id, String title, String... names) {
+        StringBuilder users = new StringBuilder();
+        for (int i = 0; i < names.length; i++) {
+            if (i > 0) {
+                users.append(",");
+            }
+            users.append("{\"name\":\"").append(names[i]).append("\"}");
+        }
+        String doc = "{\"" + TITLE_FIELD + "\":\"" + title + "\",\"" + NESTED_PATH + "\":[" + users + "]}";
+        Request request = new Request("PUT", "/" + index + "/_doc/" + id + "?refresh=true");
+        request.setJsonEntity(doc);
+        Response response = client().performRequest(request);
+        int code = response.getStatusLine().getStatusCode();
+        assertTrue("indexing nested doc failed: " + code, code == RestStatus.OK.getStatus() || code == RestStatus.CREATED.getStatus());
     }
 
     @SuppressWarnings("unchecked")
