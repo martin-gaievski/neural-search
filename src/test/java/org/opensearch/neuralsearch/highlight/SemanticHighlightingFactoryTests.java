@@ -29,6 +29,11 @@ import org.opensearch.test.OpenSearchTestCase;
 
 public class SemanticHighlightingFactoryTests extends OpenSearchTestCase {
 
+    // Parent action name for the ProcessorGenerationContext (core added this second record field). These tests assert
+    // the highlighter's candidate detection, which reads only the SearchRequest, so the parent-action value is inert
+    // here; use the canonical search transport action name.
+    private static final String SEARCH_ACTION_NAME = "indices:data/read/search";
+
     @Mock
     private MLCommonsClientAccessor mlClientAccessor;
 
@@ -47,13 +52,13 @@ public class SemanticHighlightingFactoryTests extends OpenSearchTestCase {
     /** Top-level type: semantic + batch_inference: true triggers the factory (legacy field-level signal). */
     public void testShouldGenerateReturnsTrueForTopLevelSemanticFieldWithBatchInference() {
         SearchRequest request = buildRequestWithTopLevelSemanticField(true);
-        assertTrue(factory.shouldGenerate(new ProcessorGenerationContext(request)));
+        assertTrue(factory.shouldGenerate(new ProcessorGenerationContext(request, SEARCH_ACTION_NAME)));
     }
 
     /** Top-level type: semantic alone (no opt-in signal) does NOT trigger the factory. */
     public void testShouldGenerateReturnsFalseForTopLevelSemanticFieldWithoutOptIn() {
         SearchRequest request = buildRequestWithTopLevelSemanticField(false);
-        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(request)));
+        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(request, SEARCH_ACTION_NAME)));
     }
 
     /** Non-semantic highlighter type does not trigger the factory. */
@@ -67,28 +72,28 @@ public class SemanticHighlightingFactoryTests extends OpenSearchTestCase {
         source.highlighter(hl);
         request.source(source);
 
-        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(request)));
+        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(request, SEARCH_ACTION_NAME)));
     }
 
     /** Customer bug shape: only inner_hits has type: semantic, no top-level highlight, no ext.
      *  The cheap candidate check returns false and the query tree is NOT walked. */
     public void testShouldGenerateReturnsFalseForInnerHitsOnlyWithoutExt() {
         SearchRequest request = buildRequestWithInnerHitsSemanticField();
-        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(request)));
+        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(request, SEARCH_ACTION_NAME)));
     }
 
     /** Inner_hits-only declaration plus the new ext opt-in: factory walks the tree and finds the target. */
     public void testShouldGenerateReturnsTrueForInnerHitsSemanticFieldWithExt() {
         SearchRequest request = buildRequestWithInnerHitsSemanticField();
         request.source().ext(extEnabled(true));
-        assertTrue(factory.shouldGenerate(new ProcessorGenerationContext(request)));
+        assertTrue(factory.shouldGenerate(new ProcessorGenerationContext(request, SEARCH_ACTION_NAME)));
     }
 
     /** ext: false explicitly disables the ext signal. Without batch_inference on the field, the factory still does not fire. */
     public void testShouldGenerateRespectsExtFalseWithTopLevelButNoBatchFlag() {
         SearchRequest request = buildRequestWithTopLevelSemanticField(false);
         request.source().ext(extEnabled(false));
-        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(request)));
+        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(request, SEARCH_ACTION_NAME)));
     }
 
     /** ext: false alone (no top-level semantic, no inner_hits) → factory short-circuits. */
@@ -98,22 +103,22 @@ public class SemanticHighlightingFactoryTests extends OpenSearchTestCase {
         source.ext(extEnabled(false));
         request.source(source);
 
-        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(request)));
+        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(request, SEARCH_ACTION_NAME)));
     }
 
     public void testShouldGenerateReturnsFalseWhenNoHighlighter() {
         SearchRequest request = new SearchRequest();
         request.source(new SearchSourceBuilder());
-        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(request)));
+        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(request, SEARCH_ACTION_NAME)));
     }
 
     public void testShouldGenerateReturnsFalseWhenNoSearchSource() {
         SearchRequest request = new SearchRequest();
-        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(request)));
+        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(request, SEARCH_ACTION_NAME)));
     }
 
     public void testShouldGenerateReturnsFalseWhenNullRequest() {
-        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(null)));
+        assertFalse(factory.shouldGenerate(new ProcessorGenerationContext(null, SEARCH_ACTION_NAME)));
     }
 
     /** Multiple fields, one is semantic with batch_inference: true → factory fires. */
@@ -136,7 +141,7 @@ public class SemanticHighlightingFactoryTests extends OpenSearchTestCase {
         source.highlighter(hl);
         request.source(source);
 
-        assertTrue(factory.shouldGenerate(new ProcessorGenerationContext(request)));
+        assertTrue(factory.shouldGenerate(new ProcessorGenerationContext(request, SEARCH_ACTION_NAME)));
     }
 
     public void testCreateProcessorWithDefaultValues() {

@@ -157,7 +157,7 @@ public class HybridQueryBuilderFusedModeTests extends OpenSearchQueryTestCase {
             new TermQueryBuilder(TEXT_FIELD_NAME, "other")
         );
 
-        MultiSearchRequest multiSearchRequest = HybridFusionOrchestrator.buildLegMultiSearch(request, legs, 100);
+        MultiSearchRequest multiSearchRequest = HybridFusionOrchestrator.buildLegMultiSearch(request, legs, 100, false);
 
         assertEquals(legs.size(), multiSearchRequest.requests().size());
         for (SearchRequest legRequest : multiSearchRequest.requests()) {

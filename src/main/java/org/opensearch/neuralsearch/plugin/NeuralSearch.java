@@ -100,6 +100,7 @@ import org.opensearch.neuralsearch.ml.MLCommonsClientAccessor;
 import org.opensearch.neuralsearch.processor.AgenticQueryTranslatorProcessor;
 import org.opensearch.neuralsearch.processor.AgenticContextResponseProcessor;
 import org.opensearch.neuralsearch.processor.ExplanationResponseProcessor;
+import org.opensearch.neuralsearch.processor.HybridFusedProfileResponseProcessor;
 import org.opensearch.neuralsearch.processor.NeuralQueryEnricherProcessor;
 import org.opensearch.neuralsearch.processor.NeuralSparseTwoPhaseProcessor;
 import org.opensearch.neuralsearch.processor.NormalizationProcessor;
@@ -417,8 +418,14 @@ public class NeuralSearch extends Plugin
     ) {
         NeuralSearchClusterUtil.instance().setSearchPipelineService(parameters.searchPipelineService);
 
-        // System-generated semantic highlighting processor that automatically applies when semantic highlighting is detected
-        return Map.of(SemanticHighlightingConstants.SYSTEM_FACTORY_TYPE, new SemanticHighlightingFactory(clientAccessor));
+        // System-generated semantic highlighting processor that automatically applies when semantic highlighting is detected,
+        // and a fused-mode hybrid profiler processor that merges per-sub-query (leg) profiles into the response profile.
+        return Map.of(
+            SemanticHighlightingConstants.SYSTEM_FACTORY_TYPE,
+            new SemanticHighlightingFactory(clientAccessor),
+            HybridFusedProfileResponseProcessor.TYPE,
+            new HybridFusedProfileResponseProcessor.Factory()
+        );
     }
 
     @Override

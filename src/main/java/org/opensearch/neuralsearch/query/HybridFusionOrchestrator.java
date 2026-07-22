@@ -24,6 +24,7 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.pipeline.SearchPipelineService;
+import org.opensearch.search.profile.ProfileShardResult;
 
 /**
  * Coordinator-level fusion for the hybrid query {@code mode: "fused"} path: fire each sub-query as an independent
@@ -53,14 +54,20 @@ final class HybridFusionOrchestrator {
      * against id-only, {@code fetchSource(false)} hits with no {@code ext.rerank} context). The outer fused request
      * still carries the pipeline, so top-level request/response processors run exactly once, as intended.
      */
-    static MultiSearchRequest buildLegMultiSearch(SearchRequest request, List<QueryBuilder> legs, int rankWindowSize) {
+    static MultiSearchRequest buildLegMultiSearch(SearchRequest request, List<QueryBuilder> legs, int rankWindowSize, boolean profile) {
         MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
         for (QueryBuilder leg : legs) {
             SearchSourceBuilder legSource = new SearchSourceBuilder().query(leg)
                 .size(rankWindowSize)
                 .from(0)
                 .fetchSource(false)
-                .trackTotalHits(false);
+                .trackTotalHits(false)
+                // When the outer request has profiling on, profile each leg too. The leg is the real sub-query
+                // execution that drives fusion; profiling it is the only way to surface per-sub-query timing, since the
+                // self-erased outer query only profiles the constant_score(ids) Top + Tail filter, not the sub-query
+                // scoring. The captured leg profiles are merged back into the response by the system-generated
+                // HybridFusedProfileResponseProcessor.
+                .profile(profile);
             multiSearchRequest.add(
                 new SearchRequest(request.indices()).indicesOptions(request.indicesOptions())
                     .source(legSource)
@@ -105,6 +112,31 @@ final class HybridFusionOrchestrator {
         }
         List<QueryBuilder> tail = topOnly ? List.of() : survivingLegQueries(legs, legHits);
         return new HybridFusionQuery(ranked.ids, ranked.scores, tail);
+    }
+
+    /**
+     * Collect the per-leg profile results from a profiled leg MultiSearch, namespacing each leg's shard keys with a
+     * {@code [fused_leg_N]} prefix so they do not collide with the outer request's shard keys and so a reader can tell
+     * which sub-query each profile belongs to. Returns an empty map when no leg carried a profile (e.g. profiling off,
+     * or a failed leg). This is the real per-sub-query timing that the self-erased outer query cannot show.
+     */
+    static Map<String, ProfileShardResult> collectLegProfiles(MultiSearchResponse multiSearchResponse) {
+        Map<String, ProfileShardResult> merged = new LinkedHashMap<>();
+        MultiSearchResponse.Item[] items = multiSearchResponse.getResponses();
+        for (int legIndex = 0; legIndex < items.length; legIndex++) {
+            MultiSearchResponse.Item item = items[legIndex];
+            if (item.isFailure() || item.getResponse() == null) {
+                continue;
+            }
+            Map<String, ProfileShardResult> legProfile = item.getResponse().getProfileResults();
+            if (legProfile == null) {
+                continue;
+            }
+            for (Map.Entry<String, ProfileShardResult> entry : legProfile.entrySet()) {
+                merged.put(String.format(Locale.ROOT, "[fused_leg_%d]%s", legIndex, entry.getKey()), entry.getValue());
+            }
+        }
+        return merged;
     }
 
     /** The sub-query legs restricted to those that survived (non-null hits slot); used for the Tail so a failed leg is

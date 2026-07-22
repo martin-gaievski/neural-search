@@ -114,6 +114,29 @@ public final class FusionSpec {
         return null;
     }
 
+    /**
+     * Read a {@link FusionSpec} from an inline {@code fusion} block on the query body (Option X precedence step 1:
+     * inline wins over the attached pipeline). The block mirrors the processor JSON verbatim —
+     * {@code {normalization: {technique}, combination: {technique, parameters: {weights | rank_constant}}}} — so this
+     * reuses the pipeline-config parsing. {@code combination.technique: rrf} routes to the rank-constant shape.
+     *
+     * @param fusionConfig the parsed inline fusion map (nullable)
+     * @return the parsed fusion spec, or null when the map is null
+     */
+    @SuppressWarnings("unchecked")
+    static FusionSpec fromInlineFusion(Map<String, Object> fusionConfig) {
+        if (fusionConfig == null) {
+            return null;
+        }
+        if (fusionConfig.get(COMBINATION_CLAUSE) instanceof Map) {
+            Object technique = ((Map<String, Object>) fusionConfig.get(COMBINATION_CLAUSE)).get(TECHNIQUE_KEY);
+            if (technique != null && TECHNIQUE_RRF.equals(technique.toString().toLowerCase(Locale.ROOT))) {
+                return fromScoreRankerProcessor(fusionConfig);
+            }
+        }
+        return fromNormalizationProcessor(fusionConfig);
+    }
+
     @SuppressWarnings("unchecked")
     private static FusionSpec fromNormalizationProcessor(Map<String, Object> config) {
         String normalization = NORMALIZATION_MIN_MAX;
