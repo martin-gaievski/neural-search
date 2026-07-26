@@ -103,12 +103,17 @@ final class HybridFusionOrchestrator {
         boolean topOnly;
         if (topLevel == false) {
             topOnly = true; // nested: enclosing filter intersects at the query phase
-        } else if (needsExecutionTail(source) || legsHaveInnerHits(legs)) {
-            topOnly = false; // aggregations / explain / profile / highlight / leg inner_hits need the legs IN the query
+        } else if (requiresExecutionTail(source) || legsHaveInnerHits(legs)) {
+            // aggregations / highlight / leg inner_hits are silently WRONG without the full match set in the query,
+            // so they retain the Tail even when the user set track_total_hits:false (documented override).
+            topOnly = false;
         } else if (wantsTotalsBeyondWindow(source, ranked.ids.length)) {
-            topOnly = false; // keep the Tail for an accurate index-wide count
+            topOnly = false; // keep the Tail for an accurate index-wide count (also serves explain/profile visibility)
         } else {
-            topOnly = true; // track_total_hits:false -> plain top-K, no Tail
+            // track_total_hits:false -> plain top-K, no Tail. Explicit user intent wins over the merely-informative
+            // Tail uses (explain/profile show the constant_score(ids) window only) — this keeps the Top-only window
+            // deterministic, e.g. for rescore-based promotion.
+            topOnly = true;
         }
         List<QueryBuilder> tail = topOnly ? List.of() : survivingLegQueries(legs, legHits);
         return new HybridFusionQuery(ranked.ids, ranked.scores, tail);
@@ -395,9 +400,16 @@ final class HybridFusionOrchestrator {
         return new RankedDocs(ids, scores);
     }
 
-    private static boolean needsExecutionTail(SearchSourceBuilder source) {
-        return source != null
-            && (source.aggregations() != null || Boolean.TRUE.equals(source.explain()) || source.profile() || source.highlighter() != null);
+    /**
+     * True when the request is silently WRONG without the Tail: aggregations must run over the full match set and the
+     * highlighter needs the legs' terms in the query. These retain the Tail even under an explicit
+     * {@code track_total_hits: false}. Explain and profile are deliberately NOT here — they are informative, not
+     * correctness-bearing (the per-leg profiler collects leg timings from round 1 regardless), so they get the Tail
+     * only via the default totals branch and an explicit {@code track_total_hits: false} yields a deterministic
+     * Top-only window.
+     */
+    private static boolean requiresExecutionTail(SearchSourceBuilder source) {
+        return source != null && (source.aggregations() != null || source.highlighter() != null);
     }
 
     /**

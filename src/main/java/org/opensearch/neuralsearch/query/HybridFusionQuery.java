@@ -40,6 +40,21 @@ import org.opensearch.index.query.QueryShardContext;
  *       needs the full match set; omitted (Top-only) for plain top-K and for a nested fused query.</li>
  * </ul>
  *
+ * <p><b>Rescore.</b> A top-level {@code rescore} block passes through the self-erase untouched and runs the stock
+ * query-phase rescorer over THIS query's scores — i.e. once, on the final FUSED scores. This differs from classic
+ * (pipeline-mode) hybrid, where the same rescore block is applied per sub-query on raw pre-normalization scores
+ * inside the hybrid collector (so e.g. a promotion band there is erased by normalization). Consequences for fused
+ * rescore users: set {@code window_size} explicitly (the rescore default of 10 is far below the default
+ * {@code rank_window_size} of 100 and silently drops candidates), and note that when the Tail is present its score-0
+ * docs can enter the per-shard rescore window in docid order — pin determinism with {@code track_total_hits:false}
+ * (Top-only) or a {@code min_score} epsilon below 0.001 when needed.
+ *
+ * <p><b>min_max window floor.</b> Fused min_max normalizes each leg over its collected window (the global top
+ * {@code rank_window_size} per leg), so the leg's weakest collected doc normalizes to the 0.001 floor even though it
+ * outscored every non-collected doc. Classic hybrid has the same property over its own window (per-shard top-K per
+ * sub-query, min/max reduced across shards) — window-relative floors are inherent to min_max, not a fused regression;
+ * only the window shapes differ.
+ *
  * <p>This query is created internally by the coordinator self-erase and is never parseable from a search request.
  */
 public class HybridFusionQuery extends AbstractQueryBuilder<HybridFusionQuery> {
@@ -54,6 +69,11 @@ public class HybridFusionQuery extends AbstractQueryBuilder<HybridFusionQuery> {
         this.ids = ids;
         this.scores = scores;
         this.sourceQueries = sourceQueries == null ? new ArrayList<>() : sourceQueries;
+    }
+
+    /** True when the Tail (non-scoring full-match-set filter) is part of this query. Package-private, for tests. */
+    boolean hasTail() {
+        return sourceQueries.isEmpty() == false;
     }
 
     public HybridFusionQuery(StreamInput in) throws IOException {

@@ -227,4 +227,74 @@ public class HybridQueryBuilderFusedModeTests extends OpenSearchQueryTestCase {
         assertNull(FusionSpec.fromPipelineConfig(Map.of()));
         assertNull(FusionSpec.fromPipelineConfig(null));
     }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // buildFusedQuery Tail-precedence: explicit track_total_hits:false must win over the merely-informative Tail uses
+    // (explain/profile), while correctness-bearing uses (aggregations/highlight) still retain the Tail.
+    // ---------------------------------------------------------------------------------------------------------------
+
+    @SneakyThrows
+    private static QueryBuilder buildFusedQueryFor(org.opensearch.search.builder.SearchSourceBuilder source) {
+        org.opensearch.search.SearchHit hit = new org.opensearch.search.SearchHit(0, "doc-1", Map.of(), Map.of());
+        hit.score(1.0f);
+        org.opensearch.search.SearchHits hits = new org.opensearch.search.SearchHits(
+            new org.opensearch.search.SearchHit[] { hit },
+            new org.apache.lucene.search.TotalHits(1, org.apache.lucene.search.TotalHits.Relation.EQUAL_TO),
+            1.0f
+        );
+        org.opensearch.action.search.SearchResponseSections sections = new org.opensearch.action.search.SearchResponseSections(
+            hits,
+            null,
+            null,
+            false,
+            false,
+            null,
+            0,
+            new java.util.ArrayList<>()
+        );
+        org.opensearch.action.search.SearchResponse legResponse = new org.opensearch.action.search.SearchResponse(
+            sections,
+            null,
+            1,
+            1,
+            0,
+            1,
+            null,
+            new org.opensearch.action.search.ShardSearchFailure[0],
+            org.opensearch.action.search.SearchResponse.Clusters.EMPTY,
+            null
+        );
+        org.opensearch.action.search.MultiSearchResponse multiSearchResponse = new org.opensearch.action.search.MultiSearchResponse(
+            new org.opensearch.action.search.MultiSearchResponse.Item[] {
+                new org.opensearch.action.search.MultiSearchResponse.Item(legResponse, null) },
+            1
+        );
+        List<QueryBuilder> legs = List.of(new TermQueryBuilder("field", "value"));
+        FusionSpec spec = FusionSpec.fromInlineFusion(Map.of("normalization", Map.of("technique", "min_max")));
+        return HybridFusionOrchestrator.buildFusedQuery(source, multiSearchResponse, legs, spec, 100, true);
+    }
+
+    private static boolean hasTail(QueryBuilder fused) {
+        assertTrue("expected a HybridFusionQuery", fused instanceof HybridFusionQuery);
+        return ((HybridFusionQuery) fused).hasTail();
+    }
+
+    public void testBuildFusedQuery_whenTrackTotalHitsFalse_thenTopOnlyEvenWithExplainAndProfile() {
+        org.opensearch.search.builder.SearchSourceBuilder source = new org.opensearch.search.builder.SearchSourceBuilder().trackTotalHits(
+            false
+        ).explain(true).profile(true);
+        assertFalse("explain/profile must not override explicit track_total_hits:false", hasTail(buildFusedQueryFor(source)));
+    }
+
+    public void testBuildFusedQuery_whenTrackTotalHitsFalseWithAggregations_thenTailRetained() {
+        org.opensearch.search.builder.SearchSourceBuilder source = new org.opensearch.search.builder.SearchSourceBuilder().trackTotalHits(
+            false
+        ).aggregation(org.opensearch.search.aggregations.AggregationBuilders.terms("by_field").field("field"));
+        assertTrue("aggregations are silently wrong without the Tail and must retain it", hasTail(buildFusedQueryFor(source)));
+    }
+
+    public void testBuildFusedQuery_whenDefaultTotals_thenTailPresent() {
+        org.opensearch.search.builder.SearchSourceBuilder source = new org.opensearch.search.builder.SearchSourceBuilder();
+        assertTrue("default (totals wanted) keeps the Tail", hasTail(buildFusedQueryFor(source)));
+    }
 }
