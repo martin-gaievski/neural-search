@@ -15,25 +15,24 @@ import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.neuralsearch.BaseNeuralSearchIT;
-import org.opensearch.neuralsearch.processor.HybridFusedAggregationsResponseProcessor;
 
 import lombok.SneakyThrows;
 
 /**
- * Isolates the KNN-only-Tail-gap question for a TOP-LEVEL fused hybrid: a dense {@code knn} leg's Tail is materialized
- * from the ids the leg RETURNED (top {@code rank_window_size}, further capped by the query's {@code k}) — it is NOT
- * re-run as a real query ({@code HybridFusionOrchestrator.isMaterializableLeg} avoids a second HNSW walk). So a doc that
- * is a genuine vector neighbor but sits OUTSIDE the returned window, and is NOT matched by the lexical leg, is absent
- * from the Tail and therefore absent from aggregations / total_hits.
+ * Verifies the KNN-leg aggregation fix for a TOP-LEVEL fused hybrid, PIPELINE-FREE (no processor, nothing enabled).
  *
- * <p><b>Empirical finding (this is a REGRESSION on multi-shard indices):</b> classic hybrid runs the KNN sub-query
- * in-place per shard, so its aggregation sees the <b>per-shard-k</b> union (which includes {@code red_far}, top-3 on
- * its own shard). Fused fires the KNN leg with {@code size=rank_window_size} and the coordinator reduces it to the
- * <b>global top-{@code rank_window_size}</b> before materializing the Tail, dropping {@code red_far} in that global
- * merge. So on a 2-shard index: classic counts {@code red=1} (total 5), fused counts {@code red=0} (total 4). The KNN
- * leg's aggregation contribution is therefore narrower under fused (global-top-window) than classic (per-shard-k union)
- * — a genuine undercount, distinct from the lexical case where the Tail re-runs the real query and covers the full
- * match set. (A single-shard index would hide this, since per-shard-k == global-k there.)
+ * <p><b>The bug (now fixed):</b> the Tail used to materialize a dense {@code knn}/{@code neural} leg as an
+ * {@code IdsQuery} of the ids that leg RETURNED — the coordinator's global top-{@code rank_window_size} — to avoid a
+ * second HNSW walk. Classic hybrid instead runs the sub-query in place on every shard, aggregating the
+ * <b>per-shard-{@code k}</b> union. On a multi-shard index those differ: a doc that is top-{@code k} on its own shard
+ * but outside the global top-{@code rank_window_size} ({@code red_far} here) was counted by classic and dropped by
+ * fused (2-shard probe: classic total 5, old fused total 4).
+ *
+ * <p><b>The fix (in {@code HybridFusionOrchestrator.survivingLegQueries}):</b> the Tail now carries every leg's REAL
+ * query, so on each shard a knn/neural leg is evaluated in place and its per-shard-{@code k} neighbors are in the
+ * aggregation. Because the Tail is part of the self-erased query, this is entirely pipeline-free — no processor, no
+ * pipeline, no cluster setting. The cost is a second ANN walk in the round-2 Tail (a latency tradeoff, not a
+ * correctness one). A single-shard index would hide the original bug (per-shard-{@code k} == global-{@code k}).
  *
  * <p><b>Construction (2-D vectors, single query vector [0,0]):</b>
  * <pre>
@@ -163,15 +162,14 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
         assertEquals("classic: total is the full union", 5L, totalHits(resp));
     }
 
-    // FUSED hybrid aggregation — THE DIVERGENCE. Fused fires the KNN leg with size=rank_window_size and the
-    // coordinator reduces it to the GLOBAL top-rank_window_size (blue1..3), dropping red_far in that global
-    // merge; the Tail is then materialized from those returned ids only. So red_far is ABSENT from fused aggs
-    // (blue=3, green=1, red=0, total=4) while classic counts it (red=1, total=5). This is a genuine fused
-    // undercount of the KNN leg's aggregation contribution on a MULTI-SHARD index: fused aggregates the global
-    // top-rank_window_size of the KNN leg, classic aggregates the per-shard-k union. Regression guard.
+    // FUSED hybrid aggregation — now MATCHES classic. The Tail carries the real knn query (no longer
+    // materialized to global-top-window ids), so on each shard the knn leg is evaluated in place and its
+    // per-shard-k neighbors (incl. red_far) are in the aggregation. Regression guard for the fix: fused must
+    // equal classic here (blue=3, green=1, red=1, total=5) with NO processor/pipeline enabled.
     @SneakyThrows
-    public void testFusedHybrid_knnLeg_undercountsVsClassic() {
+    public void testFusedHybrid_knnLeg_matchesClassic_pipelineFree() {
         ensureDataset();
+        updateClusterSettings("cluster.search.enabled_system_generated_factories", List.of());
         String body = "{\"query\":{\"hybrid\":{\"mode\":\"fused\",\"rank_window_size\":"
             + RANK_WINDOW
             + ",\"queries\":["
@@ -186,13 +184,9 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
         System.out.println("RESULT[FUSED knn+lex]: buckets=" + b + " total=" + totalHits(resp));
         assertEquals("fused: blue in union", Integer.valueOf(3), b.getOrDefault("blue", 0));
         assertEquals("fused: green (lexical) in union", Integer.valueOf(1), b.getOrDefault("green", 0));
-        // red_far dropped in the coordinator global-top-rank_window_size reduction of the KNN leg -> absent from Tail.
-        assertEquals(
-            "fused: red_far ABSENT (global-top-window reduction) — diverges from classic red=1",
-            Integer.valueOf(0),
-            b.getOrDefault("red", 0)
-        );
-        assertEquals("fused: total undercounts vs classic (4 vs 5)", 4L, totalHits(resp));
+        // real-knn Tail evaluated per shard -> red_far (per-shard-k) is counted, matching classic.
+        assertEquals("fused: red_far counted (real-knn Tail per shard)", Integer.valueOf(1), b.getOrDefault("red", 0));
+        assertEquals("fused: total matches classic (5)", 5L, totalHits(resp));
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -249,65 +243,15 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // THE FIX (aggregation leg): with the agg leg implemented, a top-level fused hybrid carrying an
-    // aggregation must now report the TRUE leg union — identical to classic — instead of undercounting
-    // the KNN leg. Expected: blue=3, green=1, red=1, total=5 (was blue=3, green=1, total=4).
-    // ---------------------------------------------------------------------------------------------
-    @SneakyThrows
-    public void testFusedHybrid_withAggregationLeg_matchesClassicExactly() {
-        ensureDataset();
-        // System-generated processors are OFF by default; the aggregation-leg swap rides one, so enable its factory
-        // (same deployment prerequisite as the fused profiler processor).
-        updateClusterSettings("cluster.search.enabled_system_generated_factories", List.of(HybridFusedAggregationsResponseProcessor.TYPE));
-        try {
-            String fusedBody = "{\"query\":{\"hybrid\":{\"mode\":\"fused\",\"rank_window_size\":"
-                + RANK_WINDOW
-                + ",\"queries\":["
-                + lexicalLeg()
-                + ","
-                + knnLeg()
-                + "]}},"
-                + termsAgg()
-                + ",\"track_total_hits\":true}";
-            Map<String, Object> fused = searchRaw(fusedBody, 10);
-            Map<String, Integer> fb = colorBuckets(fused);
-            long fusedTotal = totalHits(fused);
-
-            String classicBody = "{\"query\":{\"hybrid\":{\"queries\":["
-                + lexicalLeg()
-                + ","
-                + knnLeg()
-                + "]}},"
-                + termsAgg()
-                + ",\"track_total_hits\":true}";
-            Map<String, Object> classic = searchRaw(classicBody, 10);
-            Map<String, Integer> cb = colorBuckets(classic);
-            long classicTotal = totalHits(classic);
-
-            System.out.println("RESULT[AGGLEG fused]: buckets=" + fb + " total=" + fusedTotal);
-            System.out.println("RESULT[AGGLEG classic]: buckets=" + cb + " total=" + classicTotal);
-
-            // THE PROOF: fused aggregations now equal classic, including the previously-missed KNN-only doc.
-            assertEquals("agg leg: red_far recaptured (was 0)", Integer.valueOf(1), fb.getOrDefault("red", 0));
-            assertEquals("agg leg: blue matches classic", cb.getOrDefault("blue", 0), fb.getOrDefault("blue", 0));
-            assertEquals("agg leg: green matches classic", cb.getOrDefault("green", 0), fb.getOrDefault("green", 0));
-            assertEquals("agg leg: red matches classic", cb.getOrDefault("red", 0), fb.getOrDefault("red", 0));
-            assertEquals("agg leg: total_hits matches classic", classicTotal, fusedTotal);
-        } finally {
-            updateClusterSettings("cluster.search.enabled_system_generated_factories", List.of());
-        }
-    }
-
-    // ---------------------------------------------------------------------------------------------
-    // RELEVANCE GUARD: the aggregation leg must NOT change ranking. It is a size:0, non-scoring side
-    // query, so the SCORED docs (the fused Top window) must be identical with and without it.
+    // RELEVANCE GUARD: attaching an aggregation must NOT change ranking. The Tail (which carries the real
+    // sub-queries, including the knn leg) is non-scoring, so the SCORED docs (the fused Top window) must be
+    // identical with and without an aggregation on the request.
     //
-    // NOTE on shape: a request WITH aggregations also retains the Tail (pre-existing behavior, unrelated
-    // to the agg leg), which appends score-0 union docs BELOW the window. So we compare the SCORED
-    // PREFIX (score > 0) — that is the ranking — not the raw hit list length.
+    // NOTE on shape: a request WITH aggregations retains the Tail, which appends score-0 union docs BELOW the
+    // window. So we compare the SCORED PREFIX (score > 0) — that is the ranking — not the raw hit list length.
     // ---------------------------------------------------------------------------------------------
     @SneakyThrows
-    public void testAggregationLeg_doesNotChangeRankingOrScores() {
+    public void testAggregation_doesNotChangeRankingOrScores() {
         ensureDataset();
         String withAgg = "{\"query\":{\"hybrid\":{\"mode\":\"fused\",\"rank_window_size\":"
             + RANK_WINDOW
@@ -362,6 +306,38 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
             }
         }
         return out;
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // THE PIPELINE-FREE FIX: with the knn-leg materialization removed, the Tail carries the REAL knn
+    // query, so the self-erased query alone (NO processor, NO pipeline, nothing enabled) computes the
+    // full per-shard-k union. This is the whole point of fused mode — self-erase into a standard query
+    // and all features work for free. Verifies red_far is recaptured with the aggregations processor
+    // factory explicitly DISABLED.
+    // ---------------------------------------------------------------------------------------------
+    @SneakyThrows
+    public void testFusedHybrid_knnTailNotMaterialized_aggregationsCorrectWithoutProcessor() {
+        ensureDataset();
+        // Explicitly ensure NO system-generated factory is enabled — prove the self-erased query alone is correct.
+        updateClusterSettings("cluster.search.enabled_system_generated_factories", List.of());
+        String fusedBody = "{\"query\":{\"hybrid\":{\"mode\":\"fused\",\"rank_window_size\":"
+            + RANK_WINDOW
+            + ",\"queries\":["
+            + lexicalLeg()
+            + ","
+            + knnLeg()
+            + "]}},"
+            + termsAgg()
+            + ",\"track_total_hits\":true}";
+        Map<String, Object> fused = searchRaw(fusedBody, 10);
+        Map<String, Integer> fb = colorBuckets(fused);
+        long total = totalHits(fused);
+        System.out.println("RESULT[TAIL-REALKNN no-processor]: buckets=" + fb + " total=" + total);
+        // The Tail now runs the real knn query per shard -> red_far (per-shard-k) is in the aggregation.
+        assertEquals("no-processor: blue", Integer.valueOf(3), fb.getOrDefault("blue", 0));
+        assertEquals("no-processor: green (lexical)", Integer.valueOf(1), fb.getOrDefault("green", 0));
+        assertEquals("no-processor: red_far recaptured by real-knn Tail (pipeline-free)", Integer.valueOf(1), fb.getOrDefault("red", 0));
+        assertEquals("no-processor: total is the full per-shard-k union", 5L, total);
     }
 
     // ------------------------------------------------ helpers ------------------------------------------------

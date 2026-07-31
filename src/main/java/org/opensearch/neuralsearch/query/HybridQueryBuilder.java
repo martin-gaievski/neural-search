@@ -20,7 +20,6 @@ import org.apache.lucene.search.BooleanClause.Occur;
 import org.apache.lucene.search.Query;
 import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
-import org.opensearch.neuralsearch.processor.HybridFusedAggregationsResponseProcessor;
 import org.opensearch.neuralsearch.processor.HybridFusedProfileResponseProcessor;
 import org.opensearch.search.pipeline.PipelineProcessingContext;
 import org.opensearch.search.pipeline.PipelinedRequest;
@@ -522,7 +521,6 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                         if (profile) {
                             captureLegProfiles(searchRequest, multiSearchResponse);
                         }
-                        captureAggregationLeg(searchRequest, multiSearchResponse, legs.size());
                         listener.onResponse(null);
                     } catch (Exception e) {
                         listener.onFailure(e);
@@ -550,39 +548,6 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      * whose context is the same instance the response processor later reads (mirrors how the explanation payload is
      * threaded through the context). No-op when the request is not pipelined, has no context, or no leg was profiled.
      */
-    /**
-     * Stash the <b>aggregation leg</b>'s aggregations and total hits into the request-scoped context so the
-     * system-generated {@link HybridFusedAggregationsResponseProcessor} can swap them into the final response. The agg
-     * leg runs the sub-queries in place per shard (see {@code HybridFusionOrchestrator#buildAggregationLegSource}), so
-     * its aggregation match set is the true leg union — this is what removes the KNN multi-shard and {@code min_score}
-     * aggregation undercounts of the Tail-based path. No-op when the request is not pipelined, has no context, or no
-     * aggregation leg ran (no aggregations on the request, or the leg failed) — in which case the Tail-based
-     * aggregations stand.
-     */
-    private static void captureAggregationLeg(SearchRequest searchRequest, MultiSearchResponse multiSearchResponse, int legCount) {
-        if ((searchRequest instanceof PipelinedRequest) == false) {
-            return;
-        }
-        PipelineProcessingContext requestContext = ((PipelinedRequest) searchRequest).getPipelineProcessingContext();
-        if (requestContext == null) {
-            return;
-        }
-        MultiSearchResponse.Item aggItem = HybridFusionOrchestrator.aggregationLegResponse(multiSearchResponse, legCount);
-        if (aggItem == null) {
-            return;
-        }
-        org.opensearch.action.search.SearchResponse aggResponse = aggItem.getResponse();
-        if (aggResponse.getAggregations() instanceof org.opensearch.search.aggregations.InternalAggregations) {
-            requestContext.setAttribute(HybridFusedAggregationsResponseProcessor.AGG_LEG_AGGS_CONTEXT_KEY, aggResponse.getAggregations());
-        }
-        if (aggResponse.getHits() != null && aggResponse.getHits().getTotalHits() != null) {
-            requestContext.setAttribute(
-                HybridFusedAggregationsResponseProcessor.AGG_LEG_TOTAL_HITS_CONTEXT_KEY,
-                aggResponse.getHits().getTotalHits()
-            );
-        }
-    }
-
     private static void captureLegProfiles(SearchRequest searchRequest, MultiSearchResponse multiSearchResponse) {
         if ((searchRequest instanceof PipelinedRequest) == false) {
             return;

@@ -17,7 +17,6 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.action.search.MultiSearchRequest;
 import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
-import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.InnerHitContextBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
@@ -74,76 +73,7 @@ final class HybridFusionOrchestrator {
                     .pipeline(SearchPipelineService.NOOP_PIPELINE_ID)
             );
         }
-        // Optional trailing AGGREGATION LEG (see buildAggregationLegSource). Appended last so leg indexes 0..N-1 keep
-        // mapping 1:1 to the sub-queries for fusion; the agg leg is read separately by aggregationLegResponse().
-        SearchSourceBuilder aggLegSource = buildAggregationLegSource(request, legs);
-        if (aggLegSource != null) {
-            multiSearchRequest.add(
-                new SearchRequest(request.indices()).indicesOptions(request.indicesOptions())
-                    .source(aggLegSource)
-                    .pipeline(SearchPipelineService.NOOP_PIPELINE_ID)
-            );
-        }
         return multiSearchRequest;
-    }
-
-    /**
-     * Build the <b>aggregation leg</b>: a {@code size:0}, non-scoring search whose query is the leg union expressed as
-     * ONE filter clause — {@code bool{filter: bool{should:[legs...]}}} — carrying the outer request's aggregations.
-     *
-     * <p><b>Why this exists (correctness).</b> The Tail reconstructs a dense {@code knn}/{@code neural} leg from the ids
-     * that leg RETURNED, i.e. the coordinator's global top-{@code rank_window_size}. Classic hybrid instead runs the
-     * sub-query in place on every shard, so its aggregations see the <b>per-shard-{@code k}</b> union. On a multi-shard
-     * index those differ, and fused silently undercounts aggregations/{@code total_hits} for KNN-matched documents. The
-     * aggregation leg removes that gap by executing the legs <b>in place per shard</b> exactly like classic — no global
-     * reduction, no id materialization — so the aggregation match set is the true leg union. It also sidesteps the
-     * {@code min_score} undercount, since this leg carries no {@code min_score} and has no score-0 Tail docs to drop.
-     *
-     * <p><b>Shape matters.</b> The union must be a single {@code filter} clause wrapping a {@code should} disjunction.
-     * Separate filter clauses ({@code bool{filter:[legA, legB]}}) would be a CONJUNCTION — far too narrow.
-     *
-     * <p><b>Why it is cheap.</b> Everything rides the existing round-1 MultiSearch fan-out, so it costs no extra round
-     * trip and runs in parallel with the scoring legs. Inside the leg, {@code Occur.FILTER} skips scoring entirely and
-     * {@code size:0} skips the top-docs heap and the fetch phase.
-     *
-     * @return the agg-leg source, or {@code null} when the request has no aggregations (nothing to compute).
-     */
-    static SearchSourceBuilder buildAggregationLegSource(SearchRequest request, List<QueryBuilder> legs) {
-        SearchSourceBuilder source = request.source();
-        if (source == null || source.aggregations() == null || source.aggregations().getAggregatorFactories().isEmpty()) {
-            return null;
-        }
-        org.opensearch.index.query.BoolQueryBuilder union = new org.opensearch.index.query.BoolQueryBuilder();
-        for (QueryBuilder leg : legs) {
-            union.should(leg);
-        }
-        org.opensearch.index.query.BoolQueryBuilder filtered = new org.opensearch.index.query.BoolQueryBuilder().filter(union);
-        SearchSourceBuilder aggLegSource = new SearchSourceBuilder().query(filtered)
-            .size(0)
-            .from(0)
-            .fetchSource(false)
-            // Totals come from this leg too: it is the only place the true leg union is materialized per shard.
-            .trackTotalHits(true);
-        source.aggregations().getAggregatorFactories().forEach(aggLegSource::aggregation);
-        source.aggregations().getPipelineAggregatorFactories().forEach(aggLegSource::aggregation);
-        return aggLegSource;
-    }
-
-    /**
-     * The trailing aggregation-leg item from the leg MultiSearch response, or {@code null} when no agg leg was added
-     * (no aggregations on the request) or it failed. Leg items 0..{@code legCount-1} are the sub-query legs.
-     */
-    static MultiSearchResponse.Item aggregationLegResponse(MultiSearchResponse multiSearchResponse, int legCount) {
-        MultiSearchResponse.Item[] items = multiSearchResponse.getResponses();
-        if (items.length <= legCount) {
-            return null;
-        }
-        MultiSearchResponse.Item aggItem = items[legCount];
-        if (aggItem.isFailure() || aggItem.getResponse() == null) {
-            log.warn("[hybrid] fused-mode aggregation leg failed; falling back to Tail-based aggregations");
-            return null;
-        }
-        return aggItem;
     }
 
     /**
@@ -222,27 +152,17 @@ final class HybridFusionOrchestrator {
         List<QueryBuilder> surviving = new ArrayList<>(legs.size());
         for (int legIndex = 0; legIndex < legs.size(); legIndex++) {
             if (legIndex >= legHits.length || legHits[legIndex] != null) {
-                QueryBuilder leg = legs.get(legIndex);
-                // A kNN/neural leg's match set IS its returned top-k — re-running it in the Tail would walk the HNSW
-                // graph again purely to count. Materialize such legs as their already-retrieved ids instead.
-                if (isMaterializableLeg(leg) && legIndex < legHits.length && legHits[legIndex] != null) {
-                    IdsQueryBuilder ids = new IdsQueryBuilder();
-                    for (SearchHit hit : legHits[legIndex]) {
-                        ids.addIds(hit.getId());
-                    }
-                    surviving.add(ids);
-                } else {
-                    surviving.add(leg);
-                }
+                // Every surviving leg goes into the Tail as its REAL query. This is what makes the Tail the true
+                // per-shard match set: each shard evaluates the leg (including a knn/neural ANN leg) in place, so
+                // aggregations and total_hits over the Tail cover the full leg union — matching classic hybrid and
+                // fixing the multi-shard KNN undercount. (Earlier this materialized a knn/neural leg to an IdsQuery of
+                // its coordinator-reduced global top-k to avoid a second HNSW walk; that reduction is exactly what
+                // dropped per-shard-k docs from the aggregation, so it is not a valid shortcut. The re-walk cost is the
+                // honest price of a correct aggregation — no pipeline or extra processor is involved.)
+                surviving.add(legs.get(legIndex));
             }
         }
         return surviving;
-    }
-
-    /** Legs whose Lucene match set is their own top-k (re-running them in the Tail = a redundant ANN pass). */
-    private static boolean isMaterializableLeg(QueryBuilder leg) {
-        String name = leg.getWriteableName();
-        return "knn".equals(name) || "neural".equals(name) || "neural_knn".equals(name);
     }
 
     /**
@@ -251,17 +171,9 @@ final class HybridFusionOrchestrator {
      * do we throw (nothing to fuse).
      */
     private static SearchHit[][] groupLegHits(MultiSearchResponse.Item[] items, int legCount) {
-        // items = one per sub-query leg, plus an OPTIONAL trailing aggregation leg (see buildAggregationLegSource), so
-        // the response may carry legCount or legCount+1 items. Anything else is a real mismatch.
-        if (items.length != legCount && items.length != legCount + 1) {
+        if (items.length != legCount) {
             throw new IllegalStateException(
-                String.format(
-                    Locale.ROOT,
-                    "[hybrid] expected %d (or %d) leg sub-search responses but got %d",
-                    legCount,
-                    legCount + 1,
-                    items.length
-                )
+                String.format(Locale.ROOT, "[hybrid] expected %d leg sub-search responses but got %d", legCount, items.length)
             );
         }
         SearchHit[][] legHits = new SearchHit[legCount][];
@@ -277,9 +189,7 @@ final class HybridFusionOrchestrator {
             }
         }
         if (survivingLegs == 0) {
-            // Only the sub-query legs matter here; a failed aggregation leg degrades to Tail-based aggs, it is not fatal.
-            MultiSearchResponse.Item[] subQueryItems = java.util.Arrays.copyOf(items, legCount);
-            MultiSearchResponse.Item firstFailure = firstFailure(subQueryItems);
+            MultiSearchResponse.Item firstFailure = firstFailure(items);
             throw new IllegalStateException(
                 "[hybrid] all fused-mode sub-queries failed" + (firstFailure == null ? "" : ": " + firstFailure.getFailureMessage()),
                 firstFailure == null ? null : firstFailure.getFailure()
