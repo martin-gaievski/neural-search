@@ -124,6 +124,34 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
         return "\"aggregations\":{\"by_color\":{\"terms\":{\"field\":\"" + COLOR + "\",\"size\":10}}}";
     }
 
+    /** A cardinality aggregation over color — a metric agg (not bucketed) to prove the fix is agg-type-agnostic. */
+    private String cardinalityAgg() {
+        return "\"aggregations\":{\"colors\":{\"cardinality\":{\"field\":\"" + COLOR + "\"}}}";
+    }
+
+    /** The fused hybrid (match + knn) as a bare query fragment, for nesting inside compound queries. */
+    private String fusedHybridQuery() {
+        return "{\"hybrid\":{\"mode\":\"fused\",\"rank_window_size\":"
+            + RANK_WINDOW
+            + ",\"fusion\":{\"normalization\":{\"technique\":\"min_max\"},"
+            + "\"combination\":{\"technique\":\"arithmetic_mean\"}},"
+            + "\"queries\":["
+            + lexicalLeg()
+            + ","
+            + knnLeg()
+            + "]}}";
+    }
+
+    @SuppressWarnings("unchecked")
+    private int cardinalityValue(Map<String, Object> resp) {
+        Map<String, Object> aggs = (Map<String, Object>) resp.get("aggregations");
+        if (aggs == null) {
+            return -1;
+        }
+        Map<String, Object> c = (Map<String, Object>) aggs.get("colors");
+        return c == null ? -1 : ((Number) c.get("value")).intValue();
+    }
+
     // Baseline: what the KNN leg alone returns. NOTE: knn `k` is PER-SHARD. With 2 shards holding ~2-3 docs
     // each, red_far is top-3 ON ITS OWN SHARD, so it surfaces even though it is the 4th-nearest GLOBALLY.
     // This is the crux: the KNN leg's match set is the per-shard-k union (blue1..3 + red_far = 4), not the
@@ -338,6 +366,81 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
         assertEquals("no-processor: green (lexical)", Integer.valueOf(1), fb.getOrDefault("green", 0));
         assertEquals("no-processor: red_far recaptured by real-knn Tail (pipeline-free)", Integer.valueOf(1), fb.getOrDefault("red", 0));
         assertEquals("no-processor: total is the full per-shard-k union", 5L, total);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // POSITION-INDEPENDENCE: the KNN aggregation fix must hold when the fused hybrid is NESTED inside
+    // another compound query, not only at top level — because the Tail (which carries the real knn
+    // query) is part of the self-erased query regardless of nesting depth. Each case asserts the full
+    // per-shard-k union (blue=3, green=1, red=1, total=5), pipeline-free. Guards against a regression
+    // that only fixes the top-level path.
+    // ---------------------------------------------------------------------------------------------
+    @SneakyThrows
+    public void testFusedHybrid_knnAggregation_correctAtAnyPosition() {
+        ensureDataset();
+        updateClusterSettings("cluster.search.enabled_system_generated_factories", List.of());
+        // label -> query wrapping the fused hybrid at a different position
+        Map<String, String> positions = new java.util.LinkedHashMap<>();
+        positions.put("top-level", fusedHybridQuery());
+        positions.put("bool.must", "{\"bool\":{\"must\":[" + fusedHybridQuery() + "]}}");
+        positions.put("dis_max", "{\"dis_max\":{\"queries\":[" + fusedHybridQuery() + "]}}");
+        positions.put("function_score", "{\"function_score\":{\"query\":" + fusedHybridQuery() + "}}");
+
+        for (Map.Entry<String, String> e : positions.entrySet()) {
+            String body = "{\"query\":" + e.getValue() + "," + termsAgg() + ",\"track_total_hits\":true}";
+            Map<String, Object> resp = searchRaw(body, 10);
+            Map<String, Integer> b = colorBuckets(resp);
+            System.out.println("RESULT[position=" + e.getKey() + "]: buckets=" + b + " total=" + totalHits(resp));
+            assertEquals(e.getKey() + ": blue", Integer.valueOf(3), b.getOrDefault("blue", 0));
+            assertEquals(e.getKey() + ": green (lexical)", Integer.valueOf(1), b.getOrDefault("green", 0));
+            assertEquals(e.getKey() + ": red_far (per-shard-k KNN) counted", Integer.valueOf(1), b.getOrDefault("red", 0));
+            assertEquals(e.getKey() + ": total is the full union", 5L, totalHits(resp));
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // NESTED + ENCLOSING FILTER: fuse-then-filter semantics apply to aggregations too. A nested fused
+    // hybrid under bool.filter=blue aggregates union ∩ filter — the 3 blue docs (red_far is red,
+    // green_lexical is green, both excluded by the filter). This is correct: the enclosing filter
+    // narrows what is aggregated, exactly as a user expects from bool.filter.
+    // ---------------------------------------------------------------------------------------------
+    @SneakyThrows
+    public void testFusedHybrid_nestedWithEnclosingFilter_aggregatesUnionIntersectFilter() {
+        ensureDataset();
+        updateClusterSettings("cluster.search.enabled_system_generated_factories", List.of());
+        String body = "{\"query\":{\"bool\":{\"must\":["
+            + fusedHybridQuery()
+            + "],\"filter\":[{\"term\":{\""
+            + COLOR
+            + "\":\"blue\"}}]}},"
+            + termsAgg()
+            + ",\"track_total_hits\":true}";
+        Map<String, Object> resp = searchRaw(body, 10);
+        Map<String, Integer> b = colorBuckets(resp);
+        System.out.println("RESULT[nested+filter=blue]: buckets=" + b + " total=" + totalHits(resp));
+        // union ∩ blue = the 3 blue docs; red/green filtered out.
+        assertEquals("nested+filter: blue kept", Integer.valueOf(3), b.getOrDefault("blue", 0));
+        assertEquals("nested+filter: red excluded by filter", Integer.valueOf(0), b.getOrDefault("red", 0));
+        assertEquals("nested+filter: green excluded by filter", Integer.valueOf(0), b.getOrDefault("green", 0));
+        assertEquals("nested+filter: total is union ∩ filter", 3L, totalHits(resp));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // AGG-TYPE-AGNOSTIC: the fix corrects WHICH docs are collected, so it holds for any aggregation, not
+    // just terms. A metric agg (cardinality of color over the full union) must see all 3 colors
+    // (blue+green+red), which is only possible if red_far is in the aggregated set.
+    // ---------------------------------------------------------------------------------------------
+    @SneakyThrows
+    public void testFusedHybrid_knnAggregation_cardinalityMetricAgg() {
+        ensureDataset();
+        updateClusterSettings("cluster.search.enabled_system_generated_factories", List.of());
+        String body = "{\"query\":" + fusedHybridQuery() + "," + cardinalityAgg() + ",\"track_total_hits\":true}";
+        Map<String, Object> resp = searchRaw(body, 10);
+        int distinctColors = cardinalityValue(resp);
+        System.out.println("RESULT[cardinality]: distinct_colors=" + distinctColors + " total=" + totalHits(resp));
+        // union spans blue + green + red (red only present if red_far is aggregated) -> 3 distinct colors.
+        assertEquals("cardinality sees all 3 colors (incl. red_far's)", 3, distinctColors);
+        assertEquals("cardinality: total is the full union", 5L, totalHits(resp));
     }
 
     // ------------------------------------------------ helpers ------------------------------------------------
