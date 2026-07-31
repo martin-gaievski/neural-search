@@ -271,7 +271,7 @@ public class HybridQueryBuilderFusedModeTests extends OpenSearchQueryTestCase {
         );
         List<QueryBuilder> legs = List.of(new TermQueryBuilder("field", "value"));
         FusionSpec spec = FusionSpec.fromInlineFusion(Map.of("normalization", Map.of("technique", "min_max")));
-        return HybridFusionOrchestrator.buildFusedQuery(source, multiSearchResponse, legs, spec, 100, true);
+        return HybridFusionOrchestrator.buildFusedQuery(source, multiSearchResponse, legs, spec, 100);
     }
 
     private static boolean hasTail(QueryBuilder fused) {
