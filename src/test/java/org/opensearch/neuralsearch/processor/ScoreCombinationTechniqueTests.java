@@ -209,6 +209,60 @@ public class ScoreCombinationTechniqueTests extends OpenSearchTestCase {
         }
     }
 
+    public void testCombination_whenSortEnabledAndShardHasNoResults_thenNoException() {
+        // Reproduces https://github.com/opensearch-project/neural-search/issues/1934:
+        // with sort enabled (as search_after requires), a shard that contributed no results past the cursor
+        // arrives at the coordinator with an empty top docs list but a non-zero total hits count (see
+        // CompoundTopDocs constructor, which preserves totalHits while initializing an empty list when
+        // scoreDocs.length < 2). Before the fix, getDocIdSortFieldsMap probed topFieldDocs.getFirst()
+        // unconditionally and threw a bare NoSuchElementException on that empty list.
+        ScoreCombiner scoreCombiner = new ScoreCombiner();
+
+        Object[] sortFields1 = new Object[] { new BytesRef("value1") };
+        Object[] sortFields2 = new Object[] { new BytesRef("value2") };
+        SortField[] sortFields = new SortField[] { new SortField("_id", SortField.Type.STRING, true) };
+        Sort sort = new Sort(sortFields);
+
+        // First shard has results, second shard is exhausted: empty top docs list but total hits > 0.
+        CompoundTopDocs shardWithResults = new CompoundTopDocs(
+            new TotalHits(2, TotalHits.Relation.EQUAL_TO),
+            List.of(
+                new TopFieldDocs(
+                    new TotalHits(2, TotalHits.Relation.EQUAL_TO),
+                    new FieldDoc[] { new FieldDoc(1, 0.5f, sortFields1), new FieldDoc(2, 0.3f, sortFields2) },
+                    sortFields
+                )
+            ),
+            true,
+            SEARCH_SHARD
+        );
+        CompoundTopDocs exhaustedShard = new CompoundTopDocs(
+            new TotalHits(3, TotalHits.Relation.EQUAL_TO),
+            Collections.emptyList(),
+            true,
+            SEARCH_SHARD
+        );
+        final List<CompoundTopDocs> queryTopDocs = List.of(shardWithResults, exhaustedShard);
+
+        // Must not throw NoSuchElementException.
+        scoreCombiner.combineScores(
+            CombineScoresDto.builder()
+                .queryTopDocs(queryTopDocs)
+                .scoreCombinationTechnique(ScoreCombinationFactory.DEFAULT_METHOD)
+                .querySearchResults(Collections.emptyList())
+                .sort(sort)
+                .isSingleShard(false)
+                .build()
+        );
+
+        // The shard with results is combined as usual.
+        assertEquals(2, queryTopDocs.get(0).getScoreDocs().size());
+        // The exhausted shard yields no score docs but keeps its total hit count (search_after semantics:
+        // total_hits is pagination-independent, so a shard past its cursor still reports its full match count).
+        assertTrue(queryTopDocs.get(1).getScoreDocs().isEmpty());
+        assertEquals(3, queryTopDocs.get(1).getTotalHits().value());
+    }
+
     public void testCombination_whenMultipleSubqueriesResultsWithMinScore_thenScoresCombined() {
         ScoreCombiner scoreCombiner = new ScoreCombiner();
 

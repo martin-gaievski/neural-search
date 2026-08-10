@@ -234,6 +234,12 @@ public class ScoreCombiner {
         // we're merging docs with normalized and combined scores. we need to have only maxHits results
         Map<Integer, Object[]> docIdSortFieldMap = new HashMap<>();
         final List<TopDocs> topFieldDocs = compoundTopDocs.getTopDocs();
+        // A shard that returned no results (e.g. one exhausted past a search_after cursor while other shards
+        // still have hits) arrives here with an empty top docs list but a non-zero total hits count. There are
+        // no sort fields to collect, so return the empty map and avoid getFirst() on an empty list. See issue #1934.
+        if (topFieldDocs.isEmpty()) {
+            return docIdSortFieldMap;
+        }
         final boolean isSortByScore = isSortOrderByScore(sort);
         final boolean isCollapseEnabled = topFieldDocs.getFirst() instanceof CollapseTopFieldDocs;
         for (TopDocs topDocs : topFieldDocs) {
