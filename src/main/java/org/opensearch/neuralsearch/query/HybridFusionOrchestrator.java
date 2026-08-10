@@ -179,6 +179,32 @@ final class HybridFusionOrchestrator {
         return toRankedDocs(combined, windowSize);
     }
 
+    /**
+     * Fail fast on a malformed {@code weights} array BEFORE the leg fan-out fires — otherwise a bad weights array (out
+     * of range, not summing to 1.0, or the wrong count) wastes a full N-leg MultiSearch before {@link ScoreCombinationUtil}
+     * errors in the async callback. Constructing the combination technique here reuses core's existing
+     * {@code validateParams}/{@code validateWeights} range-and-sum checks with no duplication; the count-vs-legs check
+     * (only enforced later, in {@code combine()}) is added explicitly so a mismatch also fails before the fan-out.
+     *
+     * @param fusion resolved fusion config (inline or pipeline)
+     * @param legCount number of sub-query legs (weights, when supplied, must match this)
+     */
+    static void validateFusionParams(final FusionSpec fusion, final int legCount) {
+        // Triggers ScoreCombinationUtil.validateParams + getWeights -> validateWeights (range 0.0..1.0 and sum == 1.0).
+        SCORE_COMBINATION_FACTORY.createCombination(fusion.combinationTechnique(), weightsParams(fusion.weights()));
+        float[] weights = fusion.weights();
+        if (weights.length != 0 && weights.length != legCount) {
+            throw new IllegalArgumentException(
+                String.format(
+                    Locale.ROOT,
+                    "number of weights [%d] must match number of sub-queries [%d] in hybrid query",
+                    weights.length,
+                    legCount
+                )
+            );
+        }
+    }
+
     private static Map<String, Object> weightsParams(float[] weights) {
         if (Objects.isNull(weights) || weights.length == 0) {
             return Map.of();
@@ -208,13 +234,14 @@ final class HybridFusionOrchestrator {
     /** The sub-query legs restricted to those that survived (non-null hits slot); used for the Tail so a failed leg is
      *  not re-executed in the self-erased query (graceful degradation). */
     private static List<QueryBuilder> survivingLegQueries(List<QueryBuilder> legs, SearchHit[][] legHits) {
+        // groupLegHits guarantees legHits.length == legs.size(), so a surviving leg is exactly a non-null hits slot.
         List<QueryBuilder> surviving = new ArrayList<>(legs.size());
         for (int legIndex = 0; legIndex < legs.size(); legIndex++) {
-            if (legIndex >= legHits.length || Objects.nonNull(legHits[legIndex])) {
+            if (Objects.nonNull(legHits[legIndex])) {
                 QueryBuilder leg = legs.get(legIndex);
                 // A kNN/neural leg's match set IS its returned top-k — re-running it in the Tail would walk the HNSW
                 // graph again purely to count. Materialize such legs as their already-retrieved ids instead.
-                if (isMaterializableLeg(leg) && legIndex < legHits.length && Objects.nonNull(legHits[legIndex])) {
+                if (isMaterializableLeg(leg)) {
                     IdsQueryBuilder ids = new IdsQueryBuilder();
                     for (SearchHit hit : legHits[legIndex]) {
                         ids.addIds(hit.getId());

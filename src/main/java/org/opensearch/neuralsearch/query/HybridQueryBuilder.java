@@ -470,7 +470,13 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         requireSupportedTechniques(fusionSpec);
 
         // Whether this query is the whole request (=> conditional Tail for accurate totals/aggs) or nested inside a
-        // container (=> Top-only, so an enclosing filter intersects at the query phase).
+        // container (=> Top-only, so an enclosing filter intersects at the query phase). The `== this` is an INTENTIONAL
+        // reference-identity check: it holds only because the coordinator rewrite runs on the exact instance still parked
+        // at source().query(). If a request-rewrite layer ever clones the query before this point, a genuinely top-level
+        // query would compare != and be misclassified as nested -> forced Top-only -> the Tail is silently dropped, so
+        // scores and top hits stay correct but total_hits and aggregations would be computed over just the fused window.
+        // TODO: once nested fusion is wired and validated end-to-end, thread the top-level/nesting signal down explicitly
+        // (e.g. via the coordinator context) so it survives cloning instead of relying on this invariant.
         boolean topLevel = Objects.nonNull(searchRequest.source()) && searchRequest.source().query() == this;
         int window = effectiveWindowSize();
         // Each leg fires size=window per shard, so an unbounded window is a per-shard memory/CPU amplifier. Cap it at
@@ -478,6 +484,9 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         // pagination_depth ceiling.
         validateWindowSizeAgainstMaxResultWindow(searchRequest, window);
         List<QueryBuilder> legs = queries;
+        // Validate weights (range, sum, count) before the leg fan-out — a bad weights array otherwise burns a full
+        // MultiSearch before the combiner is built in the async callback.
+        HybridFusionOrchestrator.validateFusionParams(fusionSpec, legs.size());
 
         SetOnce<QueryBuilder> fused = new SetOnce<>();
         queryRewriteContext.registerAsyncAction(

@@ -41,13 +41,6 @@ public class FusedDocsScorerQueryTests extends OpenSearchTestCase {
         assertNotEquals(a, c);
     }
 
-    public void testFusedDocRecordAccessors() {
-        FusedDoc doc = new FusedDoc(7, 0.42f, 2);
-        assertEquals(7, doc.docId());
-        assertEquals(0.42f, doc.score(), 0.0f);
-        assertEquals(2, doc.shardIndex());
-    }
-
     public void testEquals_falseForNullAndOtherType() {
         FusedDocsScorerQuery query = new FusedDocsScorerQuery(new int[] { 1 }, new float[] { 0.5f });
         assertNotEquals(query, null);

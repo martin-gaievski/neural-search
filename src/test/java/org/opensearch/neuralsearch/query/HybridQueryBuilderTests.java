@@ -901,6 +901,83 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         assertEquals(1, asyncRegistered.get());
     }
 
+    @SneakyThrows
+    public void testDoRewriteFused_whenWeightsSumNotOne_thenFailsFastBeforeFanOut() {
+        // A weights array that doesn't sum to 1.0 must be rejected at rewrite, BEFORE the leg MultiSearch fan-out is
+        // registered — otherwise a bad weights array burns a full fan-out before ScoreCombinationUtil errors.
+        initClusterUtilWithMaxResultWindow(10000);
+        HybridQueryBuilder builder = fusedBuilder(
+            new HashMap<>(
+                Map.of(
+                    "normalization",
+                    Map.of("technique", "min_max"),
+                    "combination",
+                    Map.of("technique", "arithmetic_mean", "parameters", Map.of("weights", List.of(0.3, 0.3)))
+                )
+            )
+        );
+        QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+        java.util.concurrent.atomic.AtomicInteger asyncRegistered = new java.util.concurrent.atomic.AtomicInteger();
+        doAnswer(invocation -> {
+            asyncRegistered.incrementAndGet();
+            return null;
+        }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.doRewrite(ctx));
+        assertThat(e.getMessage(), containsString("sum of weights"));
+        assertEquals("no leg fan-out should be registered when weights are invalid", 0, asyncRegistered.get());
+    }
+
+    @SneakyThrows
+    public void testDoRewriteFused_whenWeightOutOfRange_thenFailsFastBeforeFanOut() {
+        // A weight outside [0.0 ... 1.0] is rejected at rewrite before the fan-out.
+        initClusterUtilWithMaxResultWindow(10000);
+        HybridQueryBuilder builder = fusedBuilder(
+            new HashMap<>(
+                Map.of(
+                    "normalization",
+                    Map.of("technique", "min_max"),
+                    "combination",
+                    Map.of("technique", "arithmetic_mean", "parameters", Map.of("weights", List.of(-0.2, 1.2)))
+                )
+            )
+        );
+        QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+        java.util.concurrent.atomic.AtomicInteger asyncRegistered = new java.util.concurrent.atomic.AtomicInteger();
+        doAnswer(invocation -> {
+            asyncRegistered.incrementAndGet();
+            return null;
+        }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.doRewrite(ctx));
+        assertThat(e.getMessage(), containsString("all weights must be in range"));
+        assertEquals(0, asyncRegistered.get());
+    }
+
+    @SneakyThrows
+    public void testDoRewriteFused_whenWeightCountMismatchesLegs_thenFailsFastBeforeFanOut() {
+        // fusedBuilder has 2 legs; a 3-weight array must fail before the fan-out (count check no longer deferred to
+        // combine(), which only runs in the async callback).
+        initClusterUtilWithMaxResultWindow(10000);
+        HybridQueryBuilder builder = fusedBuilder(
+            new HashMap<>(
+                Map.of(
+                    "normalization",
+                    Map.of("technique", "min_max"),
+                    "combination",
+                    Map.of("technique", "arithmetic_mean", "parameters", Map.of("weights", List.of(0.2, 0.3, 0.5)))
+                )
+            )
+        );
+        QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+        java.util.concurrent.atomic.AtomicInteger asyncRegistered = new java.util.concurrent.atomic.AtomicInteger();
+        doAnswer(invocation -> {
+            asyncRegistered.incrementAndGet();
+            return null;
+        }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.doRewrite(ctx));
+        assertThat(e.getMessage(), containsString("number of weights"));
+        assertEquals(0, asyncRegistered.get());
+    }
+
     /**
      * Tests basic query:
      * {
