@@ -13,7 +13,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 
-import lombok.extern.log4j.Log4j2;
 import org.opensearch.action.search.MultiSearchRequest;
 import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
@@ -43,7 +42,6 @@ import lombok.NoArgsConstructor;
  * normalization + {@code arithmetic_mean} combination (the caller rejects other techniques at rewrite for now).
  */
 @NoArgsConstructor(access = AccessLevel.PRIVATE)
-@Log4j2
 final class HybridFusionOrchestrator {
 
     private static final ScoreCombinationFactory SCORE_COMBINATION_FACTORY = new ScoreCombinationFactory();
@@ -57,6 +55,11 @@ final class HybridFusionOrchestrator {
      * request/response processors once per leg (redundant, and incorrect for processors like {@code rerank} that expect
      * request context absent from an id-only leg). The outer fused request still carries the pipeline, so top-level
      * processors run exactly once.
+     *
+     * <p>Legs disable partial results ({@code allowPartialSearchResults(false)}): fused relevance is computed across a
+     * leg's full window, so a leg silently truncated by a down shard would be as corrupting as a fully failed leg.
+     * Failing the leg instead lets {@link #groupLegHits} fail the whole request fast, rather than fusing over incomplete
+     * data — this is the leg-level half of the fail-fast contract.
      */
     static MultiSearchRequest buildLegMultiSearch(SearchRequest request, List<QueryBuilder> legs, int windowSize) {
         MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
@@ -70,6 +73,7 @@ final class HybridFusionOrchestrator {
                 new SearchRequest(request.indices()).indicesOptions(request.indicesOptions())
                     .source(legSource)
                     .pipeline(SearchPipelineService.NOOP_PIPELINE_ID)
+                    .allowPartialSearchResults(false)
             );
         }
         return multiSearchRequest;
@@ -109,13 +113,15 @@ final class HybridFusionOrchestrator {
         } else {
             topOnly = true; // track_total_hits:false -> plain top-K, no Tail
         }
-        List<QueryBuilder> tail = topOnly ? List.of() : survivingLegQueries(legs, legHits);
+        List<QueryBuilder> tail = topOnly ? List.of() : legQueriesForTail(legs, legHits);
         return new HybridFusionQuery(ranked.ids(), ranked.scores(), tail);
     }
 
     /**
-     * Reduce the raw MultiSearch items into a per-leg array of hits (one item per leg). Graceful per-leg failure: a
-     * failed sub-search sets its slot to null and is skipped by fusion; only when ALL legs failed do we throw.
+     * Reduce the raw MultiSearch items into a per-leg array of hits (one item per leg). Fail fast on ANY leg failure:
+     * fused relevance is computed across all legs (min_max normalization + combination), so a dropped leg would silently
+     * change the ranking function — a partial fused result is semantically different, not just smaller. So a single
+     * failed sub-search fails the whole request rather than degrading to the surviving legs.
      */
     private static SearchHit[][] groupLegHits(MultiSearchResponse.Item[] items, int legCount) {
         if (items.length != legCount) {
@@ -124,50 +130,31 @@ final class HybridFusionOrchestrator {
             );
         }
         SearchHit[][] legHits = new SearchHit[legCount][];
-        int survivingLegs = 0;
         for (int leg = 0; leg < legCount; leg++) {
             MultiSearchResponse.Item item = items[leg];
             if (item.isFailure()) {
-                log.warn("[hybrid] fused-mode sub-query {} dropped: {}", leg, item.getFailureMessage());
-                legHits[leg] = null;
-            } else {
-                legHits[leg] = item.getResponse().getHits().getHits();
-                survivingLegs++;
+                throw new IllegalStateException(
+                    String.format(Locale.ROOT, "[hybrid] fused-mode sub-query %d failed: %s", leg, item.getFailureMessage()),
+                    item.getFailure()
+                );
             }
-        }
-        if (survivingLegs == 0) {
-            MultiSearchResponse.Item firstFailure = firstFailure(items);
-            throw new IllegalStateException(
-                "[hybrid] all fused-mode sub-queries failed"
-                    + (Objects.isNull(firstFailure) ? "" : ": " + firstFailure.getFailureMessage()),
-                Objects.isNull(firstFailure) ? null : firstFailure.getFailure()
-            );
+            legHits[leg] = item.getResponse().getHits().getHits();
         }
         return legHits;
-    }
-
-    private static MultiSearchResponse.Item firstFailure(MultiSearchResponse.Item[] items) {
-        for (MultiSearchResponse.Item item : items) {
-            if (item.isFailure()) {
-                return item;
-            }
-        }
-        return null;
     }
 
     /**
      * Fuse via the shared {@link CoordinatorScoreFusion} core (min_max + arithmetic_mean), then rank by fused score and
      * cut to the window. Converts the coordinator's {@code SearchHit[][]} view into the {@code _id}-keyed per-leg maps
-     * the shared core consumes; a dropped (null) leg contributes an empty map.
+     * the shared core consumes; a leg that matched nothing contributes an empty map (groupLegHits fails fast on failures,
+     * so every slot is non-null).
      */
     private static RankedDocs computeRankedDocs(SearchHit[][] legHits, FusionSpec fusion, int windowSize) {
         List<Map<String, Float>> legRawScores = new ArrayList<>(legHits.length);
         for (SearchHit[] hits : legHits) {
             Map<String, Float> byId = new LinkedHashMap<>();
-            if (Objects.nonNull(hits)) {
-                for (SearchHit hit : hits) {
-                    byId.put(hit.getId(), hit.getScore());
-                }
+            for (SearchHit hit : hits) {
+                byId.put(hit.getId(), hit.getScore());
             }
             legRawScores.add(byId);
         }
@@ -231,28 +218,25 @@ final class HybridFusionOrchestrator {
         return new RankedDocs(ids, scores);
     }
 
-    /** The sub-query legs restricted to those that survived (non-null hits slot); used for the Tail so a failed leg is
-     *  not re-executed in the self-erased query (graceful degradation). */
-    private static List<QueryBuilder> survivingLegQueries(List<QueryBuilder> legs, SearchHit[][] legHits) {
-        // groupLegHits guarantees legHits.length == legs.size(), so a surviving leg is exactly a non-null hits slot.
-        List<QueryBuilder> surviving = new ArrayList<>(legs.size());
+    /** The sub-query legs in their Tail form. groupLegHits fails fast on any leg failure, so every leg is present here
+     *  (legHits.length == legs.size(), no null slots). A kNN/neural leg's match set IS its returned top-k, so it is
+     *  materialized as an {@link IdsQueryBuilder} of its already-retrieved ids rather than re-walking the HNSW graph in
+     *  the Tail purely to count; other legs are used as-is. */
+    private static List<QueryBuilder> legQueriesForTail(List<QueryBuilder> legs, SearchHit[][] legHits) {
+        List<QueryBuilder> tail = new ArrayList<>(legs.size());
         for (int legIndex = 0; legIndex < legs.size(); legIndex++) {
-            if (Objects.nonNull(legHits[legIndex])) {
-                QueryBuilder leg = legs.get(legIndex);
-                // A kNN/neural leg's match set IS its returned top-k — re-running it in the Tail would walk the HNSW
-                // graph again purely to count. Materialize such legs as their already-retrieved ids instead.
-                if (isMaterializableLeg(leg)) {
-                    IdsQueryBuilder ids = new IdsQueryBuilder();
-                    for (SearchHit hit : legHits[legIndex]) {
-                        ids.addIds(hit.getId());
-                    }
-                    surviving.add(ids);
-                } else {
-                    surviving.add(leg);
+            QueryBuilder leg = legs.get(legIndex);
+            if (isMaterializableLeg(leg)) {
+                IdsQueryBuilder ids = new IdsQueryBuilder();
+                for (SearchHit hit : legHits[legIndex]) {
+                    ids.addIds(hit.getId());
                 }
+                tail.add(ids);
+            } else {
+                tail.add(leg);
             }
         }
-        return surviving;
+        return tail;
     }
 
     /** Legs whose Lucene match set is their own top-k (re-running them in the Tail = a redundant ANN pass). */
