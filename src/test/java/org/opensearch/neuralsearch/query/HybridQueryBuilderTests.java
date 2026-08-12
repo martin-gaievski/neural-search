@@ -800,7 +800,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
     public void testDoRewriteFused_endToEnd_asyncActionProducesFusedQuery() {
         // Drives the full round-1 → round-2 lifecycle: capture the registered async action, run it with a mock client
         // that returns a fake per-leg MultiSearchResponse, and confirm the marker's supplier then yields the fused
-        // HybridFusionQuery (exercises the registerAsyncAction lambda body: buildLegMultiSearch + buildFusedQuery).
+        // HybridFusionQueryBuilder (exercises the registerAsyncAction lambda body: buildLegMultiSearch + buildFusedQuery).
         initClusterUtilWithMaxResultWindow(10000);
         HybridQueryBuilder builder = fusedBuilder(
             new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"), "combination", Map.of("technique", "arithmetic_mean")))
@@ -841,7 +841,82 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
 
         // Round 2: rewriting the marker now yields the self-erased fused query.
         QueryBuilder fused = marker.rewrite(ctx);
-        assertTrue("round 2 returns the fused HybridFusionQuery", fused instanceof HybridFusionQuery);
+        assertTrue("round 2 returns the fused HybridFusionQueryBuilder", fused instanceof HybridFusionQueryBuilder);
+    }
+
+    @SneakyThrows
+    public void testDoRewriteFused_whenMultipleIndices_thenFailsFast() {
+        // Fusion keys leg hits by _id, which is unique only within one index, so multi-index fused search is rejected
+        // until keying + the self-erase are index-aware (guards against conflated same-_id docs from different indices).
+        initClusterUtilWithConcreteIndexCount(2);
+        HybridQueryBuilder builder = fusedBuilder(new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"))));
+        QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.doRewrite(ctx));
+        assertThat(e.getMessage(), containsString("does not yet support searching multiple indices"));
+    }
+
+    @SneakyThrows
+    public void testDoRewriteFused_whenMultiSearchTransportFails_thenErrorIsHybridFramed() {
+        // Whole-MultiSearch transport failure (not a per-leg Item failure) is reframed as the user's hybrid/fused query
+        // instead of surfacing a bare multiSearch error.
+        initClusterUtilWithMaxResultWindow(10000);
+        HybridQueryBuilder builder = fusedBuilder(
+            new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"), "combination", Map.of("technique", "arithmetic_mean")))
+        );
+        QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+        java.util.concurrent.atomic.AtomicReference<
+            java.util.function.BiConsumer<org.opensearch.transport.client.Client, org.opensearch.core.action.ActionListener<?>>> captured =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        doAnswer(invocation -> {
+            captured.set(invocation.getArgument(0));
+            return null;
+        }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+        builder.doRewrite(ctx);
+
+        // Mock client whose multiSearch invokes the FAILURE consumer (transport-level failure).
+        org.opensearch.transport.client.Client client = mock(org.opensearch.transport.client.Client.class);
+        doAnswer(invocation -> {
+            org.opensearch.core.action.ActionListener<org.opensearch.action.search.MultiSearchResponse> l = invocation.getArgument(1);
+            l.onFailure(new RuntimeException("msearch rejected"));
+            return null;
+        }).when(client).multiSearch(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+
+        java.util.concurrent.atomic.AtomicReference<Exception> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        captured.get().accept(client, org.opensearch.core.action.ActionListener.wrap(r -> fail("should have failed"), failure::set));
+        assertNotNull(failure.get());
+        assertThat(failure.get().getMessage(), containsString("failed to execute fused-mode sub-queries"));
+        assertThat(failure.get().getMessage(), containsString("msearch rejected"));
+    }
+
+    /** Initialize NeuralSearchClusterUtil so getIndexMetadataList resolves the given number of concrete indices. */
+    private void initClusterUtilWithConcreteIndexCount(int count) {
+        org.opensearch.cluster.metadata.Metadata metadata = mock(org.opensearch.cluster.metadata.Metadata.class);
+        org.opensearch.cluster.ClusterState clusterState = mock(org.opensearch.cluster.ClusterState.class);
+        org.opensearch.cluster.service.ClusterService clusterService = mock(org.opensearch.cluster.service.ClusterService.class);
+        when(clusterService.state()).thenReturn(clusterState);
+        when(clusterState.metadata()).thenReturn(metadata);
+        when(clusterState.getMetadata()).thenReturn(metadata);
+        when(metadata.custom(org.opensearch.search.pipeline.SearchPipelineMetadata.TYPE)).thenReturn(
+            new org.opensearch.search.pipeline.SearchPipelineMetadata(Map.of())
+        );
+        Settings settings = Settings.builder()
+            .put("index.number_of_shards", 1)
+            .put("index.number_of_replicas", 0)
+            .put("index.version.created", org.opensearch.Version.CURRENT.id)
+            .put("index.max_result_window", 10000)
+            .build();
+        org.opensearch.core.index.Index[] indices = new org.opensearch.core.index.Index[count];
+        for (int i = 0; i < count; i++) {
+            org.opensearch.core.index.Index index = new org.opensearch.core.index.Index("idx-" + i, "uuid-" + i);
+            indices[i] = index;
+            when(metadata.index(index)).thenReturn(IndexMetadata.builder("idx-" + i).settings(settings).build());
+        }
+        org.opensearch.cluster.metadata.IndexNameExpressionResolver resolver = mock(
+            org.opensearch.cluster.metadata.IndexNameExpressionResolver.class
+        );
+        when(resolver.concreteIndices(any(org.opensearch.cluster.ClusterState.class), any(org.opensearch.action.IndicesRequest.class)))
+            .thenReturn(indices);
+        org.opensearch.neuralsearch.util.NeuralSearchClusterUtil.instance().initialize(clusterService, resolver);
     }
 
     /** Initialize NeuralSearchClusterUtil so getIndexMetadataList returns one index with the given max_result_window. */

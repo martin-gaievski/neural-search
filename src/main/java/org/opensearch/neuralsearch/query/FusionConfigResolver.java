@@ -46,7 +46,8 @@ final class FusionConfigResolver {
     /**
      * Resolve the {@link FusionSpec} for a fused-mode request, or {@code null} when no pipeline / no fusion processor is
      * resolvable. Throws {@link IllegalArgumentException} when inline and named pipelines are both specified (mirrors
-     * core).
+     * core), or when an inline {@code search_pipeline} body was attached but is not readable at query rewrite (core
+     * drains it first — see Step 2), which yields a targeted error rather than a misleading generic one.
      */
     static FusionSpec resolve(SearchRequest searchRequest) {
         Map<String, Object> inlineConfig = Objects.isNull(searchRequest.source()) ? null : searchRequest.source().searchPipelineSource();
@@ -63,10 +64,19 @@ final class FusionConfigResolver {
         // CAVEAT (verified): core's resolvePipeline runs BEFORE query rewrite and builds the ad-hoc pipeline via
         // PipelineWithMetrics.create, whose ConfigurationUtils.readOptionalList(config, "phase_results_processors")
         // REMOVES the key from this same live map. So by the time this runs, searchPipelineSource() is typically
-        // drained to {} and fromPipelineConfig returns null. Kept for completeness / body forms that survive, but the
-        // inline-body path needs the same core fix as the URL param to be reliable.
+        // drained to {} and fromPipelineConfig returns null. Body forms that survive the drain are still honored; when
+        // nothing is readable we throw a TARGETED error (rather than falling through to the generic "no processor"
+        // message) so the user isn't misled into thinking their inline pipeline was simply missing a processor.
+        // Genuinely supporting inline-body pipelines needs the companion core fix (deep-copy the config in resolvePipeline).
         if (Objects.nonNull(inlineConfig)) {
-            return FusionSpec.fromPipelineConfig(inlineConfig);
+            FusionSpec spec = FusionSpec.fromPipelineConfig(inlineConfig);
+            if (Objects.nonNull(spec)) {
+                return spec;
+            }
+            throw new IllegalArgumentException(
+                "[hybrid] query [fusion]: an inline search_pipeline block is not readable at query rewrite for fused mode; "
+                    + "provide the config in an inline `fusion` block, a named `?search_pipeline=`, or `index.search.default_pipeline`"
+            );
         }
 
         ClusterService clusterService = NeuralSearchClusterUtil.instance().getClusterService();

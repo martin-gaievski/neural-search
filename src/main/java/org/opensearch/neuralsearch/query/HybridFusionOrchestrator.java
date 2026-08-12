@@ -20,6 +20,7 @@ import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.InnerHitContextBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.knn.index.query.KNNQueryBuilder;
 import org.opensearch.neuralsearch.fusion.CoordinatorScoreFusion;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationFactory;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationTechnique;
@@ -33,7 +34,7 @@ import lombok.NoArgsConstructor;
 
 /**
  * Coordinator-side machinery for the resolver (fused) mode: fan the sub-query legs out as a parallel {@code MultiSearch},
- * then fuse the leg hits into the standard query the {@code hybrid} query self-erases into ({@link HybridFusionQuery},
+ * then fuse the leg hits into the standard query the {@code hybrid} query self-erases into ({@link HybridFusionQueryBuilder},
  * or {@code match_none} when nothing fused). All methods are static and take the {@link SearchRequest} /
  * {@link MultiSearchResponse} explicitly so the class holds no state.
  *
@@ -50,6 +51,13 @@ final class HybridFusionOrchestrator {
      * Build the leg MultiSearch: one standalone search per sub-query, each reduced to the global top-{@code windowSize}.
      * Id-only (no {@code _source}); totals disabled (the Tail supplies the full-match-set count when needed).
      *
+     * <p>Note on ANN legs: {@code size} sets how many hits a leg returns, but an ANN leg's retrieval depth is bounded by
+     * its own {@code k} (collected per shard), not by {@code size} — a {@code knn}/{@code neural} leg with a small or
+     * default {@code k} (10) contributes at most that many candidates regardless of {@code windowSize}. This matches
+     * classic hybrid, which likewise never rewrites {@code k}; for a full window, set {@code k >= window_size} on the
+     * sub-query. We deliberately do NOT rewrite {@code k} here — it would diverge from classic and has no analog for
+     * radial knn ({@code min_score}/{@code max_distance} have no {@code k}).
+     *
      * <p>Each leg is pinned to the no-op search pipeline ({@code _none}). Otherwise a leg — a plain {@link SearchRequest}
      * with no explicit pipeline — would inherit the index's {@code index.search.default_pipeline} and re-run its
      * request/response processors once per leg (redundant, and incorrect for processors like {@code rerank} that expect
@@ -59,16 +67,15 @@ final class HybridFusionOrchestrator {
      * <p>Legs disable partial results ({@code allowPartialSearchResults(false)}): fused relevance is computed across a
      * leg's full window, so a leg silently truncated by a down shard would be as corrupting as a fully failed leg.
      * Failing the leg instead lets {@link #groupLegHits} fail the whole request fast, rather than fusing over incomplete
-     * data — this is the leg-level half of the fail-fast contract.
+     * data — this is the leg-level half of the fail-fast contract. TODO: honor the request's
+     * {@code allow_partial_search_results} in a follow-up (propagate only when explicitly set — the outer flag is a
+     * nullable {@code Boolean} not yet resolved to the cluster default at rewrite time, so a bare pass-through would NPE
+     * on the common unset case).
      */
     static MultiSearchRequest buildLegMultiSearch(SearchRequest request, List<QueryBuilder> legs, int windowSize) {
         MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
         for (QueryBuilder leg : legs) {
-            SearchSourceBuilder legSource = new SearchSourceBuilder().query(leg)
-                .size(windowSize)
-                .from(0)
-                .fetchSource(false)
-                .trackTotalHits(false);
+            SearchSourceBuilder legSource = new SearchSourceBuilder().query(leg).size(windowSize).fetchSource(false).trackTotalHits(false);
             multiSearchRequest.add(
                 new SearchRequest(request.indices()).indicesOptions(request.indicesOptions())
                     .source(legSource)
@@ -80,12 +87,12 @@ final class HybridFusionOrchestrator {
     }
 
     /**
-     * Fuse the leg results into the standard query the fused-mode hybrid self-erases into — a {@link HybridFusionQuery}
+     * Fuse the leg results into the standard query the fused-mode hybrid self-erases into — a {@link HybridFusionQueryBuilder}
      * (Top + conditional Tail), or a {@link MatchNoneQueryBuilder} when nothing fused. Pure: returns the query and
      * mutates nothing.
      *
      * <p>The Tail (non-scoring {@code bool{should: legs}} surfacing the full match set) is included only when the request
-     * needs it (aggregations / explain / profile / highlight / leg inner_hits / totals beyond the window) and this
+     * needs it (aggregations / highlight / leg inner_hits / totals beyond the window — see {@link #needsTail}) and this
      * marker is the whole query. A nested fused query is always Top-only, so an enclosing filter intersects the fused
      * window at the query phase (fuse-then-filter).
      */
@@ -103,18 +110,11 @@ final class HybridFusionOrchestrator {
         if (ranked.ids().length == 0) {
             return new MatchNoneQueryBuilder();
         }
-        boolean topOnly;
-        if (topLevel == false) {
-            topOnly = true; // nested: enclosing filter intersects at the query phase
-        } else if (needsExecutionTail(source) || legsHaveInnerHits(legs)) {
-            topOnly = false; // aggregations / explain / profile / highlight / leg inner_hits need the legs IN the query
-        } else if (wantsTotalsBeyondWindow(source, ranked.ids().length)) {
-            topOnly = false; // keep the Tail for an accurate index-wide count
-        } else {
-            topOnly = true; // track_total_hits:false -> plain top-K, no Tail
-        }
+        // A nested fused query is always Top-only (an enclosing filter intersects the fused window at the query phase);
+        // a top-level query keeps the Tail only when it genuinely needs the full match set executed (see needsTail).
+        boolean topOnly = topLevel == false || needsTail(source, legs, ranked.ids().length) == false;
         List<QueryBuilder> tail = topOnly ? List.of() : legQueriesForTail(legs, legHits);
-        return new HybridFusionQuery(ranked.ids(), ranked.scores(), tail);
+        return new HybridFusionQueryBuilder(ranked.ids(), ranked.scores(), tail);
     }
 
     /**
@@ -239,18 +239,35 @@ final class HybridFusionOrchestrator {
         return tail;
     }
 
-    /** Legs whose Lucene match set is their own top-k (re-running them in the Tail = a redundant ANN pass). */
+    /**
+     * Legs whose full Lucene match set equals their returned top-k, so re-running them in the Tail would be a redundant
+     * ANN pass (kNN/neural re-walk the HNSW graph). Only such legs are safe to materialize as an {@link IdsQueryBuilder}
+     * of the already-retrieved window ids. A leg whose match set is NOT bounded to its top-k — e.g. {@code neural_sparse},
+     * whose match set is every doc containing a query token (far larger than the window) — must NOT be materialized, or
+     * the Tail would drop the rest and undercount total_hits/aggregations (and re-running it is cheap: no graph to walk).
+     */
     private static boolean isMaterializableLeg(QueryBuilder leg) {
         String name = leg.getWriteableName();
-        return "knn".equals(name) || "neural".equals(name) || "neural_knn".equals(name);
+        return KNNQueryBuilder.NAME.equals(name) || NeuralQueryBuilder.NAME.equals(name) || NeuralKNNQueryBuilder.NAME.equals(name);
     }
 
-    private static boolean needsExecutionTail(SearchSourceBuilder source) {
-        return Objects.nonNull(source)
-            && (Objects.nonNull(source.aggregations())
-                || Boolean.TRUE.equals(source.explain())
-                || source.profile()
-                || Objects.nonNull(source.highlighter()));
+    /**
+     * Single source of truth for whether a top-level fused query needs the executed Tail (the non-scoring
+     * {@code bool{should: legs}}): aggregations or highlighting need the full match set in the query phase, leg
+     * inner_hits currently require the legs registered via the Tail, and an accurate index-wide {@code total_hits}
+     * beyond the fused window needs the legs counted. {@code explain}/{@code profile} are intentionally NOT triggers —
+     * the fused score is computed on the coordinator and the Top is a {@code constant_score(ids)}, so the Lucene tree
+     * carries no fusion breakdown to explain, and profiling the Tail would only time a redundant re-execution of legs
+     * that already ran in the fan-out (fusion-aware explain/profile is scoped to a later PR).
+     */
+    private static boolean needsTail(SearchSourceBuilder source, List<QueryBuilder> legs, int numRankedDocs) {
+        if (Objects.nonNull(source) && (Objects.nonNull(source.aggregations()) || Objects.nonNull(source.highlighter()))) {
+            return true;
+        }
+        if (legsHaveInnerHits(legs)) {
+            return true;
+        }
+        return wantsTotalsBeyondWindow(source, numRankedDocs);
     }
 
     private static boolean legsHaveInnerHits(List<QueryBuilder> legs) {

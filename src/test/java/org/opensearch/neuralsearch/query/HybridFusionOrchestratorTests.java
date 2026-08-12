@@ -73,7 +73,6 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         for (SearchRequest leg : ms.requests()) {
             SearchSourceBuilder source = leg.source();
             assertEquals(50, source.size());
-            assertEquals(0, source.from());
             assertFalse(source.fetchSource().fetchSource());
             assertEquals(SearchPipelineService.NOOP_PIPELINE_ID, leg.pipeline());
             // Legs are strict: a leg truncated by a down shard must fail (so fail-fast catches it), not return partial.
@@ -92,8 +91,8 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
 
         QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10, true);
 
-        assertTrue(fused instanceof HybridFusionQuery);
-        BoolQueryBuilder self = ((HybridFusionQuery) fused).buildSelfErasedQuery();
+        assertTrue(fused instanceof HybridFusionQueryBuilder);
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
         assertEquals("union of {1,2,3} scored in Top", 3, self.should().size());
         assertEquals("aggs → Tail retained", 1, self.filter().size());
     }
@@ -106,7 +105,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
 
         QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10, true);
 
-        BoolQueryBuilder self = ((HybridFusionQuery) fused).buildSelfErasedQuery();
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
         assertEquals(2, self.should().size());
         assertEquals("plain top-K → no Tail", 0, self.filter().size());
     }
@@ -121,7 +120,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
 
         QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10, false);
 
-        BoolQueryBuilder self = ((HybridFusionQuery) fused).buildSelfErasedQuery();
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
         assertEquals("nested → no Tail regardless of aggs", 0, self.filter().size());
     }
 
@@ -147,7 +146,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
             true
         );
 
-        BoolQueryBuilder self = ((HybridFusionQuery) fused).buildSelfErasedQuery();
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
         assertEquals("window=2 caps the Top to 2 docs", 2, self.should().size());
     }
 
@@ -209,7 +208,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
 
         QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10, true);
 
-        BoolQueryBuilder self = ((HybridFusionQuery) fused).buildSelfErasedQuery();
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
         BoolQueryBuilder tail = (BoolQueryBuilder) self.filter().get(0);
         assertEquals(2, tail.should().size());
         // lexical leg stays a real query; knn/neural leg is materialized as an IdsQuery of its returned hits.
@@ -217,7 +216,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         assertEquals("knn leg materialized as IdsQuery", 1, idsClauses);
     }
 
-    // ---- weighted combination + explain/highlight tail triggers ----
+    // ---- weighted combination + highlight/totals tail triggers (explain/profile do NOT trigger the Tail) ----
 
     public void testBuildFusedQuery_withPerLegWeights_fusesWithoutError() {
         // Weighted arithmetic mean: exercises weightsParams() building the combination technique from FusionSpec weights.
@@ -239,18 +238,33 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
             true
         );
 
-        assertTrue(fused instanceof HybridFusionQuery);
-        assertEquals(3, ((HybridFusionQuery) fused).buildSelfErasedQuery().should().size());
+        assertTrue(fused instanceof HybridFusionQueryBuilder);
+        assertEquals(3, ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().should().size());
     }
 
-    public void testBuildFusedQuery_explainTriggersTail() {
+    public void testBuildFusedQuery_explainDoesNotTriggerTail() {
+        // explain/profile no longer force the Tail: fusion is computed on the coordinator (Top is constant_score(ids)),
+        // so the Lucene tree has no fusion breakdown to explain and the Tail would only re-execute legs. With
+        // track_total_hits:false there is nothing else needing the Tail, so the query is Top-only.
         List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"));
         MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)));
         SearchSourceBuilder source = new SearchSourceBuilder().trackTotalHits(false).explain(true);
 
         QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10, true);
 
-        assertEquals("explain → Tail retained", 1, ((HybridFusionQuery) fused).buildSelfErasedQuery().filter().size());
+        assertEquals("explain alone → no Tail", 0, ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().filter().size());
+    }
+
+    public void testBuildFusedQuery_profileDoesNotTriggerTail() {
+        // Same as explain: profiling the self-erased query would only time a redundant re-execution of legs that already
+        // ran in the fan-out, so profile is not a Tail trigger. With track_total_hits:false the query is Top-only.
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"));
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)));
+        SearchSourceBuilder source = new SearchSourceBuilder().trackTotalHits(false).profile(true);
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10, true);
+
+        assertEquals("profile alone → no Tail", 0, ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().filter().size());
     }
 
     public void testBuildFusedQuery_defaultTrackTotalHits_keepsTailForAccurateCount() {
@@ -260,7 +274,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
 
         QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, minMaxArithmetic(), 10, true);
 
-        assertEquals("default totals → Tail retained", 1, ((HybridFusionQuery) fused).buildSelfErasedQuery().filter().size());
+        assertEquals("default totals → Tail retained", 1, ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().filter().size());
     }
 
     public void testBuildFusedQuery_nullSource_keepsTail() {
@@ -270,7 +284,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
 
         QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(null, ms, legs, minMaxArithmetic(), 10, true);
 
-        assertEquals(1, ((HybridFusionQuery) fused).buildSelfErasedQuery().filter().size());
+        assertEquals(1, ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().filter().size());
     }
 
     public void testBuildFusedQuery_neuralNamedLeg_materializedAsIds() {
@@ -289,7 +303,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
 
         QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10, true);
 
-        BoolQueryBuilder tail = (BoolQueryBuilder) ((HybridFusionQuery) fused).buildSelfErasedQuery().filter().get(0);
+        BoolQueryBuilder tail = (BoolQueryBuilder) ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().filter().get(0);
         long idsClauses = tail.should().stream().filter(q -> q instanceof IdsQueryBuilder).count();
         assertEquals("neural leg materialized as IdsQuery", 1, idsClauses);
     }

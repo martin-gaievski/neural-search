@@ -429,7 +429,7 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      *   <li><b>Round 1</b>: resolve the {@link FusionSpec} (inline block, else the attached pipeline), fire the legs as
      *       a parallel {@code MultiSearch} via {@link QueryRewriteContext#registerAsyncAction}, and return a marker
      *       carrying a {@link SetOnce}-backed supplier.</li>
-     *   <li><b>Round 2</b>: the async action has produced the standard query — return it ({@link HybridFusionQuery} or
+     *   <li><b>Round 2</b>: the async action has produced the standard query — return it ({@link HybridFusionQueryBuilder} or
      *       {@code match_none}).</li>
      * </ul>
      */
@@ -458,8 +458,9 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             throw new IllegalArgumentException(
                 String.format(
                     Locale.ROOT,
-                    "[%s] query [%s] requires a normalization or score-ranker processor in the attached search pipeline "
-                        + "(inline body, ?search_pipeline=, or index.search.default_pipeline), or an inline fusion block; none was found",
+                    "[%s] query [%s] requires a normalization or score-ranker processor: the resolved search pipeline "
+                        + "(from ?search_pipeline= or index.search.default_pipeline) has none, and no inline fusion block "
+                        + "was provided (a missing pipeline id is rejected earlier by core)",
                     NAME,
                     FUSION_FIELD.getPreferredName()
                 )
@@ -468,6 +469,9 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         // Current scope (first working slice): min_max + arithmetic_mean only. Other techniques parse but are not wired
         // into the coordinator fusion path yet — fail fast rather than silently mis-fuse.
         requireSupportedTechniques(fusionSpec);
+        // Fusion keys leg hits by _id, which is only unique within one index; reject multi-index until keying + the
+        // self-erase are index-aware (follow-up), rather than conflate same-_id docs from different indices.
+        validateSingleIndexForFusedMode(searchRequest);
 
         // Whether this query is the whole request (=> conditional Tail for accurate totals/aggs) or nested inside a
         // container (=> Top-only, so an enclosing filter intersects at the query phase). The `== this` is an INTENTIONAL
@@ -508,7 +512,22 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                     } catch (Exception e) {
                         listener.onFailure(e);
                     }
-                }, listener::onFailure)
+                    // Whole-MultiSearch transport failure (cancellation, rejection, coordinator error) — not a per-leg
+                    // Item failure. Frame it as the user's hybrid/fused query rather than surfacing a bare multiSearch error.
+                },
+                    e -> listener.onFailure(
+                        new IllegalStateException(
+                            String.format(
+                                Locale.ROOT,
+                                "[%s] query [%s] failed to execute fused-mode sub-queries: %s",
+                                NAME,
+                                FUSION_FIELD.getPreferredName(),
+                                e.getMessage()
+                            ),
+                            e
+                        )
+                    )
+                )
             )
         );
 
@@ -554,6 +573,33 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             return ((Number) fusion.get(FUSION_KEY_WINDOW_SIZE)).intValue();
         }
         return DEFAULT_FUSION_WINDOW_SIZE;
+    }
+
+    /**
+     * Reject a fused-mode query that targets more than one concrete index. Fusion keys leg hits by {@code _id} on the
+     * coordinator, but {@code _id} is unique only within an index — across two indices the same {@code _id} denotes
+     * different docs, which would be conflated during fusion and both matched by the self-erased {@code _id} Top. Until
+     * fusion keying and the self-erase are index-aware (a follow-up), fail fast rather than return silently-wrong scores.
+     * (A single index under custom routing can still collide on {@code _id} across shards — a narrower case the follow-up
+     * also addresses.)
+     */
+    private static void validateSingleIndexForFusedMode(final SearchRequest searchRequest) {
+        long concreteIndices = NeuralSearchClusterUtil.instance()
+            .getIndexMetadataList(searchRequest)
+            .stream()
+            .filter(Objects::nonNull)
+            .count();
+        if (concreteIndices > 1) {
+            throw new IllegalArgumentException(
+                String.format(
+                    Locale.ROOT,
+                    "[%s] query [%s] (resolver/fused mode) does not yet support searching multiple indices; the request resolved to %d indices",
+                    NAME,
+                    FUSION_FIELD.getPreferredName(),
+                    concreteIndices
+                )
+            );
+        }
     }
 
     /**

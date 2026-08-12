@@ -43,7 +43,7 @@ import org.opensearch.index.query.QueryShardContext;
  *
  * <p>This query is created internally by the coordinator self-erase and is never parseable from a search request.
  */
-public class HybridFusionQuery extends AbstractQueryBuilder<HybridFusionQuery> {
+public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQueryBuilder> {
 
     public static final String NAME = "hybrid_fusion";
 
@@ -51,13 +51,13 @@ public class HybridFusionQuery extends AbstractQueryBuilder<HybridFusionQuery> {
     private final float[] scores;
     private final List<QueryBuilder> sourceQueries;
 
-    public HybridFusionQuery(String[] ids, float[] scores, List<QueryBuilder> sourceQueries) {
+    public HybridFusionQueryBuilder(String[] ids, float[] scores, List<QueryBuilder> sourceQueries) {
         this.ids = ids;
         this.scores = scores;
         this.sourceQueries = Objects.isNull(sourceQueries) ? new ArrayList<>() : sourceQueries;
     }
 
-    public HybridFusionQuery(StreamInput in) throws IOException {
+    public HybridFusionQueryBuilder(StreamInput in) throws IOException {
         super(in);
         this.ids = in.readStringArray();
         this.scores = in.readFloatArray();
@@ -81,7 +81,7 @@ public class HybridFusionQuery extends AbstractQueryBuilder<HybridFusionQuery> {
             changed |= r != q;
         }
         if (changed) {
-            HybridFusionQuery rewrittenBuilder = new HybridFusionQuery(ids, scores, rewritten);
+            HybridFusionQueryBuilder rewrittenBuilder = new HybridFusionQueryBuilder(ids, scores, rewritten);
             rewrittenBuilder.boost(boost());
             rewrittenBuilder.queryName(queryName());
             return rewrittenBuilder;
@@ -138,7 +138,7 @@ public class HybridFusionQuery extends AbstractQueryBuilder<HybridFusionQuery> {
     }
 
     @Override
-    protected boolean doEquals(HybridFusionQuery other) {
+    protected boolean doEquals(HybridFusionQueryBuilder other) {
         return Arrays.equals(ids, other.ids) && Arrays.equals(scores, other.scores) && Objects.equals(sourceQueries, other.sourceQueries);
     }
 
@@ -160,7 +160,7 @@ public class HybridFusionQuery extends AbstractQueryBuilder<HybridFusionQuery> {
         builder.endObject();
     }
 
-    public static HybridFusionQuery fromXContent(XContentParser parser) {
+    public static HybridFusionQueryBuilder fromXContent(XContentParser parser) {
         throw new UnsupportedOperationException(
             String.format(
                 Locale.ROOT,

@@ -35,7 +35,7 @@ import lombok.extern.log4j.Log4j2;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.neuralsearch.query.NeuralQueryBuilder;
 import org.opensearch.neuralsearch.query.HybridQueryBuilder;
-import org.opensearch.neuralsearch.query.HybridFusionQuery;
+import org.opensearch.neuralsearch.query.HybridFusionQueryBuilder;
 import org.opensearch.neuralsearch.query.NeuralSparseQueryBuilder;
 import org.opensearch.neuralsearch.query.NeuralKNNQueryBuilder;
 import org.opensearch.neuralsearch.query.AgenticSearchQueryBuilder;
@@ -258,7 +258,7 @@ public class NeuralSearch extends Plugin
             new QuerySpec<>(NeuralSparseQueryBuilder.NAME, NeuralSparseQueryBuilder::new, NeuralSparseQueryBuilder::fromXContent),
             new QuerySpec<>(NeuralKNNQueryBuilder.NAME, NeuralKNNQueryBuilder::new, NeuralKNNQueryBuilder::fromXContent),
             new QuerySpec<>(AgenticSearchQueryBuilder.NAME, AgenticSearchQueryBuilder::new, AgenticSearchQueryBuilder::fromXContent),
-            new QuerySpec<>(HybridFusionQuery.NAME, HybridFusionQuery::new, HybridFusionQuery::fromXContent)
+            new QuerySpec<>(HybridFusionQueryBuilder.NAME, HybridFusionQueryBuilder::new, HybridFusionQueryBuilder::fromXContent)
         );
     }
 

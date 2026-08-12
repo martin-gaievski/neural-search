@@ -115,9 +115,12 @@ public class FusionConfigResolverTests extends OpenSearchTestCase {
         assertEquals(FusionSpec.NORMALIZATION_MIN_MAX, spec.normalizationTechnique());
     }
 
-    public void testResolve_whenInlineBodyHasNoFusionProcessor_thenNull() {
+    public void testResolve_whenInlineBodyNotReadable_thenThrowsTargetedError() {
+        // An inline search_pipeline block was attached but yields no fusion processor here (core typically drains it
+        // before rewrite) → targeted error pointing to the supported alternatives, not the generic "no processor" one.
         SearchRequest request = requestWithInlinePipeline(Map.of("phase_results_processors", List.of()));
-        assertNull(FusionConfigResolver.resolve(request));
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> FusionConfigResolver.resolve(request));
+        assertTrue(e.getMessage().contains("inline search_pipeline block is not readable at query rewrite"));
     }
 
     public void testResolve_whenNamedNonePipeline_thenNull() {
