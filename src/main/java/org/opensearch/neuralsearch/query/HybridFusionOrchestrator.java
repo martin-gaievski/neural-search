@@ -64,13 +64,13 @@ final class HybridFusionOrchestrator {
      * request context absent from an id-only leg). The outer fused request still carries the pipeline, so top-level
      * processors run exactly once.
      *
-     * <p>Legs disable partial results ({@code allowPartialSearchResults(false)}): fused relevance is computed across a
-     * leg's full window, so a leg silently truncated by a down shard would be as corrupting as a fully failed leg.
-     * Failing the leg instead lets {@link #groupLegHits} fail the whole request fast, rather than fusing over incomplete
-     * data — this is the leg-level half of the fail-fast contract. TODO: honor the request's
-     * {@code allow_partial_search_results} in a follow-up (propagate only when explicitly set — the outer flag is a
-     * nullable {@code Boolean} not yet resolved to the cluster default at rewrite time, so a bare pass-through would NPE
-     * on the common unset case).
+     * <p>Legs do NOT override {@code allow_partial_search_results}: the flag is left unset, so each leg resolves the
+     * cluster default at execution (default {@code true}) exactly like a normal search — a shard that fails for a leg
+     * degrades that leg to partial results rather than failing the request. A wholly-failed leg (all shards down, or a
+     * non-partial error) is still a hard failure surfaced by {@link #groupLegHits}. Caveats: a request-level
+     * {@code allow_partial_search_results=false} is intentionally NOT propagated to the legs yet (unsupported), and
+     * because min_max is per-leg a partially-degraded leg can shift its own min/max, so the fused ranking may differ
+     * from a complete run — see the LLD "Partial-leg failure" note under *Consistency*.
      */
     static MultiSearchRequest buildLegMultiSearch(SearchRequest request, List<QueryBuilder> legs, int windowSize) {
         MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
@@ -80,7 +80,6 @@ final class HybridFusionOrchestrator {
                 new SearchRequest(request.indices()).indicesOptions(request.indicesOptions())
                     .source(legSource)
                     .pipeline(SearchPipelineService.NOOP_PIPELINE_ID)
-                    .allowPartialSearchResults(false)
             );
         }
         return multiSearchRequest;
@@ -118,10 +117,11 @@ final class HybridFusionOrchestrator {
     }
 
     /**
-     * Reduce the raw MultiSearch items into a per-leg array of hits (one item per leg). Fail fast on ANY leg failure:
-     * fused relevance is computed across all legs (min_max normalization + combination), so a dropped leg would silently
-     * change the ranking function — a partial fused result is semantically different, not just smaller. So a single
-     * failed sub-search fails the whole request rather than degrading to the surviving legs.
+     * Reduce the raw MultiSearch items into a per-leg array of hits (one item per leg). A wholly-failed leg (all shards
+     * down or a non-partial error → {@code Item.isFailure()}) fails the whole request — fusing over a missing leg would
+     * silently change the ranking function, not merely return fewer docs. A leg that only lost some shards under
+     * {@code allow_partial_search_results=true} comes back as a successful item with fewer hits and is fused as-is
+     * (matching OpenSearch's default partial-results behavior; the relevance caveat is in the LLD *Consistency* note).
      */
     private static SearchHit[][] groupLegHits(MultiSearchResponse.Item[] items, int legCount) {
         if (items.length != legCount) {

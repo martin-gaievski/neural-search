@@ -13,6 +13,7 @@ import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchResponseSections;
+import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
@@ -57,6 +58,24 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         return new MultiSearchResponse.Item(null, new RuntimeException("leg boom"));
     }
 
+    /** A SUCCESSFUL MultiSearch item that lost a shard under allow_partial=true: HTTP 200, fewer hits, non-empty
+     *  shardFailures (isFailure()==false). Models a partially-degraded leg. */
+    private MultiSearchResponse.Item partialLegItem(Map<String, Float> idToScore) {
+        SearchHit[] hits = new SearchHit[idToScore.size()];
+        int i = 0;
+        for (Map.Entry<String, Float> e : idToScore.entrySet()) {
+            SearchHit hit = new SearchHit(i, e.getKey(), Map.of(), Map.of());
+            hit.score(e.getValue());
+            hits[i++] = hit;
+        }
+        SearchHits searchHits = new SearchHits(hits, new TotalHits(hits.length, TotalHits.Relation.EQUAL_TO), 1.0f);
+        SearchResponseSections sections = new SearchResponseSections(searchHits, null, null, false, false, null, 0);
+        ShardSearchFailure[] failures = new ShardSearchFailure[] { new ShardSearchFailure(new RuntimeException("shard down")) };
+        // totalShards=2, successful=1, skipped=0, one shard failure → partial but SUCCESSFUL item.
+        SearchResponse response = new SearchResponse(sections, null, 2, 1, 0, 10, failures, null);
+        return new MultiSearchResponse.Item(response, null);
+    }
+
     private MultiSearchResponse multiSearch(MultiSearchResponse.Item... items) {
         return new MultiSearchResponse(items, 10L);
     }
@@ -75,8 +94,9 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
             assertEquals(50, source.size());
             assertFalse(source.fetchSource().fetchSource());
             assertEquals(SearchPipelineService.NOOP_PIPELINE_ID, leg.pipeline());
-            // Legs are strict: a leg truncated by a down shard must fail (so fail-fast catches it), not return partial.
-            assertEquals(Boolean.FALSE, leg.allowPartialSearchResults());
+            // Legs don't override allow_partial_search_results — left unset so each resolves the cluster default (true)
+            // at execution, like a normal search.
+            assertNull(leg.allowPartialSearchResults());
         }
     }
 
@@ -150,11 +170,12 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         assertEquals("window=2 caps the Top to 2 docs", 2, self.should().size());
     }
 
-    // ---- fail-fast on leg failure ----
+    // ---- leg failure: a wholly-failed leg fails fast, a partially-degraded leg is fused ----
 
     public void testBuildFusedQuery_whenAnyLegFailed_thenFailsFast() {
-        // A single failed leg fails the whole request: partial fusion would silently change the ranking function, so we
-        // do not degrade to the surviving legs. The failing leg's index is reported and its exception chained as cause.
+        // A wholly-failed leg (all shards down / non-partial error -> Item.isFailure) fails the whole request — fusing
+        // over a missing leg would silently change the ranking function. (A merely partial leg degrades instead — see
+        // testBuildFusedQuery_whenLegPartiallyFailed_thenFused.) The failing leg's index is reported, cause chained.
         List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
         MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f, "2", 0.5f)), failedItem());
 
@@ -185,6 +206,30 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         );
         assertTrue(e.getMessage().contains("fused-mode sub-query 0 failed"));
         assertNotNull(e.getCause());
+    }
+
+    public void testBuildFusedQuery_whenLegPartiallyFailed_thenFused() {
+        // A leg that lost some shards under allow_partial_search_results=true is a SUCCESSFUL item with fewer hits — it
+        // is fused (degrade, matching OpenSearch's default), not rejected. groupLegHits only hard-fails a wholly-failed
+        // item, so a partial-but-successful leg flows through.
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(partialLegItem(Map.of("1", 0.9f)), legItem(Map.of("2", 0.8f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(
+            new SearchSourceBuilder().trackTotalHits(false),
+            ms,
+            legs,
+            minMaxArithmetic(),
+            10,
+            true
+        );
+
+        assertTrue(fused instanceof HybridFusionQueryBuilder);
+        assertEquals(
+            "both legs' docs fused despite one leg's partial shard failure",
+            2,
+            ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().should().size()
+        );
     }
 
     // ---- knn/neural leg materialized as Ids in the Tail (no second ANN walk) ----
