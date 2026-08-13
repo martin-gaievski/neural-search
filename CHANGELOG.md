@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Enhancements
 * In-query fusion in hybrid search. Implement base classes and enable fusion (min_max and arithmetic mean) ([#1933](https://github.com/opensearch-project/neural-search/pull/1933))
+* In-query fusion in hybrid search. Support nested hybrid queries, search across multiple indices, aggregations, and point in time ([#1943](https://github.com/opensearch-project/neural-search/pull/1943))
 
 ### Bug Fixes
 * [SemanticHighlighter] Fix SemanticHighlighterExtBuilder.toXContent ([#1906](https://github.com/opensearch-project/neural-search/issues/1906)) (query-insights [#651](https://github.com/opensearch-project/query-insights/issues/651))

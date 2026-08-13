@@ -76,10 +76,14 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     /**
      * Resolver (fused) mode config: the raw inline {@code fusion} block from the query body. Its <b>presence</b> is the
      * resolver on/off flag; its <b>shape</b> carries the config. {@code null} = classic hybrid (byte-identical wire
-     * form). A string {@code "pipeline"} is normalized to {@code {source: "pipeline"}} at parse. In this build the
-     * parameter is parsed, validated, and round-tripped, but execution is not yet wired — a well-formed {@code fusion}
-     * fails fast at {@link #doRewrite} (see PR sequencing in the LLD/tracker). Not serialized over the transport wire
-     * yet (binary wire gate lands with the execution path).
+     * form). A string {@code "pipeline"} is normalized to {@code {source: "pipeline"}} at parse.
+     *
+     * <p>A well-formed {@code fusion} block drives execution: {@link #doRewrite} routes to {@link #doRewriteFused}, which
+     * fans the legs out and self-erases into a standard query on the coordinator.
+     *
+     * <p>Serialized over the transport wire behind a peer-stream-version gate, so a request carrying {@code fusion} keeps
+     * a wire form a pre-fused-mode node can still read: the field is written only when the peer understands it, and its
+     * absence costs a single {@code false} boolean.
      */
     private Map<String, Object> fusion;
 
