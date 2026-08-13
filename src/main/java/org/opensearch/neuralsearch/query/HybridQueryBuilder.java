@@ -473,15 +473,6 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         // self-erase are index-aware (follow-up), rather than conflate same-_id docs from different indices.
         validateSingleIndexForFusedMode(searchRequest);
 
-        // Whether this query is the whole request (=> conditional Tail for accurate totals/aggs) or nested inside a
-        // container (=> Top-only, so an enclosing filter intersects at the query phase). The `== this` is an INTENTIONAL
-        // reference-identity check: it holds only because the coordinator rewrite runs on the exact instance still parked
-        // at source().query(). If a request-rewrite layer ever clones the query before this point, a genuinely top-level
-        // query would compare != and be misclassified as nested -> forced Top-only -> the Tail is silently dropped, so
-        // scores and top hits stay correct but total_hits and aggregations would be computed over just the fused window.
-        // TODO: once nested fusion is wired and validated end-to-end, thread the top-level/nesting signal down explicitly
-        // (e.g. via the coordinator context) so it survives cloning instead of relying on this invariant.
-        boolean topLevel = Objects.nonNull(searchRequest.source()) && searchRequest.source().query() == this;
         int window = effectiveWindowSize();
         // Each leg fires size=window per shard, so an unbounded window is a per-shard memory/CPU amplifier. Cap it at
         // index.max_result_window (resolved coordinator-side from the targeted indices), mirroring classic hybrid's
@@ -499,14 +490,7 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                 ActionListener.wrap(multiSearchResponse -> {
                     try {
                         fused.set(
-                            HybridFusionOrchestrator.buildFusedQuery(
-                                searchRequest.source(),
-                                multiSearchResponse,
-                                legs,
-                                fusionSpec,
-                                window,
-                                topLevel
-                            )
+                            HybridFusionOrchestrator.buildFusedQuery(searchRequest.source(), multiSearchResponse, legs, fusionSpec, window)
                         );
                         listener.onResponse(null);
                     } catch (Exception e) {

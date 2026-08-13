@@ -22,6 +22,8 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
+import org.opensearch.common.unit.TimeValue;
+import org.opensearch.search.builder.PointInTimeBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.pipeline.SearchPipelineService;
 import org.opensearch.test.OpenSearchTestCase;
@@ -50,7 +52,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         }
         SearchHits searchHits = new SearchHits(hits, new TotalHits(hits.length, TotalHits.Relation.EQUAL_TO), 1.0f);
         SearchResponseSections sections = new SearchResponseSections(searchHits, null, null, false, false, null, 0);
-        SearchResponse response = new SearchResponse(sections, null, 1, 1, 0, 10, null, null);
+        SearchResponse response = new SearchResponse(sections, null, 1, 1, 0, 10, ShardSearchFailure.EMPTY_ARRAY, null);
         return new MultiSearchResponse.Item(response, null);
     }
 
@@ -94,10 +96,51 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
             assertEquals(50, source.size());
             assertFalse(source.fetchSource().fetchSource());
             assertEquals(SearchPipelineService.NOOP_PIPELINE_ID, leg.pipeline());
-            // Legs don't override allow_partial_search_results — left unset so each resolves the cluster default (true)
-            // at execution, like a normal search.
+            // Unset on the request → left unset on the leg so each resolves the cluster default (true) at execution.
             assertNull(leg.allowPartialSearchResults());
         }
+    }
+
+    public void testBuildLegMultiSearch_whenAllowPartialExplicitlySet_thenPropagatedToLegs() {
+        // An explicit request-level value is honored by the legs. Notably false must reach them: that is what makes a
+        // leg with a failing shard fail outright, which groupLegHits turns into a whole-request failure.
+        for (boolean explicit : new boolean[] { true, false }) {
+            SearchRequest request = new SearchRequest(INDEX).allowPartialSearchResults(explicit);
+            List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+
+            MultiSearchRequest ms = HybridFusionOrchestrator.buildLegMultiSearch(request, legs, 50);
+
+            for (SearchRequest leg : ms.requests()) {
+                assertEquals(explicit, leg.allowPartialSearchResults());
+            }
+        }
+    }
+
+    public void testBuildLegMultiSearch_whenRequestHasPit_thenPassedToEveryLeg() {
+        // A user-supplied PIT must reach every leg so all legs (and round 2) read one immutable view instead of N+1
+        // independent reader instants. keepAlive is left unset on legs so the PIT's original keep-alive governs.
+        SearchRequest request = new SearchRequest(INDEX).source(
+            new SearchSourceBuilder().pointInTimeBuilder(new PointInTimeBuilder("pit-id-42").setKeepAlive(TimeValue.timeValueMinutes(5)))
+        );
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+
+        MultiSearchRequest ms = HybridFusionOrchestrator.buildLegMultiSearch(request, legs, 50);
+
+        assertEquals(2, ms.requests().size());
+        for (SearchRequest leg : ms.requests()) {
+            assertNotNull("each leg must carry the PIT", leg.source().pointInTimeBuilder());
+            assertEquals("pit-id-42", leg.source().pointInTimeBuilder().getId());
+            assertNull("legs must not extend the PIT keep-alive", leg.source().pointInTimeBuilder().getKeepAlive());
+        }
+    }
+
+    public void testBuildLegMultiSearch_whenNoPit_thenLegsHaveNone() {
+        SearchRequest request = new SearchRequest(INDEX);
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"));
+
+        MultiSearchRequest ms = HybridFusionOrchestrator.buildLegMultiSearch(request, legs, 50);
+
+        assertNull(ms.requests().get(0).source().pointInTimeBuilder());
     }
 
     // ---- buildFusedQuery: Top+Tail / Top-only / match_none ----
@@ -109,7 +152,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
             org.opensearch.search.aggregations.AggregationBuilders.terms("t").field("f")
         );
 
-        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10, true);
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10);
 
         assertTrue(fused instanceof HybridFusionQueryBuilder);
         BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
@@ -123,32 +166,34 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         // track_total_hits:false, no aggs/highlight/explain → plain top-K, Tail dropped.
         SearchSourceBuilder source = new SearchSourceBuilder().trackTotalHits(false);
 
-        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10, true);
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10);
 
         BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
         assertEquals(2, self.should().size());
         assertEquals("plain top-K → no Tail", 0, self.filter().size());
     }
 
-    public void testBuildFusedQuery_nested_alwaysTopOnly() {
+    public void testBuildFusedQuery_tailDecisionIsDepthIndependent() {
+        // The Tail decision comes from the REQUEST alone, never from whether this hybrid is top-level or nested: the
+        // fused query self-erases the same way at any depth, and an enclosing clause simply intersects it. So with aggs
+        // present the Tail is retained — nesting no longer silently downgrades agg/total_hits accuracy.
         List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
         MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)), legItem(Map.of("2", 0.8f)));
-        // Even with aggs present, a nested (topLevel=false) fused query is Top-only.
         SearchSourceBuilder source = new SearchSourceBuilder().aggregation(
             org.opensearch.search.aggregations.AggregationBuilders.terms("t").field("f")
         );
 
-        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10, false);
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10);
 
         BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
-        assertEquals("nested → no Tail regardless of aggs", 0, self.filter().size());
+        assertEquals("aggs → Tail retained regardless of nesting depth", 1, self.filter().size());
     }
 
     public void testBuildFusedQuery_emptyResult_matchNone() {
         List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"));
         MultiSearchResponse ms = multiSearch(legItem(Map.of()));
 
-        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, minMaxArithmetic(), 10, true);
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, minMaxArithmetic(), 10);
 
         assertTrue(fused instanceof MatchNoneQueryBuilder);
     }
@@ -162,8 +207,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
             ms,
             legs,
             minMaxArithmetic(),
-            2,
-            true
+            2
         );
 
         BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
@@ -186,8 +230,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
                 ms,
                 legs,
                 minMaxArithmetic(),
-                10,
-                true
+                10
             )
         );
         assertTrue("reports the failing leg index", e.getMessage().contains("fused-mode sub-query 1 failed"));
@@ -202,16 +245,17 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
 
         IllegalStateException e = expectThrows(
             IllegalStateException.class,
-            () -> HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, minMaxArithmetic(), 10, true)
+            () -> HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, minMaxArithmetic(), 10)
         );
         assertTrue(e.getMessage().contains("fused-mode sub-query 0 failed"));
         assertNotNull(e.getCause());
     }
 
-    public void testBuildFusedQuery_whenLegPartiallyFailed_thenFused() {
+    public void testBuildFusedQuery_whenLegPartiallyFailed_thenFusedWithWarning() {
         // A leg that lost some shards under allow_partial_search_results=true is a SUCCESSFUL item with fewer hits — it
         // is fused (degrade, matching OpenSearch's default), not rejected. groupLegHits only hard-fails a wholly-failed
-        // item, so a partial-but-successful leg flows through.
+        // item, so a partial-but-successful leg flows through — but emits a Warning header naming it, because per-leg
+        // normalization means the degraded leg can shift the fused ranking, not just drop docs.
         List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
         MultiSearchResponse ms = multiSearch(partialLegItem(Map.of("1", 0.9f)), legItem(Map.of("2", 0.8f)));
 
@@ -220,8 +264,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
             ms,
             legs,
             minMaxArithmetic(),
-            10,
-            true
+            10
         );
 
         assertTrue(fused instanceof HybridFusionQueryBuilder);
@@ -230,6 +273,18 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
             2,
             ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().should().size()
         );
+        assertWarnings(
+            "[hybrid] fused-mode sub-query [0] returned partial results (shard failures); fused scores were computed "
+                + "over an incomplete result set, so ranking may differ from a complete run"
+        );
+    }
+
+    public void testBuildFusedQuery_whenNoLegDegraded_thenNoWarning() {
+        // Clean legs must not emit a warning (OpenSearchTestCase fails the test on any unasserted warning).
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)), legItem(Map.of("2", 0.8f)));
+
+        HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder().trackTotalHits(false), ms, legs, minMaxArithmetic(), 10);
     }
 
     // ---- knn/neural leg materialized as Ids in the Tail (no second ANN walk) ----
@@ -251,7 +306,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
             org.opensearch.search.aggregations.AggregationBuilders.terms("t").field("f")
         );
 
-        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10, true);
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10);
 
         BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
         BoolQueryBuilder tail = (BoolQueryBuilder) self.filter().get(0);
@@ -279,8 +334,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
             ms,
             legs,
             weighted,
-            10,
-            true
+            10
         );
 
         assertTrue(fused instanceof HybridFusionQueryBuilder);
@@ -295,7 +349,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)));
         SearchSourceBuilder source = new SearchSourceBuilder().trackTotalHits(false).explain(true);
 
-        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10, true);
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10);
 
         assertEquals("explain alone → no Tail", 0, ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().filter().size());
     }
@@ -307,7 +361,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)));
         SearchSourceBuilder source = new SearchSourceBuilder().trackTotalHits(false).profile(true);
 
-        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10, true);
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10);
 
         assertEquals("profile alone → no Tail", 0, ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().filter().size());
     }
@@ -317,7 +371,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"));
         MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f, "2", 0.5f)));
 
-        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, minMaxArithmetic(), 10, true);
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, minMaxArithmetic(), 10);
 
         assertEquals("default totals → Tail retained", 1, ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().filter().size());
     }
@@ -327,7 +381,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"));
         MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)));
 
-        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(null, ms, legs, minMaxArithmetic(), 10, true);
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(null, ms, legs, minMaxArithmetic(), 10);
 
         assertEquals(1, ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().filter().size());
     }
@@ -346,7 +400,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
             org.opensearch.search.aggregations.AggregationBuilders.terms("t").field("f")
         );
 
-        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10, true);
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10);
 
         BoolQueryBuilder tail = (BoolQueryBuilder) ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().filter().get(0);
         long idsClauses = tail.should().stream().filter(q -> q instanceof IdsQueryBuilder).count();

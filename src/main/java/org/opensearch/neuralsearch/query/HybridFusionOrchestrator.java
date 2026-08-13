@@ -16,16 +16,21 @@ import java.util.Objects;
 import org.opensearch.action.search.MultiSearchRequest;
 import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.ShardSearchFailure;
+import org.opensearch.common.logging.HeaderWarning;
 import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.InnerHitContextBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.knn.index.query.KNNQueryBuilder;
 import org.opensearch.neuralsearch.fusion.CoordinatorScoreFusion;
+import org.opensearch.neuralsearch.fusion.ScalarNormalizer;
+import org.opensearch.neuralsearch.fusion.ScalarNormalizerFactory;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationFactory;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationTechnique;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationUtil;
 import org.opensearch.search.SearchHit;
+import org.opensearch.search.builder.PointInTimeBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.pipeline.SearchPipelineService;
 
@@ -64,23 +69,38 @@ final class HybridFusionOrchestrator {
      * request context absent from an id-only leg). The outer fused request still carries the pipeline, so top-level
      * processors run exactly once.
      *
-     * <p>Legs do NOT override {@code allow_partial_search_results}: the flag is left unset, so each leg resolves the
-     * cluster default at execution (default {@code true}) exactly like a normal search — a shard that fails for a leg
-     * degrades that leg to partial results rather than failing the request. A wholly-failed leg (all shards down, or a
-     * non-partial error) is still a hard failure surfaced by {@link #groupLegHits}. Caveats: a request-level
-     * {@code allow_partial_search_results=false} is intentionally NOT propagated to the legs yet (unsupported), and
-     * because min_max is per-leg a partially-degraded leg can shift its own min/max, so the fused ranking may differ
-     * from a complete run — see the LLD "Partial-leg failure" note under *Consistency*.
+     * <p>{@code allow_partial_search_results} follows the request: an explicitly set value is propagated to every leg,
+     * and when the user left it unset the leg flag is left unset too so each leg resolves the cluster default at
+     * execution (default {@code true}) exactly like a normal search. Propagating only the explicit value matters because
+     * the outer flag is a nullable {@code Boolean} that core has not yet resolved to the cluster default at rewrite
+     * time, so an unconditional pass-through would unbox {@code null}. With an effective {@code true} a shard failing
+     * for one leg degrades that leg to partial results; with {@code false} the leg fails and {@link #groupLegHits} turns
+     * that into a whole-request failure. Note the fused-specific caveat: because normalization is per-leg, a
+     * partially-degraded leg shifts its own min/max, so the fused ranking may differ from a complete run — not merely
+     * return fewer docs (see {@link #groupLegHits} and the LLD "Partial-leg failure" note under *Consistency*).
+     *
+     * <p>A user-supplied point-in-time is passed through to every leg, so all legs and the self-erased round-2 query read
+     * the same immutable view instead of N+1 independent reader instants — the consistency window that otherwise exists
+     * on a live-ingest index. {@code keepAlive} is deliberately left unset on the legs so the PIT's original keep-alive
+     * governs; the legs never extend it. Copying the request's indices alongside a PIT is safe: core's REST layer has
+     * already resolved a PIT request's indices to the PIT's own, and the transport layer derives shards from the PIT
+     * context regardless, so the leg is consistent with the outer request rather than in conflict with it.
      */
     static MultiSearchRequest buildLegMultiSearch(SearchRequest request, List<QueryBuilder> legs, int windowSize) {
         MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
+        PointInTimeBuilder pointInTime = Objects.isNull(request.source()) ? null : request.source().pointInTimeBuilder();
         for (QueryBuilder leg : legs) {
             SearchSourceBuilder legSource = new SearchSourceBuilder().query(leg).size(windowSize).fetchSource(false).trackTotalHits(false);
-            multiSearchRequest.add(
-                new SearchRequest(request.indices()).indicesOptions(request.indicesOptions())
-                    .source(legSource)
-                    .pipeline(SearchPipelineService.NOOP_PIPELINE_ID)
-            );
+            if (Objects.nonNull(pointInTime)) {
+                legSource.pointInTimeBuilder(new PointInTimeBuilder(pointInTime.getId()));
+            }
+            SearchRequest legRequest = new SearchRequest(request.indices()).indicesOptions(request.indicesOptions())
+                .source(legSource)
+                .pipeline(SearchPipelineService.NOOP_PIPELINE_ID);
+            if (Objects.nonNull(request.allowPartialSearchResults())) {
+                legRequest.allowPartialSearchResults(request.allowPartialSearchResults());
+            }
+            multiSearchRequest.add(legRequest);
         }
         return multiSearchRequest;
     }
@@ -91,17 +111,21 @@ final class HybridFusionOrchestrator {
      * mutates nothing.
      *
      * <p>The Tail (non-scoring {@code bool{should: legs}} surfacing the full match set) is included only when the request
-     * needs it (aggregations / highlight / leg inner_hits / totals beyond the window — see {@link #needsTail}) and this
-     * marker is the whole query. A nested fused query is always Top-only, so an enclosing filter intersects the fused
-     * window at the query phase (fuse-then-filter).
+     * needs it (aggregations / highlight / leg inner_hits / totals beyond the window — see {@link #needsTail}).
+     *
+     * <p>The Tail decision is <b>depth-independent</b>: it is derived from the request alone, not from whether this
+     * hybrid is the whole query or nested inside a container. A nested fused query still self-erases into
+     * {@code bool{Top + Tail}}, and an enclosing clause simply intersects that (fuse-then-filter), so aggregations and
+     * {@code total_hits} stay correct at any nesting depth. This deliberately avoids inferring nesting from the query
+     * instance (a reference-identity check against {@code source().query()} would silently drop the Tail — and with it
+     * agg/total_hits accuracy — for any request-rewrite layer that clones the query first).
      */
     static QueryBuilder buildFusedQuery(
         SearchSourceBuilder source,
         MultiSearchResponse multiSearchResponse,
         List<QueryBuilder> legs,
         FusionSpec fusion,
-        int windowSize,
-        boolean topLevel
+        int windowSize
     ) {
         MultiSearchResponse.Item[] items = multiSearchResponse.getResponses();
         SearchHit[][] legHits = groupLegHits(items, legs.size());
@@ -109,10 +133,7 @@ final class HybridFusionOrchestrator {
         if (ranked.ids().length == 0) {
             return new MatchNoneQueryBuilder();
         }
-        // A nested fused query is always Top-only (an enclosing filter intersects the fused window at the query phase);
-        // a top-level query keeps the Tail only when it genuinely needs the full match set executed (see needsTail).
-        boolean topOnly = topLevel == false || needsTail(source, legs, ranked.ids().length) == false;
-        List<QueryBuilder> tail = topOnly ? List.of() : legQueriesForTail(legs, legHits);
+        List<QueryBuilder> tail = needsTail(source, legs, ranked.ids().length) ? legQueriesForTail(legs, legHits) : List.of();
         return new HybridFusionQueryBuilder(ranked.ids(), ranked.scores(), tail);
     }
 
@@ -120,8 +141,12 @@ final class HybridFusionOrchestrator {
      * Reduce the raw MultiSearch items into a per-leg array of hits (one item per leg). A wholly-failed leg (all shards
      * down or a non-partial error → {@code Item.isFailure()}) fails the whole request — fusing over a missing leg would
      * silently change the ranking function, not merely return fewer docs. A leg that only lost some shards under
-     * {@code allow_partial_search_results=true} comes back as a successful item with fewer hits and is fused as-is
-     * (matching OpenSearch's default partial-results behavior; the relevance caveat is in the LLD *Consistency* note).
+     * {@code allow_partial_search_results=true} comes back as a successful item with fewer hits and is fused as-is —
+     * matching OpenSearch's default partial-results behavior. Because normalization is per-leg, that degraded leg shifts
+     * its own min/max, so the fused <i>ranking</i> can differ from a complete run rather than merely losing docs; a
+     * response {@code Warning} header names the affected legs so the degradation is not silent. Under an effective
+     * {@code allow_partial_search_results=false} the leg itself fails, which the check below turns into a whole-request
+     * failure — so honoring that flag needs no separate handling here.
      */
     private static SearchHit[][] groupLegHits(MultiSearchResponse.Item[] items, int legCount) {
         if (items.length != legCount) {
@@ -130,6 +155,7 @@ final class HybridFusionOrchestrator {
             );
         }
         SearchHit[][] legHits = new SearchHit[legCount][];
+        List<Integer> degradedLegs = new ArrayList<>();
         for (int leg = 0; leg < legCount; leg++) {
             MultiSearchResponse.Item item = items[leg];
             if (item.isFailure()) {
@@ -138,9 +164,36 @@ final class HybridFusionOrchestrator {
                     item.getFailure()
                 );
             }
+            // Shard failures (not successful<total) — skipped/can-match shards are not failures. Read the array rather
+            // than getFailedShards(), which dereferences it unguarded.
+            ShardSearchFailure[] shardFailures = item.getResponse().getShardFailures();
+            if (Objects.nonNull(shardFailures) && shardFailures.length > 0) {
+                degradedLegs.add(leg);
+            }
             legHits[leg] = item.getResponse().getHits().getHits();
         }
+        warnOnDegradedLegs(degradedLegs);
         return legHits;
+    }
+
+    /**
+     * Surface partially-degraded legs as a response {@code Warning} header. Uses the same mechanism as deprecation
+     * warnings, emitted from the coordinator rewrite's async callback so it rides the request's thread context onto the
+     * response.
+     */
+    private static void warnOnDegradedLegs(final List<Integer> degradedLegs) {
+        if (degradedLegs.isEmpty()) {
+            return;
+        }
+        HeaderWarning.addWarning(
+            String.format(
+                Locale.ROOT,
+                "[hybrid] fused-mode sub-quer%s %s returned partial results (shard failures); fused scores were computed "
+                    + "over an incomplete result set, so ranking may differ from a complete run",
+                degradedLegs.size() == 1 ? "y" : "ies",
+                degradedLegs
+            )
+        );
     }
 
     /**
@@ -162,7 +215,10 @@ final class HybridFusionOrchestrator {
             fusion.combinationTechnique(),
             weightsParams(fusion.weights())
         );
-        Map<String, Float> combined = CoordinatorScoreFusion.fuseMinMax(legRawScores, combination);
+        // Normalization is resolved by name, so widening technique support is a new ScalarNormalizer + factory entry —
+        // no change here. The caller already rejected techniques outside the current scope at rewrite.
+        ScalarNormalizer normalizer = ScalarNormalizerFactory.create(fusion.normalizationTechnique());
+        Map<String, Float> combined = CoordinatorScoreFusion.fuse(legRawScores, normalizer, combination);
         return toRankedDocs(combined, windowSize);
     }
 
