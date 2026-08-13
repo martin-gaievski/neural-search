@@ -845,14 +845,22 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
     }
 
     @SneakyThrows
-    public void testDoRewriteFused_whenMultipleIndices_thenFailsFast() {
-        // Fusion keys leg hits by _id, which is unique only within one index, so multi-index fused search is rejected
-        // until keying + the self-erase are index-aware (guards against conflated same-_id docs from different indices).
+    public void testDoRewriteFused_whenMultipleIndices_thenProceeds() {
+        // Multi-index fused search is supported now that fusion keys documents by _index + _id: the interim reject guard
+        // is gone, and the request registers its leg fan-out like any other. (That same-_id docs across indices stay
+        // distinct is asserted at the fusion/self-erase level in HybridFusionOrchestratorTests.)
         initClusterUtilWithConcreteIndexCount(2);
         HybridQueryBuilder builder = fusedBuilder(new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"))));
         QueryCoordinatorContext ctx = coordinatorContextFor(builder);
-        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.doRewrite(ctx));
-        assertThat(e.getMessage(), containsString("does not yet support searching multiple indices"));
+        java.util.concurrent.atomic.AtomicInteger asyncRegistered = new java.util.concurrent.atomic.AtomicInteger();
+        doAnswer(invocation -> {
+            asyncRegistered.incrementAndGet();
+            return null;
+        }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+
+        builder.doRewrite(ctx);
+
+        assertEquals("multi-index fused query fans out normally", 1, asyncRegistered.get());
     }
 
     @SneakyThrows

@@ -469,9 +469,6 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         // Current scope (first working slice): min_max + arithmetic_mean only. Other techniques parse but are not wired
         // into the coordinator fusion path yet — fail fast rather than silently mis-fuse.
         requireSupportedTechniques(fusionSpec);
-        // Fusion keys leg hits by _id, which is only unique within one index; reject multi-index until keying + the
-        // self-erase are index-aware (follow-up), rather than conflate same-_id docs from different indices.
-        validateSingleIndexForFusedMode(searchRequest);
 
         int window = effectiveWindowSize();
         // Each leg fires size=window per shard, so an unbounded window is a per-shard memory/CPU amplifier. Cap it at
@@ -557,33 +554,6 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             return ((Number) fusion.get(FUSION_KEY_WINDOW_SIZE)).intValue();
         }
         return DEFAULT_FUSION_WINDOW_SIZE;
-    }
-
-    /**
-     * Reject a fused-mode query that targets more than one concrete index. Fusion keys leg hits by {@code _id} on the
-     * coordinator, but {@code _id} is unique only within an index — across two indices the same {@code _id} denotes
-     * different docs, which would be conflated during fusion and both matched by the self-erased {@code _id} Top. Until
-     * fusion keying and the self-erase are index-aware (a follow-up), fail fast rather than return silently-wrong scores.
-     * (A single index under custom routing can still collide on {@code _id} across shards — a narrower case the follow-up
-     * also addresses.)
-     */
-    private static void validateSingleIndexForFusedMode(final SearchRequest searchRequest) {
-        long concreteIndices = NeuralSearchClusterUtil.instance()
-            .getIndexMetadataList(searchRequest)
-            .stream()
-            .filter(Objects::nonNull)
-            .count();
-        if (concreteIndices > 1) {
-            throw new IllegalArgumentException(
-                String.format(
-                    Locale.ROOT,
-                    "[%s] query [%s] (resolver/fused mode) does not yet support searching multiple indices; the request resolved to %d indices",
-                    NAME,
-                    FUSION_FIELD.getPreferredName(),
-                    concreteIndices
-                )
-            );
-        }
     }
 
     /**

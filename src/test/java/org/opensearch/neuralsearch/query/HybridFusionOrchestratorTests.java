@@ -14,6 +14,11 @@ import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchResponseSections;
 import org.opensearch.action.search.ShardSearchFailure;
+import org.opensearch.action.OriginalIndices;
+import org.opensearch.core.index.Index;
+import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.query.ConstantScoreQueryBuilder;
+import org.opensearch.search.SearchShardTarget;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
@@ -48,6 +53,22 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         for (Map.Entry<String, Float> e : idToScore.entrySet()) {
             SearchHit hit = new SearchHit(i, e.getKey(), Map.of(), Map.of());
             hit.score(e.getValue());
+            hits[i++] = hit;
+        }
+        SearchHits searchHits = new SearchHits(hits, new TotalHits(hits.length, TotalHits.Relation.EQUAL_TO), 1.0f);
+        SearchResponseSections sections = new SearchResponseSections(searchHits, null, null, false, false, null, 0);
+        SearchResponse response = new SearchResponse(sections, null, 1, 1, 0, 10, ShardSearchFailure.EMPTY_ARRAY, null);
+        return new MultiSearchResponse.Item(response, null);
+    }
+
+    /** Like {@link #legItem} but the hits carry an {@code _index}, as real leg responses do. */
+    private MultiSearchResponse.Item legItemFromIndex(String index, Map<String, Float> idToScore) {
+        SearchHit[] hits = new SearchHit[idToScore.size()];
+        int i = 0;
+        for (Map.Entry<String, Float> e : idToScore.entrySet()) {
+            SearchHit hit = new SearchHit(i, e.getKey(), Map.of(), Map.of());
+            hit.score(e.getValue());
+            hit.shard(new SearchShardTarget("node-1", new ShardId(new Index(index, index + "-uuid"), 0), null, OriginalIndices.NONE));
             hits[i++] = hit;
         }
         SearchHits searchHits = new SearchHits(hits, new TotalHits(hits.length, TotalHits.Relation.EQUAL_TO), 1.0f);
@@ -285,6 +306,84 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)), legItem(Map.of("2", 0.8f)));
 
         HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder().trackTotalHits(false), ms, legs, minMaxArithmetic(), 10);
+    }
+
+    // ---- document identity: _index + _id ----
+
+    public void testBuildFusedQuery_whenSameIdInDifferentIndices_thenNotConflated() {
+        // The bug this guards: keying on _id alone made a doc in idx-a and a DIFFERENT doc in idx-b with the same _id
+        // fuse as one entity, and the self-erased _id Top then boosted both to that one score. Keyed by _index + _id they
+        // stay two documents, and each Top clause is index-qualified so a score lands on exactly one of them.
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(legItemFromIndex("idx-a", Map.of("1", 0.9f)), legItemFromIndex("idx-b", Map.of("1", 0.8f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(
+            new SearchSourceBuilder().trackTotalHits(false),
+            ms,
+            legs,
+            minMaxArithmetic(),
+            10
+        );
+
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
+        assertEquals("same _id in two indices stays two distinct fused docs", 2, self.should().size());
+        for (QueryBuilder clause : self.should()) {
+            QueryBuilder inner = ((ConstantScoreQueryBuilder) clause).innerQuery();
+            assertTrue("multi-index Top clause must be index-qualified", inner instanceof BoolQueryBuilder);
+            assertEquals("qualified by _id AND _index", 2, ((BoolQueryBuilder) inner).filter().size());
+        }
+    }
+
+    public void testBuildFusedQuery_whenSingleIndex_thenTopStaysIdOnly() {
+        // Single-index searches need no disambiguation, so they keep the leaner ids-only clause (and its original cost).
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(legItemFromIndex("idx-a", Map.of("1", 0.9f)), legItemFromIndex("idx-a", Map.of("2", 0.8f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(
+            new SearchSourceBuilder().trackTotalHits(false),
+            ms,
+            legs,
+            minMaxArithmetic(),
+            10
+        );
+
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
+        assertEquals(2, self.should().size());
+        for (QueryBuilder clause : self.should()) {
+            assertTrue(
+                "single-index Top clause stays a bare ids query",
+                ((ConstantScoreQueryBuilder) clause).innerQuery() instanceof IdsQueryBuilder
+            );
+        }
+    }
+
+    // ---- inner_hits are registered without executing the legs ----
+
+    public void testBuildFusedQuery_whenLegHasInnerHits_thenRegisteredWithoutTail() {
+        // inner_hits are built in the fetch phase from the registered contexts, so a leg only needs to be REGISTERED,
+        // never executed. With track_total_hits:false and no aggs there is nothing else needing the Tail, so the query
+        // stays Top-only (no redundant leg re-execution) while inner_hits are still extractable.
+        QueryBuilder nestedLeg = new org.opensearch.index.query.NestedQueryBuilder(
+            "user",
+            new MatchQueryBuilder("user.name", "alice"),
+            org.apache.lucene.search.join.ScoreMode.None
+        ).innerHit(new org.opensearch.index.query.InnerHitBuilder());
+        List<QueryBuilder> legs = List.of(nestedLeg, new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)), legItem(Map.of("2", 0.8f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(
+            new SearchSourceBuilder().trackTotalHits(false),
+            ms,
+            legs,
+            minMaxArithmetic(),
+            10
+        );
+
+        HybridFusionQueryBuilder fusedBuilder = (HybridFusionQueryBuilder) fused;
+        assertEquals("leg inner_hits no longer force the Tail", 0, fusedBuilder.buildSelfErasedQuery().filter().size());
+        Map<String, org.opensearch.index.query.InnerHitContextBuilder> innerHits = new java.util.HashMap<>();
+        fusedBuilder.extractInnerHitBuilders(innerHits);
+        assertFalse("inner_hits must still be registered for the fetch phase", innerHits.isEmpty());
     }
 
     // ---- knn/neural leg materialized as Ids in the Tail (no second ANN walk) ----

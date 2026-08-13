@@ -7,11 +7,13 @@ package org.opensearch.neuralsearch.query;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 import org.opensearch.action.search.MultiSearchRequest;
 import org.opensearch.action.search.MultiSearchResponse;
@@ -51,6 +53,8 @@ import lombok.NoArgsConstructor;
 final class HybridFusionOrchestrator {
 
     private static final ScoreCombinationFactory SCORE_COMBINATION_FACTORY = new ScoreCombinationFactory();
+    /** Separator for the composite _index+_id fusion key. Never parsed back — see computeRankedDocs. */
+    private static final String KEY_SEPARATOR = "#";
 
     /**
      * Build the leg MultiSearch: one standalone search per sub-query, each reduced to the global top-{@code windowSize}.
@@ -133,8 +137,9 @@ final class HybridFusionOrchestrator {
         if (ranked.ids().length == 0) {
             return new MatchNoneQueryBuilder();
         }
-        List<QueryBuilder> tail = needsTail(source, legs, ranked.ids().length) ? legQueriesForTail(legs, legHits) : List.of();
-        return new HybridFusionQueryBuilder(ranked.ids(), ranked.scores(), tail);
+        List<QueryBuilder> tail = needsTail(source, ranked.ids().length) ? legQueriesForTail(legs, legHits) : List.of();
+        // inner_hits are registered from the legs themselves, independent of whether the Tail executes them.
+        return new HybridFusionQueryBuilder(ranked.ids(), ranked.indices(), ranked.scores(), tail, innerHitsLegs(legs));
     }
 
     /**
@@ -197,19 +202,27 @@ final class HybridFusionOrchestrator {
     }
 
     /**
-     * Fuse via the shared {@link CoordinatorScoreFusion} core (min_max + arithmetic_mean), then rank by fused score and
-     * cut to the window. Converts the coordinator's {@code SearchHit[][]} view into the {@code _id}-keyed per-leg maps
-     * the shared core consumes; a leg that matched nothing contributes an empty map (groupLegHits fails fast on failures,
-     * so every slot is non-null).
+     * Fuse via the shared {@link CoordinatorScoreFusion} core, then rank by fused score and cut to the window. Converts
+     * the coordinator's {@code SearchHit[][]} view into the per-leg key→score maps the shared core consumes; a leg that
+     * matched nothing contributes an empty map (groupLegHits fails fast on failures, so every slot is non-null).
+     *
+     * <p>Documents are keyed by {@code _index} + {@code _id}, not {@code _id} alone: {@code _id} is unique only within an
+     * index, so across indices two different documents can share one and fusion would otherwise combine their scores as
+     * if they were one document. The composite key is built with a separator but is never parsed back — an {@code _id}
+     * may itself contain the separator, so the original identity is carried in a side map instead. To fusion and to every
+     * normalizer the key stays opaque.
      */
     private static RankedDocs computeRankedDocs(SearchHit[][] legHits, FusionSpec fusion, int windowSize) {
         List<Map<String, Float>> legRawScores = new ArrayList<>(legHits.length);
+        Map<String, SearchHit> identityByKey = new HashMap<>();
         for (SearchHit[] hits : legHits) {
-            Map<String, Float> byId = new LinkedHashMap<>();
+            Map<String, Float> byKey = new LinkedHashMap<>();
             for (SearchHit hit : hits) {
-                byId.put(hit.getId(), hit.getScore());
+                String key = documentKey(hit);
+                byKey.put(key, hit.getScore());
+                identityByKey.putIfAbsent(key, hit);
             }
-            legRawScores.add(byId);
+            legRawScores.add(byKey);
         }
         ScoreCombinationTechnique combination = SCORE_COMBINATION_FACTORY.createCombination(
             fusion.combinationTechnique(),
@@ -219,7 +232,12 @@ final class HybridFusionOrchestrator {
         // no change here. The caller already rejected techniques outside the current scope at rewrite.
         ScalarNormalizer normalizer = ScalarNormalizerFactory.create(fusion.normalizationTechnique());
         Map<String, Float> combined = CoordinatorScoreFusion.fuse(legRawScores, normalizer, combination);
-        return toRankedDocs(combined, windowSize);
+        return toRankedDocs(combined, identityByKey, windowSize);
+    }
+
+    /** Fusion key for a hit: {@code _index}-qualified when the hit carries an index, else the bare {@code _id}. */
+    private static String documentKey(SearchHit hit) {
+        return Objects.isNull(hit.getIndex()) ? hit.getId() : hit.getIndex() + KEY_SEPARATOR + hit.getId();
     }
 
     /**
@@ -259,19 +277,33 @@ final class HybridFusionOrchestrator {
         return Map.of(ScoreCombinationUtil.PARAM_NAME_WEIGHTS, weightsList);
     }
 
-    private static RankedDocs toRankedDocs(Map<String, Float> scoresById, int windowSize) {
-        List<Map.Entry<String, Float>> ranked = new ArrayList<>(scoresById.entrySet());
+    /**
+     * Rank the fused scores, cut to the window, and resolve each key back to its {@code (_index, _id)} identity via the
+     * side map — never by parsing the key. The returned {@code indices} array is null unless the window actually spans
+     * more than one index, so a single-index search keeps the leaner {@code _id}-only Top clause.
+     */
+    private static RankedDocs toRankedDocs(Map<String, Float> scoresByKey, Map<String, SearchHit> identityByKey, int windowSize) {
+        List<Map.Entry<String, Float>> ranked = new ArrayList<>(scoresByKey.entrySet());
         ranked.sort(Comparator.<Map.Entry<String, Float>>comparingDouble(e -> -e.getValue()).thenComparing(Map.Entry::getKey));
         if (ranked.size() > windowSize) {
             ranked = ranked.subList(0, windowSize);
         }
         String[] ids = new String[ranked.size()];
+        String[] indices = new String[ranked.size()];
         float[] scores = new float[ranked.size()];
+        Set<String> distinctIndices = new HashSet<>();
         for (int i = 0; i < ranked.size(); i++) {
-            ids[i] = ranked.get(i).getKey();
+            String key = ranked.get(i).getKey();
+            SearchHit hit = identityByKey.get(key);
+            // Defensive: a key always has an identity (both maps are built from the same hits), but never fall back to
+            // parsing the composite key — an _id may contain the separator.
+            ids[i] = Objects.isNull(hit) ? key : hit.getId();
+            indices[i] = Objects.isNull(hit) ? null : hit.getIndex();
             scores[i] = ranked.get(i).getValue();
+            distinctIndices.add(indices[i]);
         }
-        return new RankedDocs(ids, scores);
+        boolean needsIndexQualification = distinctIndices.size() > 1;
+        return new RankedDocs(ids, needsIndexQualification ? indices : null, scores);
     }
 
     /** The sub-query legs in their Tail form. groupLegHits fails fast on any leg failure, so every leg is present here
@@ -308,30 +340,43 @@ final class HybridFusionOrchestrator {
     }
 
     /**
-     * Single source of truth for whether a top-level fused query needs the executed Tail (the non-scoring
-     * {@code bool{should: legs}}): aggregations or highlighting need the full match set in the query phase, leg
-     * inner_hits currently require the legs registered via the Tail, and an accurate index-wide {@code total_hits}
-     * beyond the fused window needs the legs counted. {@code explain}/{@code profile} are intentionally NOT triggers —
-     * the fused score is computed on the coordinator and the Top is a {@code constant_score(ids)}, so the Lucene tree
-     * carries no fusion breakdown to explain, and profiling the Tail would only time a redundant re-execution of legs
-     * that already ran in the fan-out (fusion-aware explain/profile is scoped to a later PR).
+     * Single source of truth for whether a fused query needs the executed Tail (the non-scoring
+     * {@code bool{should: legs}}): aggregations or highlighting need the full match set in the query phase, and an
+     * accurate index-wide {@code total_hits} beyond the fused window needs the legs counted.
+     *
+     * <p>Deliberately NOT triggers:
+     * <ul>
+     *   <li>{@code explain}/{@code profile} — the fused score is computed on the coordinator and the Top is a
+     *       {@code constant_score}, so the Lucene tree carries no fusion breakdown to explain, and profiling the Tail
+     *       would only time a redundant re-execution of legs that already ran in the fan-out.</li>
+     *   <li>leg {@code inner_hits} — inner_hits are built in the fetch phase from the <i>registered</i> inner-hit
+     *       contexts per returned parent doc, so the leg never has to be executed for them to be returned. They are
+     *       carried separately (see {@link #innerHitsLegs}), which keeps a Top-only query cheap without losing them.</li>
+     * </ul>
      */
-    private static boolean needsTail(SearchSourceBuilder source, List<QueryBuilder> legs, int numRankedDocs) {
+    private static boolean needsTail(SearchSourceBuilder source, int numRankedDocs) {
         if (Objects.nonNull(source) && (Objects.nonNull(source.aggregations()) || Objects.nonNull(source.highlighter()))) {
-            return true;
-        }
-        if (legsHaveInnerHits(legs)) {
             return true;
         }
         return wantsTotalsBeyondWindow(source, numRankedDocs);
     }
 
-    private static boolean legsHaveInnerHits(List<QueryBuilder> legs) {
-        Map<String, InnerHitContextBuilder> innerHits = new HashMap<>();
+    /**
+     * The legs that declare {@code inner_hits}, in their original (un-materialized) form, for fetch-phase registration.
+     * Only legs actually carrying an inner_hits definition are kept, so the common case registers nothing. Note these are
+     * the original leg builders rather than the Tail's possibly id-materialized form — a kNN/neural leg materialized to
+     * ids has no inner_hits definition left to extract.
+     */
+    private static List<QueryBuilder> innerHitsLegs(List<QueryBuilder> legs) {
+        List<QueryBuilder> withInnerHits = new ArrayList<>();
         for (QueryBuilder leg : legs) {
+            Map<String, InnerHitContextBuilder> innerHits = new HashMap<>();
             InnerHitContextBuilder.extractInnerHits(leg, innerHits);
+            if (innerHits.isEmpty() == false) {
+                withInnerHits.add(leg);
+            }
         }
-        return innerHits.isEmpty() == false;
+        return withInnerHits;
     }
 
     private static boolean wantsTotalsBeyondWindow(SearchSourceBuilder source, int numRankedDocs) {
@@ -342,6 +387,6 @@ final class HybridFusionOrchestrator {
         return Objects.isNull(trackTotalHitsUpTo) || trackTotalHitsUpTo > numRankedDocs;
     }
 
-    private record RankedDocs(String[] ids, float[] scores) {
+    private record RankedDocs(String[] ids, String[] indices, float[] scores) {
     }
 }
