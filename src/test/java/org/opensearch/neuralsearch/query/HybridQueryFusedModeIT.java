@@ -9,6 +9,12 @@ import static org.opensearch.neuralsearch.util.AggregationsTestUtils.getNestedHi
 import java.util.List;
 import java.util.Map;
 
+import org.apache.hc.core5.http.io.entity.EntityUtils;
+import org.opensearch.client.Request;
+import org.opensearch.client.Response;
+import org.opensearch.common.xcontent.XContentHelper;
+import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.neuralsearch.BaseNeuralSearchIT;
@@ -27,6 +33,12 @@ import lombok.SneakyThrows;
 public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
 
     private static final String TEXT_FIELD = "text";
+    /** Own index: the PIT test mutates the doc set mid-test, which would break the exact hit counts asserted above. */
+    private static final String INDEX_FOR_PIT = "test-hybrid-fused-pit";
+    private static final String RANK_FIELD = "rank";
+    /** Documents in the PIT index. The fused window is bound to this count so a post-PIT doc can only enter it by
+     *  evicting a real one — which is what lets this test detect legs that ignore the PIT. */
+    private static final int PIT_DOCS = 3;
     private static final String INDEX_WITH_DEFAULT_NORM = "test-hybrid-fused-default-norm";
     private static final String INDEX_NO_PIPELINE = "test-hybrid-fused-inline-config";
     private static final String NORM_PIPELINE = "fused-mode-norm-pipeline";
@@ -130,5 +142,145 @@ public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
             assertTrue("fused score must be > 0 for a matched doc", score > 0.0);
             previous = score;
         }
+    }
+
+    /**
+     * A user-supplied point-in-time must be honored by the whole fused flow, legs included.
+     *
+     * <p>Fused mode opens N leg searches plus the round-2 self-erased query, so without a shared view those are N+1
+     * independent reader instants and a concurrently indexed document can appear in some of them but not others. Passing
+     * the request's PIT down to every leg makes them all read one immutable snapshot.
+     *
+     * <p>The probe: take a PIT, then index a document that ranks ABOVE everything already there. Through the PIT it must
+     * stay invisible, while a live search sees it.
+     *
+     * <p>Three details make this a real regression guard rather than a tautology:
+     * <ul>
+     *   <li>Both legs score by a numeric field via {@code function_score}, so the fused order is exactly the field order —
+     *       deterministic and shard-independent, unlike BM25 (whose min_max floor can actually sink a newly added short
+     *       document to the BOTTOM of a leg, which would hide the defect entirely).</li>
+     *   <li>{@code window_size} is bound to the existing document count, so a document that should be invisible can only
+     *       enter the window by evicting a real one.</li>
+     *   <li>The query is Top-only ({@code track_total_hits:false}); with the Tail present the legs would be re-matched
+     *       directly and return the real documents regardless of what the Top holds, masking the defect.</li>
+     * </ul>
+     * Top-only, the returned hits ARE the fused window: if the legs ignored the PIT they would rank the new document in,
+     * round-2 would read the PIT, fail to match that id, and the request would return FEWER hits than the window holds.
+     * Verified by mutation — removing the PIT passthrough from the legs makes this test fail with 2 hits instead of 3.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenPointInTimeSupplied_thenLegsAndRoundTwoShareOneSnapshot() {
+        if (indexExists(INDEX_FOR_PIT) == false) {
+            createIndex(INDEX_FOR_PIT, indexConfigWithRankField());
+            for (int id = 1; id <= PIT_DOCS; id++) {
+                indexRankedDoc(id, id * 10);
+            }
+        }
+        String pitId = createPointInTime(INDEX_FOR_PIT);
+        try {
+            assertEquals("the Top-only fused window holds every document", PIT_DOCS, getHitCount(searchWithPit(pitId)));
+
+            // A document that outranks everything present, so live legs would put it at the head of the window.
+            indexRankedDoc(PIT_DOCS + 1, 100_000);
+
+            Map<String, Object> throughPit = searchWithPit(pitId);
+            assertEquals(
+                "PIT snapshot must not see the doc indexed after it was taken, and no window slot may be lost to it",
+                PIT_DOCS,
+                getHitCount(throughPit)
+            );
+            for (Map<String, Object> hit : getNestedHits(throughPit)) {
+                assertNotEquals("the post-PIT doc must not leak into the fused window", String.valueOf(PIT_DOCS + 1), hit.get("_id"));
+            }
+
+            // Sanity: a live search does rank it first, so the assertions above are about the snapshot — not about the
+            // document failing to index or to match the legs.
+            List<Map<String, Object>> liveHits = getNestedHits(searchLive());
+            assertEquals("a live search ranks the new doc first", String.valueOf(PIT_DOCS + 1), liveHits.get(0).get("_id"));
+        } finally {
+            deletePointInTime(pitId);
+        }
+    }
+
+    private String indexConfigWithRankField() {
+        return "{\"settings\":{\"number_of_shards\":3,\"number_of_replicas\":0},\"mappings\":{\"properties\":{\""
+            + RANK_FIELD
+            + "\":{\"type\":\"integer\"}}}}";
+    }
+
+    @SneakyThrows
+    private void indexRankedDoc(int id, int rank) {
+        Request request = new Request("PUT", "/" + INDEX_FOR_PIT + "/_doc/" + id + "?refresh=true");
+        request.setJsonEntity("{\"" + RANK_FIELD + "\":" + rank + "}");
+        Response response = client().performRequest(request);
+        int code = response.getStatusLine().getStatusCode();
+        assertTrue("indexing doc " + id + " failed: " + code, code == RestStatus.OK.getStatus() || code == RestStatus.CREATED.getStatus());
+    }
+
+    /** Open a point-in-time over the index and return its id. */
+    @SneakyThrows
+    private String createPointInTime(String index) {
+        Request request = new Request("POST", "/" + index + "/_search/point_in_time?keep_alive=5m");
+        Response response = client().performRequest(request);
+        assertEquals(RestStatus.OK, RestStatus.fromCode(response.getStatusLine().getStatusCode()));
+        Map<String, Object> body = XContentHelper.convertToMap(
+            XContentType.JSON.xContent(),
+            EntityUtils.toString(response.getEntity()),
+            false
+        );
+        String pitId = (String) body.get("pit_id");
+        assertNotNull("pit_id must be returned", pitId);
+        return pitId;
+    }
+
+    @SneakyThrows
+    private void deletePointInTime(String pitId) {
+        Request request = new Request("DELETE", "/_search/point_in_time");
+        request.setJsonEntity("{\"pit_id\":[\"" + pitId + "\"]}");
+        client().performRequest(request);
+    }
+
+    /** Two legs that both score by the numeric rank field, so the fused order is exactly the rank order. */
+    private String rankedFusedQuery() {
+        String leg = "{\"function_score\":{\"query\":{\"match_all\":{}},\"field_value_factor\":{\"field\":\""
+            + RANK_FIELD
+            + "\",\"modifier\":\"none\",\"missing\":1}}}";
+        return "{\"hybrid\":{\"fusion\":{\"window_size\":"
+            + PIT_DOCS
+            + ",\"normalization\":{\"technique\":\"min_max\"},"
+            + "\"combination\":{\"technique\":\"arithmetic_mean\"}},"
+            + "\"queries\":["
+            + leg
+            + ","
+            + leg
+            + "]}}";
+    }
+
+    /**
+     * Fused search against a PIT, Top-only. The index deliberately does NOT appear in the path: a PIT already pins its own
+     * indices and core rejects a PIT request that also names them.
+     */
+    @SneakyThrows
+    private Map<String, Object> searchWithPit(String pitId) {
+        return searchRaw(
+            "/_search",
+            "{\"pit\":{\"id\":\"" + pitId + "\",\"keep_alive\":\"5m\"},\"track_total_hits\":false,\"query\":" + rankedFusedQuery() + "}"
+        );
+    }
+
+    /** The same fused query without a PIT, for the live-visibility contrast. */
+    @SneakyThrows
+    private Map<String, Object> searchLive() {
+        return searchRaw("/" + INDEX_FOR_PIT + "/_search", "{\"track_total_hits\":false,\"query\":" + rankedFusedQuery() + "}");
+    }
+
+    @SneakyThrows
+    private Map<String, Object> searchRaw(String endpoint, String jsonBody) {
+        Request request = new Request("POST", endpoint);
+        request.addParameter("size", "10");
+        request.setJsonEntity(jsonBody);
+        Response response = client().performRequest(request);
+        assertEquals(RestStatus.OK, RestStatus.fromCode(response.getStatusLine().getStatusCode()));
+        return XContentHelper.convertToMap(XContentType.JSON.xContent(), EntityUtils.toString(response.getEntity()), false);
     }
 }
