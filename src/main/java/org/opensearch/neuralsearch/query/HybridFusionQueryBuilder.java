@@ -54,6 +54,16 @@ import org.opensearch.index.query.TermQueryBuilder;
  * is therefore what gets executed, while {@code innerHitsQueries} is what gets registered; the two are populated
  * independently, which lets a Top-only query still return leg inner_hits without paying to re-run the legs.
  *
+ * <p><b>{@code collapse} semantics.</b> Collapse <i>grouping</i> is identical to classic hybrid — it is a plain
+ * query-phase operation over the fused ranking. {@code collapse.inner_hits} scores differ from classic, in fused mode's
+ * favour: core's {@code ExpandSearchPhase} re-runs {@code source().query()} per group, which here is this self-erased
+ * query, so every expanded member is scored by its own Top clause and therefore carries <b>its own fused score</b> —
+ * on the same scale as the group representative, and equal to the score it would receive in the ungrouped fused search.
+ * Classic instead re-runs the real sub-queries and reports their <b>raw, un-normalized</b> scores, which are on a
+ * different scale from the representative's normalized score (e.g. representative {@code 1.0} beside members
+ * {@code 198.0}). Leg-level {@code inner_hits} (a {@code nested}/{@code has_child} sub-query with its own
+ * {@code inner_hits} block) match classic exactly, because core re-runs the inner query there rather than the parent.
+ *
  * <p>This query is created internally by the coordinator self-erase and is never parseable from a search request. Its
  * wire form needs no version gate: the whole query type is new in the same version that introduced fused mode, and a
  * node predating that version cannot resolve this {@code NamedWriteable} name at all — so it fails on the query name

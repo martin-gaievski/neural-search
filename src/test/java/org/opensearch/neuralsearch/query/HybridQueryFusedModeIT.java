@@ -6,6 +6,7 @@ package org.opensearch.neuralsearch.query;
 
 import static org.opensearch.neuralsearch.util.AggregationsTestUtils.getNestedHits;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -39,6 +40,11 @@ public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
     /** Documents in the PIT index. The fused window is bound to this count so a post-PIT doc can only enter it by
      *  evicting a real one — which is what lets this test detect legs that ignore the PIT. */
     private static final int PIT_DOCS = 3;
+    /** Own index: collapse needs a low-cardinality keyword to group on, which the text-only indices above lack. */
+    private static final String INDEX_FOR_COLLAPSE = "test-hybrid-fused-collapse";
+    private static final String GRP_FIELD = "grp";
+    private static final int COLLAPSE_GROUPS = 2;
+    private static final int DOCS_PER_GROUP = 2;
     private static final String INDEX_WITH_DEFAULT_NORM = "test-hybrid-fused-default-norm";
     private static final String INDEX_NO_PIPELINE = "test-hybrid-fused-inline-config";
     private static final String NORM_PIPELINE = "fused-mode-norm-pipeline";
@@ -282,5 +288,159 @@ public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
         Response response = client().performRequest(request);
         assertEquals(RestStatus.OK, RestStatus.fromCode(response.getStatusLine().getStatusCode()));
         return XContentHelper.convertToMap(XContentType.JSON.xContent(), EntityUtils.toString(response.getEntity()), false);
+    }
+
+    /**
+     * Collapse GROUPING over a fused query must match classic hybrid exactly — it is a plain query-phase operation over
+     * the fused ranking, with no fused-specific handling. This is a real parity guard, not a limitation pin.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenCollapse_thenGroupingMatchesClassic() {
+        ensureCollapseDataset();
+        String collapse = "\"collapse\":{\"field\":\"" + GRP_FIELD + "\"}";
+
+        List<Map<String, Object>> fusedHits = getNestedHits(
+            searchRaw("/" + INDEX_FOR_COLLAPSE + "/_search", "{\"query\":" + collapseFusedQuery() + "," + collapse + "}")
+        );
+        List<Map<String, Object>> classicHits = getNestedHits(
+            searchRaw("/" + INDEX_FOR_COLLAPSE + "/_search", "{\"query\":" + collapseClassicQuery() + "," + collapse + "}")
+        );
+
+        assertEquals("collapse yields one hit per group", COLLAPSE_GROUPS, fusedHits.size());
+        assertEquals("fused and classic collapse to the same number of groups", classicHits.size(), fusedHits.size());
+        // Same groups, in the same order, represented by the same documents.
+        for (int i = 0; i < fusedHits.size(); i++) {
+            assertEquals("group key order matches classic", collapseKey(classicHits.get(i)), collapseKey(fusedHits.get(i)));
+            assertEquals("group representative matches classic", classicHits.get(i).get("_id"), fusedHits.get(i).get("_id"));
+        }
+    }
+
+    /**
+     * With {@code collapse.inner_hits}, every expanded member carries ITS OWN fused score — the same score it receives in
+     * the ungrouped fused search, on the same scale as the group representative.
+     *
+     * <p>Core's {@code ExpandSearchPhase} re-runs {@code source().query()} once per collapse group. For a fused request
+     * that query is the self-erased Top, where each ranked document has its own {@code constant_score} clause, so each
+     * member is scored by its own clause rather than the representative's.
+     *
+     * <p>This differs from classic hybrid, which re-runs the real sub-queries and reports their raw, un-normalized scores
+     * — putting members on a different scale from the representative (classic yields a representative at {@code 1.0}
+     * beside members at {@code 198.0}). Fused is self-consistent instead, which is why this asserts the fused values
+     * rather than classic parity. Leg-level {@code inner_hits} do match classic exactly and are covered separately.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenCollapseInnerHits_thenMembersCarryTheirOwnFusedScore() {
+        ensureCollapseDataset();
+
+        // Ground truth: the fused score each document receives with no collapse applied.
+        Map<String, Double> fusedScoreById = new HashMap<>();
+        for (Map<String, Object> hit : getNestedHits(
+            searchRaw("/" + INDEX_FOR_COLLAPSE + "/_search", "{\"query\":" + collapseFusedQuery() + "}")
+        )) {
+            fusedScoreById.put((String) hit.get("_id"), ((Number) hit.get("_score")).doubleValue());
+        }
+        assertEquals("every document is fused", COLLAPSE_GROUPS * DOCS_PER_GROUP, fusedScoreById.size());
+
+        String body = "{\"query\":"
+            + collapseFusedQuery()
+            + ",\"collapse\":{\"field\":\""
+            + GRP_FIELD
+            + "\",\"inner_hits\":{\"name\":\"members\",\"size\":10}}}";
+
+        List<Map<String, Object>> groups = getNestedHits(searchRaw("/" + INDEX_FOR_COLLAPSE + "/_search", body));
+
+        assertEquals(COLLAPSE_GROUPS, groups.size());
+        for (Map<String, Object> group : groups) {
+            List<Map<String, Object>> members = innerHits(group, "members");
+            assertEquals("each group expands to all of its documents", DOCS_PER_GROUP, members.size());
+            for (Map<String, Object> member : members) {
+                String memberId = (String) member.get("_id");
+                assertEquals(
+                    "expanded member " + memberId + " must carry its own fused score, not the representative's",
+                    fusedScoreById.get(memberId),
+                    ((Number) member.get("_score")).doubleValue(),
+                    1e-6
+                );
+            }
+            // The representative is the group's best-scoring member, consistent with the fused ranking.
+            double representativeScore = ((Number) group.get("_score")).doubleValue();
+            for (Map<String, Object> member : members) {
+                assertTrue(
+                    "no member may outrank its group representative",
+                    ((Number) member.get("_score")).doubleValue() <= representativeScore + 1e-6
+                );
+            }
+        }
+    }
+
+    private String indexConfigWithGroupField() {
+        return "{\"settings\":{\"number_of_shards\":2,\"number_of_replicas\":0,\"index.search.default_pipeline\":\""
+            + NORM_PIPELINE
+            + "\"},\"mappings\":{\"properties\":{\""
+            + GRP_FIELD
+            + "\":{\"type\":\"keyword\"},\""
+            + RANK_FIELD
+            + "\":{\"type\":\"integer\"}}}}";
+    }
+
+    @SneakyThrows
+    private void ensureCollapseDataset() {
+        // Classic hybrid needs a normalization pipeline; the index default supplies it for the comparison test.
+        createSearchPipeline(NORM_PIPELINE, "min_max", "arithmetic_mean", Map.of());
+        if (indexExists(INDEX_FOR_COLLAPSE)) {
+            return;
+        }
+        createIndex(INDEX_FOR_COLLAPSE, indexConfigWithGroupField());
+        int id = 1;
+        for (int group = 0; group < COLLAPSE_GROUPS; group++) {
+            for (int member = 0; member < DOCS_PER_GROUP; member++) {
+                Request request = new Request("PUT", "/" + INDEX_FOR_COLLAPSE + "/_doc/" + id + "?refresh=true");
+                // Distinct ranks so both the fused order and the per-group representative are deterministic.
+                request.setJsonEntity("{\"" + GRP_FIELD + "\":\"g" + group + "\",\"" + RANK_FIELD + "\":" + (100 - id) + "}");
+                Response response = client().performRequest(request);
+                int code = response.getStatusLine().getStatusCode();
+                assertTrue(
+                    "indexing doc " + id + " failed: " + code,
+                    code == RestStatus.OK.getStatus() || code == RestStatus.CREATED.getStatus()
+                );
+                id++;
+            }
+        }
+    }
+
+    /** Two legs scoring by the numeric rank field, so the fused order is deterministic and shard-independent. */
+    private String collapseLeg() {
+        return "{\"function_score\":{\"query\":{\"match_all\":{}},\"field_value_factor\":{\"field\":\""
+            + RANK_FIELD
+            + "\",\"modifier\":\"none\",\"missing\":1}}}";
+    }
+
+    private String collapseFusedQuery() {
+        return "{\"hybrid\":{\"fusion\":{\"normalization\":{\"technique\":\"min_max\"},"
+            + "\"combination\":{\"technique\":\"arithmetic_mean\"}},"
+            + "\"queries\":["
+            + collapseLeg()
+            + ","
+            + collapseLeg()
+            + "]}}";
+    }
+
+    private String collapseClassicQuery() {
+        return "{\"hybrid\":{\"queries\":[" + collapseLeg() + "," + collapseLeg() + "]}}";
+    }
+
+    @SuppressWarnings("unchecked")
+    private String collapseKey(Map<String, Object> hit) {
+        List<Object> fields = (List<Object>) ((Map<String, Object>) hit.get("fields")).get(GRP_FIELD);
+        return String.valueOf(fields.get(0));
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> innerHits(Map<String, Object> hit, String name) {
+        Map<String, Object> inner = (Map<String, Object>) hit.get("inner_hits");
+        assertNotNull("collapse.inner_hits must be present", inner);
+        Map<String, Object> named = (Map<String, Object>) inner.get(name);
+        Map<String, Object> hits = (Map<String, Object>) named.get("hits");
+        return (List<Map<String, Object>>) hits.get("hits");
     }
 }

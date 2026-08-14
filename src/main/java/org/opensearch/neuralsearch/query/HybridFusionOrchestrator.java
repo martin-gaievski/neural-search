@@ -235,7 +235,17 @@ final class HybridFusionOrchestrator {
         return toRankedDocs(combined, identityByKey, windowSize);
     }
 
-    /** Fusion key for a hit: {@code _index}-qualified when the hit carries an index, else the bare {@code _id}. */
+    /**
+     * Fusion key for a hit: {@code _index}-qualified when the hit carries an index, else the bare {@code _id}.
+     *
+     * <p>Limitation in custom routing. {@code _index} + {@code _id} is not a total identity when custom routing is
+     * used: the same {@code _id} can be written to different shards of one index under different routing values, giving
+     * two genuinely distinct documents that share this key and are therefore fused as one. Qualifying further is not
+     * possible from here — a leg's {@link SearchHit} exposes {@link SearchHit#getShard()} but no routing value, so the
+     * coordinator has nothing to add to the key, and the {@code _routing} metadata field (queryable in principle) would
+     * first have to be fetched per leg hit, which the id-only leg deliberately does not do. One possible way to resolve this
+     * is leg-fetch.
+     */
     private static String documentKey(SearchHit hit) {
         return Objects.isNull(hit.getIndex()) ? hit.getId() : hit.getIndex() + KEY_SEPARATOR + hit.getId();
     }
