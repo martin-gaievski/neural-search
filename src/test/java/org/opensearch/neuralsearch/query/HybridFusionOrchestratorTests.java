@@ -8,15 +8,20 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.lucene.search.TotalHits;
+import org.opensearch.ExceptionsHelper;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.action.search.MultiSearchRequest;
 import org.opensearch.action.search.MultiSearchResponse;
+import org.opensearch.action.search.SearchPhaseExecutionException;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchResponseSections;
 import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.action.OriginalIndices;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.query.ConstantScoreQueryBuilder;
 import org.opensearch.search.SearchShardTarget;
 import org.opensearch.index.query.BoolQueryBuilder;
@@ -77,6 +82,11 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
 
     private MultiSearchResponse.Item failedItem() {
         return new MultiSearchResponse.Item(null, new RuntimeException("leg boom"));
+    }
+
+    /** A wholly-failed leg whose failure carries a specific status, the way a real sub-search failure does. */
+    private MultiSearchResponse.Item failedItemWithCause(Exception cause) {
+        return new MultiSearchResponse.Item(null, cause);
     }
 
     /** A SUCCESSFUL MultiSearch item that lost a shard under allow_partial=true: HTTP 200, fewer hits, non-empty
@@ -227,8 +237,8 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
         MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f, "2", 0.5f)), failedItem());
 
-        IllegalStateException e = expectThrows(
-            IllegalStateException.class,
+        OpenSearchStatusException e = expectThrows(
+            OpenSearchStatusException.class,
             () -> HybridFusionOrchestrator.buildFusedQuery(
                 new SearchSourceBuilder().trackTotalHits(false),
                 ms,
@@ -240,6 +250,8 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         assertTrue("reports the failing leg index", e.getMessage().contains("fused-mode sub-query 1 failed"));
         assertNotNull("chains the leg failure as cause", e.getCause());
         assertTrue(e.getCause().getMessage().contains("leg boom"));
+        // A bare RuntimeException really is a server error, so 500 here is the derived status, not a default.
+        assertEquals(RestStatus.INTERNAL_SERVER_ERROR, e.status());
     }
 
     public void testBuildFusedQuery_whenAllLegsFailed_thenFailsFast() {
@@ -247,12 +259,55 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
         MultiSearchResponse ms = multiSearch(failedItem(), failedItem());
 
-        IllegalStateException e = expectThrows(
-            IllegalStateException.class,
+        OpenSearchStatusException e = expectThrows(
+            OpenSearchStatusException.class,
             () -> HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, minMaxArithmetic(), 10)
         );
         assertTrue(e.getMessage().contains("fused-mode sub-query 0 failed"));
         assertNotNull(e.getCause());
+    }
+
+    /**
+     * A leg failure must keep the status the leg itself reported. The user's own mistake — say a malformed range bound,
+     * which classic hybrid answers with 400 {@code query_shard_exception} — was arriving as a 500 because the wrapper was
+     * an {@code IllegalStateException} and {@code ExceptionsHelper#status} has no case for it, leaving the real status
+     * reachable only under {@code caused_by}.
+     */
+    public void testBuildFusedQuery_whenLegFailedWithClientError_thenStatusStaysBadRequest() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(
+            legItem(Map.of("1", 0.9f)),
+            failedItemWithCause(
+                new SearchPhaseExecutionException(
+                    "query",
+                    "all shards failed",
+                    new ShardSearchFailure[] { new ShardSearchFailure(new IllegalArgumentException("bad range bound")) }
+                )
+            )
+        );
+
+        OpenSearchStatusException e = expectThrows(
+            OpenSearchStatusException.class,
+            () -> HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, minMaxArithmetic(), 10)
+        );
+        assertEquals("the leg's own 400 must survive the wrapper", RestStatus.BAD_REQUEST, e.status());
+        assertEquals("and the status a REST layer derives must agree", RestStatus.BAD_REQUEST, ExceptionsHelper.status(e));
+    }
+
+    /** Same for a queue rejection: masking 429 as 500 means a client's retry-on-429 never fires. */
+    public void testBuildFusedQuery_whenLegRejected_thenStatusStaysTooManyRequests() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(
+            legItem(Map.of("1", 0.9f)),
+            failedItemWithCause(new OpenSearchRejectedExecutionException("search queue full"))
+        );
+
+        OpenSearchStatusException e = expectThrows(
+            OpenSearchStatusException.class,
+            () -> HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, minMaxArithmetic(), 10)
+        );
+        assertEquals(RestStatus.TOO_MANY_REQUESTS, e.status());
+        assertEquals(RestStatus.TOO_MANY_REQUESTS, ExceptionsHelper.status(e));
     }
 
     public void testBuildFusedQuery_whenLegPartiallyFailed_thenFusedWithWarning() {

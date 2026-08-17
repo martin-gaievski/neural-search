@@ -20,6 +20,8 @@ import org.apache.commons.lang3.builder.EqualsBuilder;
 import org.apache.lucene.search.BooleanClause.Occur;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
+import org.opensearch.ExceptionsHelper;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.SetOnce;
@@ -525,10 +527,12 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                         listener.onFailure(e);
                     }
                     // Whole-MultiSearch transport failure (cancellation, rejection, coordinator error) — not a per-leg
-                    // Item failure. Frame it as the user's hybrid/fused query rather than surfacing a bare multiSearch error.
+                    // Item failure. Frame it as the user's hybrid/fused query rather than surfacing a bare multiSearch
+                    // error, but keep the underlying status: a cancellation, a rejection and a coordinator bug are three
+                    // different answers, and IllegalStateException collapses all of them to 500.
                 },
                     e -> listener.onFailure(
-                        new IllegalStateException(
+                        new OpenSearchStatusException(
                             String.format(
                                 Locale.ROOT,
                                 "[%s] query [%s] failed to execute fused-mode sub-queries: %s",
@@ -536,6 +540,7 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                                 FUSION_FIELD.getPreferredName(),
                                 e.getMessage()
                             ),
+                            ExceptionsHelper.status(e),
                             e
                         )
                     )

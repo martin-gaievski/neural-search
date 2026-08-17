@@ -13,6 +13,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 
+import org.opensearch.ExceptionsHelper;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.action.search.MultiSearchRequest;
 import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
@@ -131,8 +133,17 @@ final class HybridFusionOrchestrator {
         for (int leg = 0; leg < legCount; leg++) {
             MultiSearchResponse.Item item = items[leg];
             if (item.isFailure()) {
-                throw new IllegalStateException(
+                // Carry the leg's own status instead of inventing one. A malformed query bound is the user's 400, a
+                // queue rejection is a retryable 429, a cluster block is a 403 — and ExceptionsHelper.status has no
+                // IllegalStateException case, so wrapping in one turned every leg failure into a 500 with the real
+                // status buried under caused_by: a client's retry-on-429 never fired and a bad request read as a
+                // server bug. SearchPhaseExecutionException#status derives from its shard failures and
+                // OpenSearchException#status unwraps transport wrappers, so the leg's own failure carries the right
+                // code with no unwrapping here. The message is passed with no format args, so LoggerMessageFormat
+                // returns it verbatim and a stray {} inside the leg's message cannot mangle it.
+                throw new OpenSearchStatusException(
                     String.format(Locale.ROOT, "[hybrid] fused-mode sub-query %d failed: %s", leg, item.getFailureMessage()),
+                    ExceptionsHelper.status(item.getFailure()),
                     item.getFailure()
                 );
             }

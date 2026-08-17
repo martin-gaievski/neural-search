@@ -975,9 +975,10 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
     }
 
     @SneakyThrows
-    public void testDoRewriteFused_whenMultiSearchTransportFails_thenErrorIsHybridFramed() {
+    public void testDoRewriteFused_whenMultiSearchTransportFails_thenErrorIsHybridFramedAndKeepsStatus() {
         // Whole-MultiSearch transport failure (not a per-leg Item failure) is reframed as the user's hybrid/fused query
-        // instead of surfacing a bare multiSearch error.
+        // instead of surfacing a bare multiSearch error — while keeping the underlying status, so a rejected fan-out is
+        // still the retryable 429 it was and not an opaque 500.
         initClusterUtilWithMaxResultWindow(10000);
         HybridQueryBuilder builder = fusedBuilder(
             new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"), "combination", Map.of("technique", "arithmetic_mean")))
@@ -996,7 +997,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         org.opensearch.transport.client.Client client = mock(org.opensearch.transport.client.Client.class);
         doAnswer(invocation -> {
             org.opensearch.core.action.ActionListener<org.opensearch.action.search.MultiSearchResponse> l = invocation.getArgument(1);
-            l.onFailure(new RuntimeException("msearch rejected"));
+            l.onFailure(new org.opensearch.core.concurrency.OpenSearchRejectedExecutionException("msearch rejected"));
             return null;
         }).when(client).multiSearch(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
 
@@ -1005,6 +1006,11 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         assertNotNull(failure.get());
         assertThat(failure.get().getMessage(), containsString("failed to execute fused-mode sub-queries"));
         assertThat(failure.get().getMessage(), containsString("msearch rejected"));
+        assertEquals(
+            "a rejected fan-out must stay a 429 so client retry-on-429 fires",
+            org.opensearch.core.rest.RestStatus.TOO_MANY_REQUESTS,
+            org.opensearch.ExceptionsHelper.status(failure.get())
+        );
     }
 
     /** Initialize NeuralSearchClusterUtil so getIndexMetadataList resolves the given number of concrete indices. */

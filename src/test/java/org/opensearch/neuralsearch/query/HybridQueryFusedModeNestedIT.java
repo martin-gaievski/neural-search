@@ -12,6 +12,7 @@ import java.util.Map;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
+import org.opensearch.client.ResponseException;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.rest.RestStatus;
@@ -97,8 +98,12 @@ public class HybridQueryFusedModeNestedIT extends BaseNeuralSearchIT {
 
     /** A fused hybrid: presence of the {@code fusion} block enables the resolver; {@code window_size} lives inside it. */
     private String fusedHybrid() {
+        return fusedHybrid(WINDOW_SIZE);
+    }
+
+    private String fusedHybrid(int windowSize) {
         return "{\"hybrid\":{\"fusion\":{\"window_size\":"
-            + WINDOW_SIZE
+            + windowSize
             + ",\"normalization\":{\"technique\":\"min_max\"},"
             + "\"combination\":{\"technique\":\"arithmetic_mean\",\"parameters\":{\"weights\":[0.5,0.5]}}},"
             + "\"queries\":["
@@ -252,7 +257,48 @@ public class HybridQueryFusedModeNestedIT extends BaseNeuralSearchIT {
         );
     }
 
+    /**
+     * A nested leg's rejection must reach the user as the 400 it is. The leg runs as its own search, so its refusal
+     * arrives at the enclosing coordinator as a MultiSearch item failure; wrapping that in an {@code IllegalStateException}
+     * made every leg-side rejection a 500 with the real status reachable only under {@code caused_by} — a fused hybrid
+     * answered a plain user error the way it would answer a bug, and the same masking hit 429s and cluster blocks.
+     */
+    @SneakyThrows
+    public void testFused_whenNestedLegRejects_thenBadRequestNotServerError() {
+        ensureDataset();
+        // The inner window_size exceeds index.max_result_window, so the inner level refuses it during its own rewrite.
+        String body = "{\"query\":{\"hybrid\":{\"fusion\":{\"window_size\":"
+            + WINDOW_SIZE
+            + ",\"normalization\":{\"technique\":\"min_max\"},"
+            + "\"combination\":{\"technique\":\"arithmetic_mean\",\"parameters\":{\"weights\":[0.5,0.5]}}},"
+            + "\"queries\":["
+            + fusedHybrid(20000)
+            + ","
+            + leg()
+            + "]}}}";
+
+        ResponseException e = expectThrows(ResponseException.class, () -> searchRawExpectingFailure(body));
+
+        assertEquals(
+            "a leg-side rejection is the user's 400, not a 500",
+            RestStatus.BAD_REQUEST.getStatus(),
+            e.getResponse().getStatusLine().getStatusCode()
+        );
+        assertTrue(
+            "and the response names the real cause rather than an illegal_state_exception",
+            EntityUtils.toString(e.getResponse().getEntity()).contains("max_result_window")
+        );
+    }
+
     // ------------------------------------------------ helpers ------------------------------------------------
+
+    @SneakyThrows
+    private void searchRawExpectingFailure(String jsonBody) {
+        Request request = new Request("POST", "/" + INDEX + "/_search");
+        request.setJsonEntity(jsonBody);
+        request.addParameter("size", "20");
+        client().performRequest(request);
+    }
 
     @SneakyThrows
     private Map<String, Object> searchRaw(String jsonBody, int size) {
