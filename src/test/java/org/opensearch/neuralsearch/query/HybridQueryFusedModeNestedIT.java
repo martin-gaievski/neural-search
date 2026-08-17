@@ -219,6 +219,39 @@ public class HybridQueryFusedModeNestedIT extends BaseNeuralSearchIT {
         assertFalse("fusion-of-fusion must return hits", ids.isEmpty());
     }
 
+    /**
+     * Fusion of fusion where NEITHER level carries an inline config — both read the index's default pipeline. Legs are
+     * fanned out with the search pipeline disabled (so per-leg processors do not run), so the nested fused hybrid has no
+     * pipeline of its own to read and depends on the enclosing rewrite projecting the config it already resolved.
+     * Without that projection this fails claiming no normalization processor is configured — on an index that has one.
+     */
+    @SneakyThrows
+    public void testFused_hybridNestedInHybrid_whenBothLevelsConfigFromPipeline_thenResolves() {
+        ensureDataset();
+        String pipelineConfiguredHybrid = "{\"hybrid\":{\"fusion\":{\"window_size\":"
+            + WINDOW_SIZE
+            + "},\"queries\":["
+            + leg()
+            + ","
+            + leg()
+            + "]}}";
+        String body = "{\"query\":{\"hybrid\":{\"fusion\":{\"window_size\":"
+            + WINDOW_SIZE
+            + "},\"queries\":["
+            + pipelineConfiguredHybrid
+            + ","
+            + leg()
+            + "]}}}";
+
+        List<String> ids = hitIds(searchRaw(body, 20));
+
+        assertFalse("a nested fused hybrid must resolve its config from the index default pipeline", ids.isEmpty());
+        assertTrue(
+            "fused window (grp A) ranks first",
+            ids.subList(0, Math.min(WINDOW_SIZE, ids.size())).stream().allMatch(id -> Integer.parseInt(id) <= WINDOW_LAST_ID)
+        );
+    }
+
     // ------------------------------------------------ helpers ------------------------------------------------
 
     @SneakyThrows

@@ -749,6 +749,93 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         assertThat(e.getMessage(), containsString("requires a normalization or score-ranker processor"));
     }
 
+    /** An outer fused hybrid whose first leg is itself a fused hybrid taking its config from the pipeline. */
+    private HybridQueryBuilder outerWithNestedFusedLeg() {
+        HybridQueryBuilder nested = new HybridQueryBuilder();
+        nested.add(new MatchQueryBuilder(TEXT_FIELD_NAME, "inner-a"));
+        nested.add(new MatchQueryBuilder(TEXT_FIELD_NAME, "inner-b"));
+        nested.fusion(new HashMap<>()); // fusion:{} → no inline config, must come from the pipeline
+        HybridQueryBuilder outer = new HybridQueryBuilder();
+        outer.add(nested);
+        outer.add(QueryBuilders.termQuery(TEXT_FIELD_NAME, TERM_QUERY_TEXT));
+        outer.fusion(new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"))));
+        return outer;
+    }
+
+    @SneakyThrows
+    public void testProjectResolvedConfigOntoLegs_projectsOnlyFusedLegsWithoutInlineConfig() {
+        FusionSpec resolved = new FusionSpec(FusionSpec.TECHNIQUE_ARITHMETIC_MEAN, FusionSpec.NORMALIZATION_MIN_MAX, 60, new float[0]);
+
+        // A fused leg with no inline config is substituted by an equal-but-distinct copy carrying the resolved config.
+        List<QueryBuilder> legs = outerWithNestedFusedLeg().queries();
+        List<QueryBuilder> projected = HybridQueryBuilder.projectResolvedConfigOntoLegs(legs, resolved);
+        assertNotSame("a projectable leg forces a new list", legs, projected);
+        assertNotSame("the fused leg is replaced by a copy", legs.get(0), projected.get(0));
+        assertEquals("the copy is wire/equality-identical to the original leg", legs.get(0), projected.get(0));
+        assertSame("non-hybrid legs are left alone", legs.get(1), projected.get(1));
+
+        // Nothing to project: an inline-config fused leg and a plain leg both stay put, and the list is not copied.
+        HybridQueryBuilder inlineNested = new HybridQueryBuilder();
+        inlineNested.add(new MatchQueryBuilder(TEXT_FIELD_NAME, "inner"));
+        inlineNested.fusion(new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"))));
+        List<QueryBuilder> noneProjectable = List.of(inlineNested, QueryBuilders.termQuery(TEXT_FIELD_NAME, TERM_QUERY_TEXT));
+        assertSame(
+            "no projectable leg → the original list is reused",
+            noneProjectable,
+            HybridQueryBuilder.projectResolvedConfigOntoLegs(noneProjectable, resolved)
+        );
+    }
+
+    @SneakyThrows
+    public void testDoRewriteFused_whenNestedFusedLegOnPipelineDisabledLegRequest_thenInheritsResolvedConfig() {
+        // The blocker: legs are fanned out with pipeline=_none so per-leg processors do not run, so a nested fused
+        // hybrid could resolve no config from its own leg request and failed claiming the user had no pipeline.
+        // Drive the REAL leg-request builder, then rewrite the nested leg exactly as the leg sub-search would.
+        initClusterUtilWithNoPipeline();
+        HybridQueryBuilder outer = outerWithNestedFusedLeg();
+        SearchRequest userRequest = new SearchRequest("test-index").source(new SearchSourceBuilder().query(outer))
+            .pipeline("norm-pipeline");
+        FusionSpec resolved = new FusionSpec(FusionSpec.TECHNIQUE_ARITHMETIC_MEAN, FusionSpec.NORMALIZATION_MIN_MAX, 60, new float[0]);
+
+        org.opensearch.action.search.MultiSearchRequest fannedOut = HybridFusionOrchestrator.buildLegMultiSearch(
+            userRequest,
+            HybridQueryBuilder.projectResolvedConfigOntoLegs(outer.queries(), resolved),
+            10
+        );
+        SearchRequest legRequest = fannedOut.requests().get(0);
+        assertEquals("leg sub-searches run with the search pipeline disabled", "_none", legRequest.pipeline());
+
+        QueryCoordinatorContext legCtx = mock(QueryCoordinatorContext.class);
+        when(legCtx.convertToCoordinatorContext()).thenReturn(legCtx);
+        when(legCtx.getSearchRequest()).thenReturn(legRequest);
+        java.util.concurrent.atomic.AtomicInteger asyncRegistered = new java.util.concurrent.atomic.AtomicInteger();
+        doAnswer(invocation -> {
+            asyncRegistered.incrementAndGet();
+            return null;
+        }).when(legCtx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+
+        QueryBuilder rewritten = legRequest.source().query().rewrite(legCtx);
+
+        assertEquals("the nested fused leg fans out its own legs instead of failing", 1, asyncRegistered.get());
+        assertTrue(rewritten instanceof HybridQueryBuilder);
+
+        // Negative control: the same nested leg WITHOUT the projected config still cannot resolve, and now says why.
+        org.opensearch.action.search.MultiSearchRequest unprojected = HybridFusionOrchestrator.buildLegMultiSearch(
+            userRequest,
+            outer.queries(),
+            10
+        );
+        QueryCoordinatorContext bareCtx = mock(QueryCoordinatorContext.class);
+        when(bareCtx.convertToCoordinatorContext()).thenReturn(bareCtx);
+        when(bareCtx.getSearchRequest()).thenReturn(unprojected.requests().get(0));
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> unprojected.requests().get(0).source().query().rewrite(bareCtx)
+        );
+        assertThat(e.getMessage(), containsString("must carry an inline [fusion] config"));
+        assertThat(e.getMessage(), containsString("leg sub-search runs with the search pipeline disabled"));
+    }
+
     @SneakyThrows
     public void testDoRewriteFused_whenSearchRequestNotResolvable_thenReturnsThis() {
         // If the coordinator context's request is not a SearchRequest, doRewriteFused is a no-op (returns itself).

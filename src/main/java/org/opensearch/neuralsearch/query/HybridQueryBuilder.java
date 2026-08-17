@@ -40,6 +40,7 @@ import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.QueryShardException;
 import org.opensearch.index.query.QueryBuilderVisitor;
 
+import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
@@ -93,6 +94,18 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      * on a freshly parsed builder (classic path never touches it).
      */
     private Supplier<QueryBuilder> fusedSupplier;
+
+    /**
+     * Fusion config projected onto this builder by an <b>enclosing</b> fused hybrid, when this builder is one of its legs.
+     * A leg sub-search runs with the search pipeline pinned to {@code _none} (see
+     * {@link HybridFusionOrchestrator#buildLegMultiSearch}), so a nested fused hybrid cannot resolve its own config from
+     * the leg request; the enclosing rewrite hands down the config it already resolved from the user's request instead.
+     * Only ever set on a private copy made by {@link #withResolvedFusionSpec}, never parsed, never serialized, and
+     * deliberately absent from {@link #doEquals}/{@link #doHashCode} — exactly like {@link #fusedSupplier}.
+     */
+    @Getter(AccessLevel.NONE)
+    @Setter(AccessLevel.NONE)
+    private FusionSpec resolvedFusionSpec;
 
     public static final int MAX_NUMBER_OF_SUB_QUERIES = 5;
     private static final int LOWER_BOUND_OF_PAGINATION_DEPTH = 0;
@@ -452,19 +465,19 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         }
         SearchRequest searchRequest = (SearchRequest) coordinatorContext.getSearchRequest();
 
-        // Precedence: an inline `fusion` block on the query body wins; else resolve from the attached search pipeline
-        // (inline body / named param / index default). Fail fast if neither yields a config rather than emitting
-        // unfused scores.
-        FusionSpec fusionSpec = Objects.nonNull(this.fusion) && hasInlineConfig(this.fusion)
-            ? FusionSpec.fromInlineFusion(this.fusion)
-            : FusionConfigResolver.resolve(searchRequest);
+        FusionSpec fusionSpec = resolveFusionSpec(searchRequest);
         if (Objects.isNull(fusionSpec)) {
             throw new IllegalArgumentException(
                 String.format(
                     Locale.ROOT,
                     "[%s] query [%s] requires a normalization or score-ranker processor: the resolved search pipeline "
                         + "(from ?search_pipeline= or index.search.default_pipeline) has none, and no inline fusion block "
-                        + "was provided (a missing pipeline id is rejected earlier by core)",
+                        + "was provided (a missing pipeline id is rejected earlier by core). A fused [%s] nested inside "
+                        + "another compound query (for example [bool] or [dis_max]) within a leg of an enclosing fused [%s] "
+                        + "must carry an inline [%s] config, because a leg sub-search runs with the search pipeline disabled",
+                    NAME,
+                    FUSION_FIELD.getPreferredName(),
+                    NAME,
                     NAME,
                     FUSION_FIELD.getPreferredName()
                 )
@@ -483,11 +496,14 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         // Validate weights (range, sum, count) before the leg fan-out — a bad weights array otherwise burns a full
         // MultiSearch before the combiner is built in the async callback.
         HybridFusionOrchestrator.validateFusionParams(fusionSpec, legs.size());
+        // The Tail keeps the original legs (it is rewritten against the user's request, which still carries the
+        // pipeline), but the fanned-out legs run with the pipeline disabled — so hand the resolved config down.
+        List<QueryBuilder> fanOutLegs = projectResolvedConfigOntoLegs(legs, fusionSpec);
 
         SetOnce<QueryBuilder> fused = new SetOnce<>();
         queryRewriteContext.registerAsyncAction(
             (client, listener) -> client.multiSearch(
-                HybridFusionOrchestrator.buildLegMultiSearch(searchRequest, legs, window),
+                HybridFusionOrchestrator.buildLegMultiSearch(searchRequest, fanOutLegs, window),
                 ActionListener.wrap(multiSearchResponse -> {
                     try {
                         fused.set(
@@ -523,8 +539,83 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         marker.queryName(queryName);
         marker.boost(boost);
         marker.fusion(this.fusion);
+        marker.resolvedFusionSpec = this.resolvedFusionSpec;
         marker.fusedSupplier = fused::get;
         return marker;
+    }
+
+    /**
+     * Resolve the fusion config for this rewrite, in precedence order:
+     * <ol>
+     *   <li>an inline {@code fusion} block on this query body (explicit user intent, wins outright);</li>
+     *   <li>a config projected down by an enclosing fused hybrid ({@link #resolvedFusionSpec}) — this builder is one of
+     *       its legs, and the leg request has no pipeline to read;</li>
+     *   <li>the search pipeline attached to the request (inline body / {@code ?search_pipeline=} / index default).</li>
+     * </ol>
+     * {@code null} when none of the three yields a config; the caller fails fast rather than emitting unfused scores.
+     */
+    private FusionSpec resolveFusionSpec(final SearchRequest searchRequest) {
+        if (Objects.nonNull(this.fusion) && hasInlineConfig(this.fusion)) {
+            return FusionSpec.fromInlineFusion(this.fusion);
+        }
+        if (Objects.nonNull(resolvedFusionSpec)) {
+            return resolvedFusionSpec;
+        }
+        return FusionConfigResolver.resolve(searchRequest);
+    }
+
+    /**
+     * Hand the already-resolved fusion config down to any leg that is itself a fused hybrid without an inline config.
+     *
+     * <p>Legs are fanned out with {@code pipeline=_none} so that per-leg request/response processors do not run
+     * ({@link HybridFusionOrchestrator#buildLegMultiSearch}); a nested fused hybrid would therefore resolve no config
+     * from its own leg request and fail with a message blaming a pipeline the user has correctly configured. Projecting
+     * the enclosing config is faithful: resolving from the pipeline is exactly what the nested query would have done,
+     * and it is the same request and therefore the same pipeline.
+     *
+     * <p>Reaches direct legs only, at any nesting depth (each level projects onto its own legs). A fused hybrid buried
+     * inside a container query within a leg (e.g. {@code bool{must: hybrid{fusion}}}) is not reachable —
+     * {@link QueryBuilder} exposes no generic child accessor — and still fails, now with a message that names the real
+     * cause and the inline-config workaround.
+     *
+     * @return the original list when nothing needed projecting (the common case), else a copy with legs substituted
+     */
+    static List<QueryBuilder> projectResolvedConfigOntoLegs(final List<QueryBuilder> legs, final FusionSpec resolved) {
+        List<QueryBuilder> projected = null;
+        for (int i = 0; i < legs.size(); i++) {
+            QueryBuilder leg = legs.get(i);
+            if ((leg instanceof HybridQueryBuilder) == false) {
+                continue;
+            }
+            HybridQueryBuilder nested = (HybridQueryBuilder) leg;
+            if (Objects.isNull(nested.fusion) || hasInlineConfig(nested.fusion)) {
+                continue;
+            }
+            if (Objects.isNull(projected)) {
+                projected = new ArrayList<>(legs);
+            }
+            projected.set(i, nested.withResolvedFusionSpec(resolved));
+        }
+        return Objects.isNull(projected) ? legs : projected;
+    }
+
+    /**
+     * Copy of this builder carrying a fusion config resolved by an enclosing fused hybrid. A copy rather than in-place
+     * mutation because the same leg instance is also reused for the Tail, and because {@code fusion} participates in
+     * {@link #doEquals}.
+     */
+    private HybridQueryBuilder withResolvedFusionSpec(final FusionSpec resolved) {
+        HybridQueryBuilder copy = new HybridQueryBuilder();
+        for (QueryBuilder query : queries) {
+            copy.add(query);
+        }
+        copy.queryName(queryName);
+        copy.boost(boost);
+        // Always null on a fused builder (`pagination_depth` with `fusion` is a parse-time 400), copied for exactness.
+        copy.paginationDepth(paginationDepth);
+        copy.fusion(fusion);
+        copy.resolvedFusionSpec = resolved;
+        return copy;
     }
 
     /** True when the inline {@code fusion} block carries an actual config (not just {@code source: pipeline} / empty). */
