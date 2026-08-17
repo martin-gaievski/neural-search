@@ -492,6 +492,9 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         // index.max_result_window (resolved coordinator-side from the targeted indices), mirroring classic hybrid's
         // pagination_depth ceiling.
         validateWindowSizeAgainstMaxResultWindow(searchRequest, window);
+        // Decide, in one place, what each leg inherits from this request — and refuse the shapes fused mode cannot answer
+        // correctly. Done here, before the fan-out is registered, so a refusal costs less than the search it replaces.
+        CandidateScope candidateScope = CandidateScope.from(searchRequest);
         List<QueryBuilder> legs = queries;
         // Validate weights (range, sum, count) before the leg fan-out — a bad weights array otherwise burns a full
         // MultiSearch before the combiner is built in the async callback.
@@ -503,7 +506,7 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         SetOnce<QueryBuilder> fused = new SetOnce<>();
         queryRewriteContext.registerAsyncAction(
             (client, listener) -> client.multiSearch(
-                HybridFusionOrchestrator.buildLegMultiSearch(searchRequest, fanOutLegs, window),
+                HybridFusionOrchestrator.buildLegMultiSearch(candidateScope, fanOutLegs, window),
                 ActionListener.wrap(multiSearchResponse -> {
                     try {
                         fused.set(

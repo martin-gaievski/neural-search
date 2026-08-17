@@ -32,9 +32,7 @@ import org.opensearch.neuralsearch.processor.combination.ScoreCombinationFactory
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationTechnique;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationUtil;
 import org.opensearch.search.SearchHit;
-import org.opensearch.search.builder.PointInTimeBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
-import org.opensearch.search.pipeline.SearchPipelineService;
 
 import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
@@ -58,7 +56,12 @@ final class HybridFusionOrchestrator {
 
     /**
      * Build the leg MultiSearch: one standalone search per sub-query, each reduced to the global top-{@code windowSize}.
-     * Id-only (no {@code _source}); totals disabled (the Tail supplies the full-match-set count when needed).
+     *
+     * <p>What each leg inherits from the user's request is decided in exactly one place — {@link CandidateScope}, which
+     * classifies every field of {@link SearchRequest} and {@link SearchSourceBuilder} as propagated, overridden,
+     * rejected, Tail-forcing, or deliberately dropped, with the reason recorded next to it. This method only assembles
+     * the per-leg requests it produces; it holds no propagation policy of its own, so no request field can reach a leg
+     * (or fail to) by omission here.
      *
      * <p>Note on ANN legs: {@code size} sets how many hits a leg returns, but an ANN leg's retrieval depth is bounded by
      * its own {@code k} (collected per shard), not by {@code size} — a {@code knn}/{@code neural} leg with a small or
@@ -66,45 +69,11 @@ final class HybridFusionOrchestrator {
      * classic hybrid, which likewise never rewrites {@code k}; for a full window, set {@code k >= window_size} on the
      * sub-query. We deliberately do NOT rewrite {@code k} here — it would diverge from classic and has no analog for
      * radial knn ({@code min_score}/{@code max_distance} have no {@code k}).
-     *
-     * <p>Each leg is pinned to the no-op search pipeline ({@code _none}). Otherwise a leg — a plain {@link SearchRequest}
-     * with no explicit pipeline — would inherit the index's {@code index.search.default_pipeline} and re-run its
-     * request/response processors once per leg (redundant, and incorrect for processors like {@code rerank} that expect
-     * request context absent from an id-only leg). The outer fused request still carries the pipeline, so top-level
-     * processors run exactly once.
-     *
-     * <p>{@code allow_partial_search_results} follows the request: an explicitly set value is propagated to every leg,
-     * and when the user left it unset the leg flag is left unset too so each leg resolves the cluster default at
-     * execution (default {@code true}) exactly like a normal search. Propagating only the explicit value matters because
-     * the outer flag is a nullable {@code Boolean} that core has not yet resolved to the cluster default at rewrite
-     * time, so an unconditional pass-through would unbox {@code null}. With an effective {@code true} a shard failing
-     * for one leg degrades that leg to partial results; with {@code false} the leg fails and {@link #groupLegHits} turns
-     * that into a whole-request failure. Note the fused-specific caveat: because normalization is per-leg, a
-     * partially-degraded leg shifts its own min/max, so the fused ranking may differ from a complete run — not merely
-     * return fewer docs (see {@link #groupLegHits} and the LLD "Partial-leg failure" note under *Consistency*).
-     *
-     * <p>A user-supplied point-in-time is passed through to every leg, so all legs and the self-erased round-2 query read
-     * the same immutable view instead of N+1 independent reader instants — the consistency window that otherwise exists
-     * on a live-ingest index. {@code keepAlive} is deliberately left unset on the legs so the PIT's original keep-alive
-     * governs; the legs never extend it. Copying the request's indices alongside a PIT is safe: core's REST layer has
-     * already resolved a PIT request's indices to the PIT's own, and the transport layer derives shards from the PIT
-     * context regardless, so the leg is consistent with the outer request rather than in conflict with it.
      */
-    static MultiSearchRequest buildLegMultiSearch(SearchRequest request, List<QueryBuilder> legs, int windowSize) {
+    static MultiSearchRequest buildLegMultiSearch(CandidateScope scope, List<QueryBuilder> legs, int windowSize) {
         MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
-        PointInTimeBuilder pointInTime = Objects.isNull(request.source()) ? null : request.source().pointInTimeBuilder();
         for (QueryBuilder leg : legs) {
-            SearchSourceBuilder legSource = new SearchSourceBuilder().query(leg).size(windowSize).fetchSource(false).trackTotalHits(false);
-            if (Objects.nonNull(pointInTime)) {
-                legSource.pointInTimeBuilder(new PointInTimeBuilder(pointInTime.getId()));
-            }
-            SearchRequest legRequest = new SearchRequest(request.indices()).indicesOptions(request.indicesOptions())
-                .source(legSource)
-                .pipeline(SearchPipelineService.NOOP_PIPELINE_ID);
-            if (Objects.nonNull(request.allowPartialSearchResults())) {
-                legRequest.allowPartialSearchResults(request.allowPartialSearchResults());
-            }
-            multiSearchRequest.add(legRequest);
+            multiSearchRequest.add(scope.newLegRequest(leg, windowSize));
         }
         return multiSearchRequest;
     }
@@ -351,8 +320,11 @@ final class HybridFusionOrchestrator {
 
     /**
      * Single source of truth for whether a fused query needs the executed Tail (the non-scoring
-     * {@code bool{should: legs}}): aggregations or highlighting need the full match set in the query phase, and an
-     * accurate index-wide {@code total_hits} beyond the fused window needs the legs counted.
+     * {@code bool{should: legs}}): aggregations or highlighting need the full match set in the query phase, an accurate
+     * index-wide {@code total_hits} beyond the fused window needs the legs counted, and a sort that is not by
+     * {@code _score} ranks over the match set rather than the fused window (see
+     * {@link CandidateScope.Disposition#FORCES_TAIL}) — with
+     * Top only, such a request would sort an arbitrary window-sized subset of its matches.
      *
      * <p>Deliberately NOT triggers:
      * <ul>
@@ -366,6 +338,9 @@ final class HybridFusionOrchestrator {
      */
     private static boolean needsTail(SearchSourceBuilder source, int numRankedDocs) {
         if (Objects.nonNull(source) && (Objects.nonNull(source.aggregations()) || Objects.nonNull(source.highlighter()))) {
+            return true;
+        }
+        if (CandidateScope.sortDiscardsFusedRanking(source)) {
             return true;
         }
         return wantsTotalsBeyondWindow(source, numRankedDocs);

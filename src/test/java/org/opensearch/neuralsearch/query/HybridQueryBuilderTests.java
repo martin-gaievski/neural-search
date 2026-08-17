@@ -705,9 +705,32 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
     }
 
     @SneakyThrows
+    public void testDoRewriteFused_whenRequestShapeIsUnsupported_thenRefusesBeforeTheFanOut() {
+        // A refusal must cost less than the search it replaces: CandidateScope validates before registerAsyncAction, so
+        // an unsupported request shape never burns a leg MultiSearch. terminate_after stands in for the whole
+        // REJECTED set; the per-field messages are covered in CandidateScopeTests.
+        initClusterUtilWithMaxResultWindow(10000);
+        HybridQueryBuilder builder = fusedBuilder(new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"))));
+        SearchRequest searchRequest = new SearchRequest("test-index").source(new SearchSourceBuilder().query(builder).terminateAfter(100));
+        QueryCoordinatorContext ctx = mock(QueryCoordinatorContext.class);
+        when(ctx.convertToCoordinatorContext()).thenReturn(ctx);
+        when(ctx.getSearchRequest()).thenReturn(searchRequest);
+        java.util.concurrent.atomic.AtomicInteger asyncRegistered = new java.util.concurrent.atomic.AtomicInteger();
+        doAnswer(invocation -> {
+            asyncRegistered.incrementAndGet();
+            return null;
+        }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.doRewrite(ctx));
+
+        assertThat(e.getMessage(), containsString("does not support [terminate_after]"));
+        assertEquals("the refusal must precede the leg fan-out", 0, asyncRegistered.get());
+    }
+
+    @SneakyThrows
     public void testDoRewriteFused_whenWindowSizeInFusion_thenSupportedAndRegisters() {
         // A fusion block carrying window_size + supported techniques resolves and registers without error (the leg
-        // size wiring itself is asserted in HybridFusionOrchestratorTests#testBuildLegMultiSearch_perLegSourceShape).
+        // request shape itself is asserted in CandidateScopeTests).
         initClusterUtilWithMaxResultWindow(10000);
         HybridQueryBuilder withWindow = fusedBuilder(
             new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"), "window_size", 25))
@@ -798,7 +821,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         FusionSpec resolved = new FusionSpec(FusionSpec.TECHNIQUE_ARITHMETIC_MEAN, FusionSpec.NORMALIZATION_MIN_MAX, 60, new float[0]);
 
         org.opensearch.action.search.MultiSearchRequest fannedOut = HybridFusionOrchestrator.buildLegMultiSearch(
-            userRequest,
+            CandidateScope.from(userRequest),
             HybridQueryBuilder.projectResolvedConfigOntoLegs(outer.queries(), resolved),
             10
         );
@@ -821,7 +844,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
 
         // Negative control: the same nested leg WITHOUT the projected config still cannot resolve, and now says why.
         org.opensearch.action.search.MultiSearchRequest unprojected = HybridFusionOrchestrator.buildLegMultiSearch(
-            userRequest,
+            CandidateScope.from(userRequest),
             outer.queries(),
             10
         );
