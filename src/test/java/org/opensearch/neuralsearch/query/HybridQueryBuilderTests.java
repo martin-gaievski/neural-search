@@ -34,6 +34,7 @@ import java.util.Set;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TermQuery;
@@ -1092,6 +1093,52 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
         builder.doRewrite(ctx);
         assertEquals(1, asyncRegistered.get());
+    }
+
+    @SneakyThrows
+    public void testDoRewriteFused_whenWindowSizeExceedsMaxClauseCount_thenFailsFast() {
+        // The self-erased query holds one bool clause per ranked doc, so window_size is bounded by Lucene's clause ceiling
+        // as well — a much lower limit than max_result_window, and the only one that would otherwise be discovered at query
+        // time on every shard. Set to a non-default value so this also pins that the check reads the live static (which
+        // SearchService keeps in sync with the dynamic indices.query.bool.max_clause_count setting) and not a constant.
+        initClusterUtilWithMaxResultWindow(10000);
+        int savedMaxClauseCount = IndexSearcher.getMaxClauseCount();
+        IndexSearcher.setMaxClauseCount(8);
+        try {
+            // 8 clauses fit only if the Tail is absent, and Tail presence is unknown until the legs have answered.
+            HybridQueryBuilder builder = fusedBuilder(
+                new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"), "window_size", 8))
+            );
+            QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+            doAnswer(invocation -> null).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.doRewrite(ctx));
+            assertThat(e.getMessage(), containsString("indices.query.bool.max_clause_count"));
+        } finally {
+            IndexSearcher.setMaxClauseCount(savedMaxClauseCount);
+        }
+    }
+
+    @SneakyThrows
+    public void testDoRewriteFused_whenWindowSizeLeavesRoomForTail_thenProceeds() {
+        // One below the ceiling: the window plus the single Tail clause exactly fills the bool, so the request proceeds.
+        initClusterUtilWithMaxResultWindow(10000);
+        int savedMaxClauseCount = IndexSearcher.getMaxClauseCount();
+        IndexSearcher.setMaxClauseCount(8);
+        try {
+            HybridQueryBuilder builder = fusedBuilder(
+                new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"), "window_size", 7))
+            );
+            QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+            java.util.concurrent.atomic.AtomicInteger asyncRegistered = new java.util.concurrent.atomic.AtomicInteger();
+            doAnswer(invocation -> {
+                asyncRegistered.incrementAndGet();
+                return null;
+            }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+            builder.doRewrite(ctx);
+            assertEquals(1, asyncRegistered.get());
+        } finally {
+            IndexSearcher.setMaxClauseCount(savedMaxClauseCount);
+        }
     }
 
     @SneakyThrows

@@ -42,11 +42,14 @@ import org.opensearch.index.query.TermQueryBuilder;
  *       needs the full match set; omitted (Top-only) for plain top-K.</li>
  * </ul>
  *
- * <p><b>Document identity.</b> A ranked doc is addressed by {@code _id}, optionally qualified by its {@code _index}.
- * {@code _id} is unique only within an index, so for a multi-index search two different documents can share an
- * {@code _id}; qualifying the Top clause with an {@code _index} filter keeps them distinct and stops one doc's fused
- * score from being applied to the other. Index qualification is opt-in per instance ({@code indices} may be null) so a
- * single-index search keeps the leaner {@code ids}-only clause and its original performance profile.
+ * <p><b>Document identity.</b> A ranked doc is addressed by its {@code _index} and {@code _id} together, always.
+ * {@code _id} is unique only within an index, so two different documents in two indices can share one; without the
+ * {@code _index} filter each would match the other's Top clause and inherit its fused score. Qualification is not
+ * conditional on the search looking like it needs it — the fused window is not evidence about which indices round 2 will
+ * execute against — and it is not a trade either: {@code _index} is a constant field, so on the shard's own index the
+ * added filter is a MatchAll that {@code BooleanQuery.rewrite} removes (the clause collapses to exactly
+ * {@code constant_score(ids)}), and on any other index's shard the clause collapses to MatchNoDocs. {@code indices} is
+ * null only for a window whose hits carried no resolvable {@code _index}; when non-null it has no null elements.
  *
  * <p><b>inner_hits registration is decoupled from the Tail.</b> inner_hits are computed in the fetch phase from the
  * registered {@link InnerHitContextBuilder}s (per returned parent doc), not from whatever ran in the query phase — so a
@@ -77,7 +80,11 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
     private static final String INDEX_FIELD = "_index";
 
     private final String[] ids;
-    /** Parallel to {@code ids}; null when the search targets a single index and needs no qualification. */
+    /**
+     * Parallel to {@code ids}. Either null — no clause is qualified — or fully populated, one concrete index name per
+     * ranked doc. Never an array with null holes: {@code writeOptionalStringArray} handles a null array but writes
+     * elements through {@code writeString}, which NPEs on a null.
+     */
     private final String[] indices;
     private final float[] scores;
     /** Legs executed in the query phase as the non-scoring Tail (empty for a Top-only query). */
@@ -92,6 +99,9 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         List<QueryBuilder> tailQueries,
         List<QueryBuilder> innerHitsQueries
     ) {
+        assert Objects.isNull(indices) || indices.length == ids.length : "indices must be parallel to ids";
+        assert Objects.isNull(indices) || Arrays.stream(indices).noneMatch(Objects::isNull)
+            : "indices must be null or fully populated — a null element NPEs in writeOptionalStringArray";
         this.ids = ids;
         this.indices = indices;
         this.scores = scores;
@@ -99,7 +109,7 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         this.innerHitsQueries = Objects.isNull(innerHitsQueries) ? new ArrayList<>() : innerHitsQueries;
     }
 
-    /** Single-index convenience: no index qualification, and the Tail legs are also the inner_hits source. */
+    /** Unqualified convenience: {@code _id}-only Top clauses, and the Tail legs are also the inner_hits source. */
     public HybridFusionQueryBuilder(String[] ids, float[] scores, List<QueryBuilder> tailQueries) {
         this(ids, null, scores, tailQueries, tailQueries);
     }
@@ -173,8 +183,9 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
             composite.should(new ConstantScoreQueryBuilder(rankedDocQuery(i)).boost(scores[i]));
         }
         // Tail: all leg matches as a non-scoring filter -> total hits and aggregations cover the full match set, and
-        // highlighting has the sub-queries' terms available. Non-window docs match at score 0 and sort below the fused
-        // window, so a request with size <= window_size returns exactly the fused window.
+        // highlighting has the sub-queries' terms available. A doc outside the window matches no Top clause — including
+        // a doc in another index that shares a window doc's _id, which is why the Top is _index-qualified — so it scores
+        // 0 and sorts below the window, and a request with size <= window_size returns exactly the fused window.
         if (tailQueries.isEmpty() == false) {
             BoolQueryBuilder tail = new BoolQueryBuilder();
             for (QueryBuilder q : tailQueries) {
@@ -186,12 +197,13 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
     }
 
     /**
-     * Address one ranked document: by {@code _id} alone, or {@code _id} intersected with its {@code _index} when the
-     * fused set spans indices (where {@code _id} is not unique on its own).
+     * Address one ranked document by {@code _id} intersected with its {@code _index} — {@code _id} is not unique on its
+     * own, and the fused score belongs to exactly one document. Falls back to {@code _id} alone only when no index could
+     * be resolved for the window at all; per-element fallback is impossible by the {@code indices} invariant.
      */
     private QueryBuilder rankedDocQuery(int position) {
         IdsQueryBuilder idQuery = new IdsQueryBuilder().addIds(ids[position]);
-        if (Objects.isNull(indices) || Objects.isNull(indices[position])) {
+        if (Objects.isNull(indices)) {
             return idQuery;
         }
         return new BoolQueryBuilder().filter(idQuery).filter(new TermQueryBuilder(INDEX_FIELD, indices[position]));

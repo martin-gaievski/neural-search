@@ -88,8 +88,15 @@ public class HybridQueryFusedModeMultiIndexIT extends BaseNeuralSearchIT {
             + "\",\"modifier\":\"none\",\"missing\":1}}}";
     }
 
+    /** Window wide enough for every document in both indices, so the fused window itself spans both. */
     private String fusedHybrid() {
-        return "{\"hybrid\":{\"fusion\":{\"window_size\":10,"
+        return fusedHybrid(10);
+    }
+
+    private String fusedHybrid(int windowSize) {
+        return "{\"hybrid\":{\"fusion\":{\"window_size\":"
+            + windowSize
+            + ","
             + "\"normalization\":{\"technique\":\"min_max\"},"
             + "\"combination\":{\"technique\":\"arithmetic_mean\"}},"
             + "\"queries\":["
@@ -166,6 +173,37 @@ public class HybridQueryFusedModeMultiIndexIT extends BaseNeuralSearchIT {
                     + " vs "
                     + fromB,
                 fromA > fromB
+            );
+        }
+    }
+
+    /**
+     * The window is not evidence about the request. With {@code window_size} below the size of the fused set, index-a's
+     * higher scores fill the whole window — yet round 2 still runs against both indices, where index-b's {@code _id} 1..3
+     * are waiting. While qualification was decided from the window (one distinct index there, so "no disambiguation
+     * needed") each index-b document matched its index-a namesake's Top clause and was handed that document's fused score.
+     * Both sides then carried an identical score, and which one a user saw came down to Lucene's tie-break.
+     */
+    @SneakyThrows
+    public void testFusedMultiIndex_whenWindowSpansOneIndex_thenSiblingIndexDoesNotInheritScores() {
+        ensureDataset();
+        // index-a's scores (99/98/97) beat index-b's (49/48/47) for every id, so a window of 3 is entirely index-a.
+        String body = "{\"query\":" + fusedHybrid(COLLIDING_IDS) + "}";
+
+        Map<String, Double> scoreByIndexAndId = new LinkedHashMap<>();
+        for (Map<String, Object> hit : hits(searchRaw(body, 20))) {
+            scoreByIndexAndId.put(hit.get("_index") + "#" + hit.get("_id"), ((Number) hit.get("_score")).doubleValue());
+        }
+
+        for (int id = 1; id <= COLLIDING_IDS; id++) {
+            double fromA = scoreByIndexAndId.get(INDEX_A + "#" + id);
+            double fromB = scoreByIndexAndId.get(INDEX_B + "#" + id);
+            assertTrue("id " + id + ": the windowed index-a doc must be scored, got " + fromA, fromA > 0.0d);
+            assertEquals(
+                "id " + id + ": index-b's doc is outside the window, so it must score 0 rather than inherit " + fromA,
+                0.0d,
+                fromB,
+                0.0d
             );
         }
     }

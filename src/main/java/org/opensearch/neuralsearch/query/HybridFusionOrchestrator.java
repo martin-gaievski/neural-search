@@ -7,13 +7,11 @@ package org.opensearch.neuralsearch.query;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 
 import org.opensearch.action.search.MultiSearchRequest;
 import org.opensearch.action.search.MultiSearchResponse;
@@ -258,8 +256,26 @@ final class HybridFusionOrchestrator {
 
     /**
      * Rank the fused scores, cut to the window, and resolve each key back to its {@code (_index, _id)} identity via the
-     * side map — never by parsing the key. The returned {@code indices} array is null unless the window actually spans
-     * more than one index, so a single-index search keeps the leaner {@code _id}-only Top clause.
+     * side map — never by parsing the key.
+     *
+     * <p>Every ranked document is addressed by its {@code _index} as well as its {@code _id}, unconditionally. The window
+     * is not evidence about the request: a multi-index search whose window happens to be filled from one index still runs
+     * round 2 against every requested index, where a sibling index's same-{@code _id} document would match the bare
+     * {@code ids} clause and inherit that document's fused score. Deciding qualification from the window was exactly that
+     * bug — fusion keys documents by {@code _index + _id} (see {@link #documentKey}), and addressing them by {@code _id}
+     * alone merges back together what keying had correctly separated.
+     *
+     * <p>Qualifying always is free rather than a trade: {@code _index} is a constant field, so on the shard's own index
+     * the added filter is a MatchAll that {@code BooleanQuery.rewrite} removes — the clause collapses to exactly the
+     * {@code constant_score(ids)} it would have been — and on any other index's shard the all-FILTER bool has a
+     * MatchNoDocs required clause and collapses away entirely. Measured post-rewrite, the qualified Top presents the same
+     * number of clauses to Lucene's ceiling as the unqualified one.
+     *
+     * <p>The returned {@code indices} array is null-or-fully-populated, never an array with null holes: a hole would NPE
+     * inside {@code StreamOutput.writeOptionalStringArray} (it handles a null array, not null elements) while the
+     * coordinator serializes the round-2 shard request — a 500 on a query that already succeeded through fusion. If any
+     * window hit cannot be resolved to a concrete index, the whole array is dropped and every clause falls back to
+     * {@code _id}-only.
      */
     private static RankedDocs toRankedDocs(Map<String, Float> scoresByKey, Map<String, SearchHit> identityByKey, int windowSize) {
         List<Map.Entry<String, Float>> ranked = new ArrayList<>(scoresByKey.entrySet());
@@ -270,7 +286,7 @@ final class HybridFusionOrchestrator {
         String[] ids = new String[ranked.size()];
         String[] indices = new String[ranked.size()];
         float[] scores = new float[ranked.size()];
-        Set<String> distinctIndices = new HashSet<>();
+        boolean everyHitCarriesItsIndex = true;
         for (int i = 0; i < ranked.size(); i++) {
             String key = ranked.get(i).getKey();
             SearchHit hit = identityByKey.get(key);
@@ -279,10 +295,9 @@ final class HybridFusionOrchestrator {
             ids[i] = Objects.isNull(hit) ? key : hit.getId();
             indices[i] = Objects.isNull(hit) ? null : hit.getIndex();
             scores[i] = ranked.get(i).getValue();
-            distinctIndices.add(indices[i]);
+            everyHitCarriesItsIndex &= Objects.nonNull(indices[i]);
         }
-        boolean needsIndexQualification = distinctIndices.size() > 1;
-        return new RankedDocs(ids, needsIndexQualification ? indices : null, scores);
+        return new RankedDocs(ids, everyHitCarriesItsIndex ? indices : null, scores);
     }
 
     /** The sub-query legs in their Tail form. groupLegHits fails fast on any leg failure, so every leg is present here
@@ -372,6 +387,7 @@ final class HybridFusionOrchestrator {
         return Objects.isNull(trackTotalHitsUpTo) || trackTotalHitsUpTo > numRankedDocs;
     }
 
+    /** The fused window in score order. {@code indices} is parallel to {@code ids} and null-or-fully-populated. */
     private record RankedDocs(String[] ids, String[] indices, float[] scores) {
     }
 }

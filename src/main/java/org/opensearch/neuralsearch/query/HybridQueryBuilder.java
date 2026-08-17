@@ -18,6 +18,7 @@ import java.util.stream.Collectors;
 
 import org.apache.commons.lang3.builder.EqualsBuilder;
 import org.apache.lucene.search.BooleanClause.Occur;
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -39,6 +40,7 @@ import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.QueryShardException;
 import org.opensearch.index.query.QueryBuilderVisitor;
+import org.opensearch.search.SearchService;
 
 import lombok.AccessLevel;
 import lombok.Getter;
@@ -110,6 +112,8 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     public static final int MAX_NUMBER_OF_SUB_QUERIES = 5;
     private static final int LOWER_BOUND_OF_PAGINATION_DEPTH = 0;
     private static final int DEFAULT_FUSION_WINDOW_SIZE = 100;
+    /** The one clause the Tail filter takes in the self-erased bool, alongside one should-clause per ranked doc. */
+    private static final int TAIL_CLAUSE_RESERVE = 1;
 
     // Allowed top-level keys inside a `fusion` object; anything else is a parse-time 400.
     private static final String FUSION_KEY_SOURCE = "source";
@@ -492,6 +496,10 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         // index.max_result_window (resolved coordinator-side from the targeted indices), mirroring classic hybrid's
         // pagination_depth ceiling.
         validateWindowSizeAgainstMaxResultWindow(searchRequest, window);
+        // The self-erased query holds one bool clause per ranked doc, so the window is also bounded by Lucene's clause
+        // ceiling — a different (and much lower) limit than max_result_window, and the only one that would otherwise be
+        // discovered at query time on every shard.
+        validateWindowSizeAgainstMaxClauseCount(window);
         // Decide, in one place, what each leg inherits from this request — and refuse the shapes fused mode cannot answer
         // correctly. Done here, before the fan-out is registered, so a refusal costs less than the search it replaces.
         CandidateScope candidateScope = CandidateScope.from(searchRequest);
@@ -681,6 +689,43 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                     )
                 );
             }
+        }
+    }
+
+    /**
+     * Reject a {@code window_size} the self-erased query could not be assembled from. Its Top is one {@code should}
+     * clause per ranked document in a single {@code bool}, plus one {@code filter} clause when the Tail is present, and
+     * {@code BooleanQuery.Builder#add} throws {@code TooManyClauses} as soon as one bool exceeds
+     * {@code indices.query.bool.max_clause_count}. That ceiling defaults to 1024 and is unrelated to
+     * {@code index.max_result_window} (default 10000) — the only bound the other window check applies — so without this a
+     * {@code window_size} in the thousands parses, fans out, fuses, and only then fails on every shard. The setting is a
+     * dynamic node setting that {@code SearchService} keeps in sync with Lucene's static, so reading the static here
+     * reflects the live value on this coordinator.
+     *
+     * <p>Necessary, not sufficient: the Tail's own clauses are the user's legs and cannot be counted at rewrite, so a
+     * request within this bound can still exceed the ceiling through an enormous leg query. The {@code _index}
+     * qualification on each Top clause costs nothing against this bound — on the shard's own index the {@code _index}
+     * filter is a MatchAll that {@code BooleanQuery.rewrite} removes, collapsing the clause back to
+     * {@code constant_score(ids)}.
+     */
+    private static void validateWindowSizeAgainstMaxClauseCount(final int window) {
+        int maxClauseCount = IndexSearcher.getMaxClauseCount();
+        // Reserve the one clause the Tail filter occupies in the same bool. Whether a request needs the Tail is only known
+        // once the legs have answered, so the window has to fit either way.
+        if (window > maxClauseCount - TAIL_CLAUSE_RESERVE) {
+            throw new IllegalArgumentException(
+                String.format(
+                    Locale.ROOT,
+                    "[%s] query [%s.%s] (%d) must be less than [%s] (%d): the fused query holds one clause per ranked "
+                        + "document plus one for the tail",
+                    NAME,
+                    FUSION_FIELD.getPreferredName(),
+                    FUSION_KEY_WINDOW_SIZE,
+                    window,
+                    SearchService.INDICES_MAX_CLAUSE_COUNT_SETTING.getKey(),
+                    maxClauseCount
+                )
+            );
         }
     }
 

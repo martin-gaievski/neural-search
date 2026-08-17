@@ -317,8 +317,13 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         }
     }
 
-    public void testBuildFusedQuery_whenSingleIndex_thenTopStaysIdOnly() {
-        // Single-index searches need no disambiguation, so they keep the leaner ids-only clause (and its original cost).
+    /**
+     * The blocker this guards. Qualification used to be dropped when the window spanned a single index, but the window is
+     * not evidence about the request — one index outranking its siblings, or a window_size below the fused set size, both
+     * yield a single-index window for a search that round 2 still executes against every requested index, where a sibling
+     * index's same-_id doc matches the bare ids clause and inherits the fused score. So qualify unconditionally.
+     */
+    public void testBuildFusedQuery_whenWindowSpansOneIndex_thenTopIsStillQualified() {
         List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
         MultiSearchResponse ms = multiSearch(legItemFromIndex("idx-a", Map.of("1", 0.9f)), legItemFromIndex("idx-a", Map.of("2", 0.8f)));
 
@@ -333,8 +338,32 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
         assertEquals(2, self.should().size());
         for (QueryBuilder clause : self.should()) {
+            QueryBuilder inner = ((ConstantScoreQueryBuilder) clause).innerQuery();
+            assertTrue("a single-index window must not drop the _index qualification", inner instanceof BoolQueryBuilder);
+            assertEquals("qualified by _id AND _index", 2, ((BoolQueryBuilder) inner).filter().size());
+        }
+    }
+
+    public void testBuildFusedQuery_whenHitsCarryNoIndex_thenTopFallsBackToIdOnlyForEveryClause() {
+        // The array handed to the self-erased query is null-or-fully-populated: a null hole would NPE in
+        // writeOptionalStringArray while serializing the round-2 shard request. Hits with no resolvable _index drop it
+        // wholesale rather than leaving holes.
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)), legItemFromIndex("idx-a", Map.of("2", 0.8f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(
+            new SearchSourceBuilder().trackTotalHits(false),
+            ms,
+            legs,
+            minMaxArithmetic(),
+            10
+        );
+
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
+        assertEquals(2, self.should().size());
+        for (QueryBuilder clause : self.should()) {
             assertTrue(
-                "single-index Top clause stays a bare ids query",
+                "one unresolvable index drops qualification for the whole window, not just its own clause",
                 ((ConstantScoreQueryBuilder) clause).innerQuery() instanceof IdsQueryBuilder
             );
         }
