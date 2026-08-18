@@ -20,6 +20,7 @@ import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.common.logging.HeaderWarning;
+import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.InnerHitContextBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
@@ -313,29 +314,62 @@ final class HybridFusionOrchestrator {
 
     /** The sub-query legs in their Tail form. groupLegHits fails fast on any leg failure, so every leg is present here
      *  (legHits.length == legs.size(), no null slots). A kNN/neural leg's match set IS its returned top-k, so it is
-     *  materialized as an {@link IdsQueryBuilder} of its already-retrieved ids rather than re-walking the HNSW graph in
-     *  the Tail purely to count; other legs are used as-is. */
+     *  materialized as the documents it already retrieved rather than re-walking the HNSW graph in the Tail purely to
+     *  count; other legs are used as-is. */
     private static List<QueryBuilder> legQueriesForTail(List<QueryBuilder> legs, SearchHit[][] legHits) {
         List<QueryBuilder> tail = new ArrayList<>(legs.size());
         for (int legIndex = 0; legIndex < legs.size(); legIndex++) {
             QueryBuilder leg = legs.get(legIndex);
-            if (isMaterializableLeg(leg)) {
-                IdsQueryBuilder ids = new IdsQueryBuilder();
-                for (SearchHit hit : legHits[legIndex]) {
-                    ids.addIds(hit.getId());
-                }
-                tail.add(ids);
-            } else {
-                tail.add(leg);
-            }
+            tail.add(isMaterializableLeg(leg) ? materializedLeg(legHits[legIndex]) : leg);
         }
         return tail;
     }
 
     /**
+     * A materialized leg addresses the documents it returned the same way the Top addresses ranked documents — through
+     * the shared {@link HybridFusionQueryBuilder#addressDocuments}, by {@code _index} and {@code _id} together.
+     *
+     * <p>The Tail is a {@code filter}, so it decides the match set. Addressing it by {@code _id} alone made every
+     * same-{@code _id} sibling document in another index part of that set: it was counted into {@code total_hits}, fed
+     * every aggregation bucket, and came back to the user as a score-0 hit — inflating precisely the numbers the Tail
+     * exists to make correct. This is not the same defect as the Top's, and qualifying the Top did not fix it: the Tail was
+     * built from the raw leg hits without reference to the ranked window's resolved indices at all.
+     *
+     * <p>Hits are grouped by index — one qualified clause per index, OR-ed — rather than one clause per hit, so a
+     * single-index search still presents a single clause and, since {@code _index} is a constant field whose filter
+     * rewrites to MatchAll on its own shard and MatchNoDocs elsewhere, the post-rewrite leaf count per leg is unchanged.
+     *
+     * <p>An empty leg is returned as an explicit {@code match_none}. {@code bool{should: []}} compiles to
+     * {@code MatchAllDocsQuery}, so an ANN leg that matched nothing would otherwise flip to matching <i>every</i> document
+     * in the Tail. Today's bare ids query avoids that only by accident — core rewrites an empty {@link IdsQueryBuilder} to
+     * {@code match_none} — and that accident does not survive wrapping the leg in a bool, so state the guard here.
+     */
+    private static QueryBuilder materializedLeg(SearchHit[] hits) {
+        if (hits.length == 0) {
+            return new MatchNoneQueryBuilder();
+        }
+        // Insertion-ordered and null-tolerant: a hit carrying no resolvable _index groups under the null key and is
+        // addressed by _id alone, matching documentKey and the Top's own fallback.
+        Map<String, List<String>> idsByIndex = new LinkedHashMap<>();
+        for (SearchHit hit : hits) {
+            idsByIndex.computeIfAbsent(hit.getIndex(), index -> new ArrayList<>()).add(hit.getId());
+        }
+        List<QueryBuilder> perIndex = new ArrayList<>(idsByIndex.size());
+        for (Map.Entry<String, List<String>> group : idsByIndex.entrySet()) {
+            perIndex.add(HybridFusionQueryBuilder.addressDocuments(group.getKey(), group.getValue().toArray(new String[0])));
+        }
+        if (perIndex.size() == 1) {
+            return perIndex.get(0);
+        }
+        BoolQueryBuilder inAnyIndex = new BoolQueryBuilder();
+        perIndex.forEach(inAnyIndex::should);
+        return inAnyIndex;
+    }
+
+    /**
      * Legs whose full Lucene match set equals their returned top-k, so re-running them in the Tail would be a redundant
-     * ANN pass (kNN/neural re-walk the HNSW graph). Only such legs are safe to materialize as an {@link IdsQueryBuilder}
-     * of the already-retrieved window ids. A leg whose match set is NOT bounded to its top-k — e.g. {@code neural_sparse},
+     * ANN pass (kNN/neural re-walk the HNSW graph). Only such legs are safe to replace with a direct address of the
+     * already-retrieved hits. A leg whose match set is NOT bounded to its top-k — e.g. {@code neural_sparse},
      * whose match set is every doc containing a query token (far larger than the window) — must NOT be materialized, or
      * the Tail would drop the rest and undercount total_hits/aggregations (and re-running it is cheap: no graph to walk).
      */

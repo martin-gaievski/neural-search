@@ -42,7 +42,9 @@ import org.opensearch.index.query.TermQueryBuilder;
  *       needs the full match set; omitted (Top-only) for plain top-K.</li>
  * </ul>
  *
- * <p><b>Document identity.</b> A ranked doc is addressed by its {@code _index} and {@code _id} together, always.
+ * <p><b>Document identity.</b> Addressing is defined once, in {@link #addressDocuments}, and used by both halves: the Top
+ * addresses one ranked document, the Tail addresses each index group of a leg materialized to its returned ids. A ranked
+ * doc is addressed by its {@code _index} and {@code _id} together, always.
  * {@code _id} is unique only within an index, so two different documents in two indices can share one; without the
  * {@code _index} filter each would match the other's Top clause and inherit its fused score. Qualification is not
  * conditional on the search looking like it needs it — the fused window is not evidence about which indices round 2 will
@@ -202,11 +204,30 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
      * be resolved for the window at all; per-element fallback is impossible by the {@code indices} invariant.
      */
     private QueryBuilder rankedDocQuery(int position) {
-        IdsQueryBuilder idQuery = new IdsQueryBuilder().addIds(ids[position]);
-        if (Objects.isNull(indices)) {
+        return addressDocuments(Objects.isNull(indices) ? null : indices[position], ids[position]);
+    }
+
+    /**
+     * The one definition of document addressing for fused mode: the given {@code _id}s intersected with the one
+     * {@code _index} they live in. The Top calls it per ranked document; the Tail calls it per index group of a
+     * materialized kNN/neural leg (see {@code HybridFusionOrchestrator#materializedLeg}). Sharing it is the point — the
+     * scoring half and the matching half of this query must identify a document the same way, and they previously did not:
+     * the Top was {@code _index}-qualified while the Tail addressed a materialized leg by {@code _id} alone, so every
+     * same-{@code _id} sibling document in another index passed the Tail {@code filter} and was counted.
+     *
+     * <p>{@code index} is null only when the caller could resolve no index for those hits, where addressing degrades to
+     * {@code _id} alone rather than failing. That degradation is per-call, so the Top (which drops its whole
+     * {@code indices} array if any window hit lacks an index) can be unqualified while the Tail still qualifies the groups
+     * it could resolve. That combination loses no legitimate document: every window document came from some leg, so it
+     * matches that leg's Tail clause, and the only docs the narrower Tail removes from the wider Top are the same-id
+     * siblings that should never have matched.
+     */
+    static QueryBuilder addressDocuments(String index, String... ids) {
+        IdsQueryBuilder idQuery = new IdsQueryBuilder().addIds(ids);
+        if (Objects.isNull(index)) {
             return idQuery;
         }
-        return new BoolQueryBuilder().filter(idQuery).filter(new TermQueryBuilder(INDEX_FIELD, indices[position]));
+        return new BoolQueryBuilder().filter(idQuery).filter(new TermQueryBuilder(INDEX_FIELD, index));
     }
 
     /**
