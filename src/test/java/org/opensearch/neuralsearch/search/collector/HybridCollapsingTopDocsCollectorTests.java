@@ -16,9 +16,9 @@ import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.NoMergePolicy;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.LeafCollector;
-import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.Weight;
@@ -40,7 +40,6 @@ import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 public class HybridCollapsingTopDocsCollectorTests extends HybridCollectorTestCase {
 
@@ -1180,29 +1179,25 @@ public class HybridCollapsingTopDocsCollectorTests extends HybridCollectorTestCa
         Weight weight = mock(Weight.class);
         collector.setWeight(weight);
 
-        // setup: simulate profiler mode by directly setting hybridQueryScorer and compoundQueryScorer
-        Scorer subScorer1 = mock(Scorer.class);
-        HybridQueryScorer mockHybridScorer = mock(HybridQueryScorer.class);
-        when(mockHybridScorer.getSubScorers()).thenReturn(java.util.Arrays.asList(subScorer1));
-
-        HybridSubQueryScorer adapter = new HybridSubQueryScorer(1);
+        // setup: profiler mode, where the leaf collector is handed a HybridQueryScorer instead of a
+        // HybridSubQueryScorer and reads the per sub-query scores off it on every collect() call
+        int[] docIds = IntStream.range(0, 20).toArray();
+        float[] subQueryScores = new float[20];
+        for (int doc = 0; doc < 20; doc++) {
+            subQueryScores[doc] = 1.0f + doc * 0.05f;
+        }
+        HybridQueryScorer hybridQueryScorer = new HybridQueryScorer(
+            java.util.Arrays.asList(scorer(docIds, subQueryScores, mock(Weight.class)))
+        );
 
         LeafReaderContext context = reader.leaves().getFirst();
         LeafCollector leafCollector = collector.getLeafCollector(context);
 
-        // First set the adapter via setScorer() to trigger minScoreThresholds initialization,
-        // then override with profiler-mode fields
-        leafCollector.setScorer(adapter);
-        HybridLeafCollector hybridLeaf = (HybridLeafCollector) leafCollector;
-        hybridLeaf.hybridQueryScorer = mockHybridScorer;
-        hybridLeaf.compoundQueryScorer = adapter;
+        leafCollector.setScorer(hybridQueryScorer);
 
-        // execute: collect docs
-        for (int doc = 0; doc < 20; doc++) {
-            float score = 1.0f + doc * 0.05f;
-            when(mockHybridScorer.docID()).thenReturn(doc);
-            when(subScorer1.docID()).thenReturn(doc);
-            when(subScorer1.score()).thenReturn(score);
+        // execute: collect docs while iterating the hybrid scorer, the way the default bulk scorer does
+        DocIdSetIterator iterator = hybridQueryScorer.iterator();
+        for (int doc = iterator.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = iterator.nextDoc()) {
             leafCollector.collect(doc);
         }
 
