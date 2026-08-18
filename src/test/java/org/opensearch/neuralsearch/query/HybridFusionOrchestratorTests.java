@@ -32,9 +32,11 @@ import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
+import org.opensearch.index.query.InnerHitBuilder;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.collapse.CollapseBuilder;
 import org.opensearch.search.pipeline.SearchPipelineService;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -224,6 +226,34 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
 
         BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
         assertEquals("_score sort → still plain top-K, no Tail", 0, self.filter().size());
+    }
+
+    public void testBuildFusedQuery_whenCollapseInnerHits_keepsTail() {
+        // collapse.inner_hits makes core re-run THIS query once per group, filtered to the group key. A group's members
+        // are whatever shares that key — unrelated to the fused window — so with Top only every member that ranked outside
+        // the window matches nothing and silently vanishes from the expansion, where classic hybrid returns all of them.
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)), legItem(Map.of("2", 0.8f)));
+        SearchSourceBuilder source = new SearchSourceBuilder().trackTotalHits(false)
+            .collapse(new CollapseBuilder("grp").setInnerHits(new InnerHitBuilder("members")));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10);
+
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
+        assertEquals("collapse.inner_hits → Tail retained so a group expands to all of its members", 1, self.filter().size());
+    }
+
+    public void testBuildFusedQuery_whenCollapseWithoutInnerHits_staysTopOnly() {
+        // Plain collapse groups the documents round 2 already returns — core runs no expansion search at all — so it must
+        // not drag in a Tail the request did not ask for.
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)), legItem(Map.of("2", 0.8f)));
+        SearchSourceBuilder source = new SearchSourceBuilder().trackTotalHits(false).collapse(new CollapseBuilder("grp"));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10);
+
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
+        assertEquals("collapse grouping alone → still plain top-K, no Tail", 0, self.filter().size());
     }
 
     public void testBuildFusedQuery_emptyResult_matchNone() {

@@ -38,8 +38,12 @@ import org.opensearch.index.query.TermQueryBuilder;
  *       {@code should} clauses, so the fused window is returned in fused-score order.</li>
  *   <li><b>Tail</b> — a {@code bool{ should: [tailQuery...] }} added as a non-scoring {@code filter}. It matches the
  *       full set of documents any sub-query matched, so {@code total_hits} and aggregations cover all matches (not just
- *       the ranked window) and the highlighter has the sub-queries' terms available. Included only when the request
- *       needs the full match set; omitted (Top-only) for plain top-K.</li>
+ *       the ranked window) and the highlighter has the sub-queries' terms available. It is present <b>by default</b>:
+ *       an accurate {@code total_hits} is itself a Tail trigger, and requests do not set {@code track_total_hits} unless
+ *       they mean to give that up. Top-only is the opt-out — {@code track_total_hits} at or below the window, with no
+ *       aggregations, highlighting, collapse expansion or non-{@code _score} sort. So the default cost of fused mode is
+ *       the legs in round 1 plus the legs re-matched (not re-ranked) inside round 2's filter; see
+ *       {@code HybridFusionOrchestrator#needsTail} for the exact trigger set.</li>
  * </ul>
  *
  * <p><b>Document identity.</b> Addressing is defined once, in {@link #addressDocuments}, and used by both halves: the Top
@@ -60,14 +64,26 @@ import org.opensearch.index.query.TermQueryBuilder;
  * independently, which lets a Top-only query still return leg inner_hits without paying to re-run the legs.
  *
  * <p><b>{@code collapse} semantics.</b> Collapse <i>grouping</i> is identical to classic hybrid — it is a plain
- * query-phase operation over the fused ranking. {@code collapse.inner_hits} scores differ from classic, in fused mode's
- * favour: core's {@code ExpandSearchPhase} re-runs {@code source().query()} per group, which here is this self-erased
- * query, so every expanded member is scored by its own Top clause and therefore carries <b>its own fused score</b> —
- * on the same scale as the group representative, and equal to the score it would receive in the ungrouped fused search.
- * Classic instead re-runs the real sub-queries and reports their <b>raw, un-normalized</b> scores, which are on a
- * different scale from the representative's normalized score (e.g. representative {@code 1.0} beside members
- * {@code 198.0}). Leg-level {@code inner_hits} (a {@code nested}/{@code has_child} sub-query with its own
- * {@code inner_hits} block) match classic exactly, because core re-runs the inner query there rather than the parent.
+ * query-phase operation over the fused ranking. {@code collapse.inner_hits} is different in kind: core's
+ * {@code ExpandSearchPhase} issues one more search per returned group, whose query is this self-erased query under a
+ * filter on the group key. A group's members are whatever shares the representative's collapse key, which has nothing to
+ * do with the fused window, so the expansion is only as wide as what this query matches — which is why declaring
+ * {@code collapse.inner_hits} forces the Tail on ({@code CandidateScope.Disposition#FORCES_TAIL}). With the Tail, every
+ * member of the group comes back, matching classic's recall. Member <i>scores</i> then split by window membership:
+ * <ul>
+ *   <li>a member inside the fused window has its own Top clause, so it carries <b>its own fused score</b> — on the same
+ *       scale as the group representative, and equal to the score it would receive in the ungrouped fused search;</li>
+ *   <li>a member outside the window has no Top clause and matches only the non-scoring Tail, so it expands at
+ *       <b>{@code 0.0}</b>. There is no fused score to give it: fusion ranked the window, and this document is not in it.
+ *       Consequence to be aware of: within one group's {@code inner_hits}, in-window members sort above out-of-window ones
+ *       regardless of their relative relevance, so an {@code inner_hits.size} smaller than the group returns the
+ *       window's members first. Classic instead re-runs the real sub-queries and reports their <b>raw, un-normalized</b>
+ *       scores — a consistent order among members, but on a different scale from the representative's normalized score
+ *       (e.g. representative {@code 1.0} beside members {@code 198.0}). Raise {@code window_size} to cover the groups to
+ *       be expanded if member ordering matters.</li>
+ * </ul>
+ * Leg-level {@code inner_hits} (a {@code nested}/{@code has_child} sub-query with its own {@code inner_hits} block) are
+ * unaffected by any of this: core re-runs the inner query per returned parent there rather than the parent query.
  *
  * <p>This query is created internally by the coordinator self-erase and is never parseable from a search request. Its
  * wire form needs no version gate: the whole query type is new in the same version that introduced fused mode, and a

@@ -84,8 +84,10 @@ final class HybridFusionOrchestrator {
      * (Top + conditional Tail), or a {@link MatchNoneQueryBuilder} when nothing fused. Pure: returns the query and
      * mutates nothing.
      *
-     * <p>The Tail (non-scoring {@code bool{should: legs}} surfacing the full match set) is included only when the request
-     * needs it (aggregations / highlight / leg inner_hits / totals beyond the window — see {@link #needsTail}).
+     * <p>The Tail (non-scoring {@code bool{should: legs}} surfacing the full match set) is included when the request needs
+     * it: aggregations, highlighting, a non-{@code _score} sort, collapse group expansion, or totals beyond the window —
+     * see {@link #needsTail} for the list and for what deliberately does not trigger it. Since a request that sets none of
+     * those still wants an accurate {@code total_hits}, the Tail is present by default and Top-only is the opt-out.
      *
      * <p>The Tail decision is <b>depth-independent</b>: it is derived from the request alone, not from whether this
      * hybrid is the whole query or nested inside a container. A nested fused query still self-erases into
@@ -313,9 +315,10 @@ final class HybridFusionOrchestrator {
     }
 
     /** The sub-query legs in their Tail form. groupLegHits fails fast on any leg failure, so every leg is present here
-     *  (legHits.length == legs.size(), no null slots). A kNN/neural leg's match set IS its returned top-k, so it is
-     *  materialized as the documents it already retrieved rather than re-walking the HNSW graph in the Tail purely to
-     *  count; other legs are used as-is. */
+     *  (legHits.length == legs.size(), no null slots). A kNN/neural leg retrieves a bounded candidate set rather than a
+     *  term-defined one, so it is materialized as the documents it already retrieved rather than re-walking the HNSW graph
+     *  in the Tail purely to count; other legs are used as-is. See {@link #isMaterializableLeg} for the bound this relies
+     *  on and the one configuration where it under-counts. */
     private static List<QueryBuilder> legQueriesForTail(List<QueryBuilder> legs, SearchHit[][] legHits) {
         List<QueryBuilder> tail = new ArrayList<>(legs.size());
         for (int legIndex = 0; legIndex < legs.size(); legIndex++) {
@@ -367,11 +370,23 @@ final class HybridFusionOrchestrator {
     }
 
     /**
-     * Legs whose full Lucene match set equals their returned top-k, so re-running them in the Tail would be a redundant
-     * ANN pass (kNN/neural re-walk the HNSW graph). Only such legs are safe to replace with a direct address of the
-     * already-retrieved hits. A leg whose match set is NOT bounded to its top-k — e.g. {@code neural_sparse},
+     * Legs whose match set is bounded by their own retrieval depth rather than by the data, so re-running them in the Tail
+     * would be a redundant ANN pass (kNN/neural re-walk the HNSW graph). Only such legs are safe to replace with a direct
+     * address of the already-retrieved hits. A leg whose match set is NOT so bounded — e.g. {@code neural_sparse},
      * whose match set is every doc containing a query token (far larger than the window) — must NOT be materialized, or
      * the Tail would drop the rest and undercount total_hits/aggregations (and re-running it is cheap: no graph to walk).
+     *
+     * <p><b>Known limitation — materialization is exact only when the leg was not truncated.</b> A materialized leg stands
+     * for the documents it <i>returned</i>, which is {@code min(matches, window_size)}: {@code newLegRequest} sets the
+     * leg's {@code size} to the window. The leg's real match set is up to its own {@code k} per shard, which fused mode
+     * deliberately does not rewrite (see {@link #buildLegMultiSearch}), so with {@code k} × shards greater than
+     * {@code window_size} the leg matched documents it never returned, and the Tail — a {@code filter}, hence the match set
+     * — leaves them out of {@code total_hits} and out of every aggregation bucket. Classic hybrid counts them, so this is
+     * an under-count relative to classic in exactly that configuration. Default {@code k} (10) is below the default
+     * {@code window_size} (100), which is why the common case is exact; a leg that returned fewer than {@code window_size}
+     * hits is exact by construction, since it was not truncated. Raising {@code window_size} to at least {@code k} ×
+     * shards restores an exact count. The fix — using the original leg in the Tail when a materialized leg came back full —
+     * is deferred: it costs a second ANN walk in precisely the case a user chose a deep {@code k} for.
      */
     private static boolean isMaterializableLeg(QueryBuilder leg) {
         String name = leg.getWriteableName();
@@ -381,10 +396,10 @@ final class HybridFusionOrchestrator {
     /**
      * Single source of truth for whether a fused query needs the executed Tail (the non-scoring
      * {@code bool{should: legs}}): aggregations or highlighting need the full match set in the query phase, an accurate
-     * index-wide {@code total_hits} beyond the fused window needs the legs counted, and a sort that is not by
-     * {@code _score} ranks over the match set rather than the fused window (see
-     * {@link CandidateScope.Disposition#FORCES_TAIL}) — with
-     * Top only, such a request would sort an arbitrary window-sized subset of its matches.
+     * index-wide {@code total_hits} beyond the fused window needs the legs counted, a sort that is not by
+     * {@code _score} ranks over the match set rather than the fused window, and {@code collapse.inner_hits} expands each
+     * group over the match set (see {@link CandidateScope.Disposition#FORCES_TAIL}) — with
+     * Top only, such a request would sort, or expand a group over, an arbitrary window-sized subset of its matches.
      *
      * <p>Deliberately NOT triggers:
      * <ul>
@@ -393,14 +408,16 @@ final class HybridFusionOrchestrator {
      *       would only time a redundant re-execution of legs that already ran in the fan-out.</li>
      *   <li>leg {@code inner_hits} — inner_hits are built in the fetch phase from the <i>registered</i> inner-hit
      *       contexts per returned parent doc, so the leg never has to be executed for them to be returned. They are
-     *       carried separately (see {@link #innerHitsLegs}), which keeps a Top-only query cheap without losing them.</li>
+     *       carried separately (see {@link #innerHitsLegs}), which keeps a Top-only query cheap without losing them.
+     *       This is unlike {@code collapse.inner_hits} above, which is not a fetch-phase expansion of the returned
+     *       document at all but a whole extra search per group, and so does depend on what round 2 matches.</li>
      * </ul>
      */
     private static boolean needsTail(SearchSourceBuilder source, int numRankedDocs) {
         if (Objects.nonNull(source) && (Objects.nonNull(source.aggregations()) || Objects.nonNull(source.highlighter()))) {
             return true;
         }
-        if (CandidateScope.sortDiscardsFusedRanking(source)) {
+        if (CandidateScope.sortDiscardsFusedRanking(source) || CandidateScope.collapseExpandsGroups(source)) {
             return true;
         }
         return wantsTotalsBeyondWindow(source, numRankedDocs);

@@ -268,9 +268,11 @@ final class CandidateScope {
             table,
             SEARCH_SOURCE,
             "collapse",
-            Disposition.NOT_PROPAGATED,
-            "collapsing applies to the fused result, as it does to classic hybrid's; collapsing a leg would instead "
-                + "change which documents are candidates"
+            Disposition.FORCES_TAIL,
+            "collapsing applies to the fused result, as it does to classic hybrid's, and collapsing a leg would instead "
+                + "change which documents are candidates — but collapse.inner_hits expands each group by re-running the "
+                + "round-2 query per group, and a group's members are not confined to the fused window, so Top only would "
+                + "silently drop every member that ranked outside it"
         );
         put(
             table,
@@ -426,6 +428,22 @@ final class CandidateScope {
             }
         }
         return false;
+    }
+
+    /**
+     * True when the request asks for collapse groups to be expanded, i.e. {@code collapse} carries {@code inner_hits}.
+     * Core's {@code ExpandSearchPhase} then issues one extra search per returned group whose query is
+     * {@code bool{filter: group key, must: source().query()}} — by then the self-erased fused query. A group's members are
+     * whichever documents share the representative's collapse key, which is unrelated to the fused window, so with Top
+     * only they match no {@code constant_score} clause and the expansion comes back holding just the members that happened
+     * to rank inside the window. The Tail is what makes the expansion cover the group — see {@link Disposition#FORCES_TAIL}.
+     *
+     * <p>Plain {@code collapse} with no {@code inner_hits} needs nothing: grouping is a query-phase operation over the
+     * documents round 2 already returns, and core runs no expansion at all (its own {@code isCollapseRequest} likewise
+     * tests for a non-empty inner-hits list).
+     */
+    static boolean collapseExpandsGroups(final SearchSourceBuilder source) {
+        return Objects.nonNull(source) && Objects.nonNull(source.collapse()) && source.collapse().getInnerHits().isEmpty() == false;
     }
 
     /**

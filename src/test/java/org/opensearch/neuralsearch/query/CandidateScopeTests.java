@@ -20,6 +20,7 @@ import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.query.InnerHitBuilder;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
@@ -27,6 +28,7 @@ import org.opensearch.script.Script;
 import org.opensearch.search.aggregations.AggregationBuilders;
 import org.opensearch.search.builder.PointInTimeBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.collapse.CollapseBuilder;
 import org.opensearch.search.fetch.subphase.highlight.HighlightBuilder;
 import org.opensearch.search.pipeline.SearchPipelineService;
 import org.opensearch.search.slice.SliceBuilder;
@@ -304,6 +306,23 @@ public class CandidateScopeTests extends OpenSearchTestCase {
             "a field sort anywhere in the sort list counts, not just first",
             CandidateScope.sortDiscardsFusedRanking(
                 new SearchSourceBuilder().sort(SortBuilders.scoreSort()).sort(SortBuilders.fieldSort("price"))
+            )
+        );
+    }
+
+    // ---- FORCES_TAIL: collapse.inner_hits expands a group over the match set, not over the window ----
+
+    public void testCollapseExpandsGroups() {
+        assertFalse("null source", CandidateScope.collapseExpandsGroups(null));
+        assertFalse("no collapse", CandidateScope.collapseExpandsGroups(new SearchSourceBuilder()));
+        assertFalse(
+            "grouping alone runs no expansion search — core's own isCollapseRequest tests the same non-empty inner-hits list",
+            CandidateScope.collapseExpandsGroups(new SearchSourceBuilder().collapse(new CollapseBuilder("grp")))
+        );
+        assertTrue(
+            "inner_hits expands each group by re-running round 2, so round 2 must match the whole group",
+            CandidateScope.collapseExpandsGroups(
+                new SearchSourceBuilder().collapse(new CollapseBuilder("grp").setInnerHits(new InnerHitBuilder("members")))
             )
         );
     }

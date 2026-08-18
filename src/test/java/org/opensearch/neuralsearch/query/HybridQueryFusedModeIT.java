@@ -7,8 +7,10 @@ package org.opensearch.neuralsearch.query;
 import static org.opensearch.neuralsearch.util.AggregationsTestUtils.getNestedHits;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.opensearch.client.Request;
@@ -316,17 +318,20 @@ public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
     }
 
     /**
-     * With {@code collapse.inner_hits}, every expanded member carries ITS OWN fused score — the same score it receives in
-     * the ungrouped fused search, on the same scale as the group representative.
+     * With {@code collapse.inner_hits}, an expanded member that is <b>inside the fused window</b> carries ITS OWN fused
+     * score — the same score it receives in the ungrouped fused search, on the same scale as the group representative.
+     * Every document here is inside the default window, which is what makes that unconditional in this test; the
+     * out-of-window case is
+     * {@link #testFusedMode_whenCollapseInnerHitsAndMemberOutsideWindow_thenGroupStillExpandsFully}.
      *
      * <p>Core's {@code ExpandSearchPhase} re-runs {@code source().query()} once per collapse group. For a fused request
-     * that query is the self-erased Top, where each ranked document has its own {@code constant_score} clause, so each
-     * member is scored by its own clause rather than the representative's.
+     * that query is the self-erased Top (plus Tail), where each ranked document has its own {@code constant_score} clause,
+     * so each member is scored by its own clause rather than the representative's.
      *
      * <p>This differs from classic hybrid, which re-runs the real sub-queries and reports their raw, un-normalized scores
      * — putting members on a different scale from the representative (classic yields a representative at {@code 1.0}
      * beside members at {@code 198.0}). Fused is self-consistent instead, which is why this asserts the fused values
-     * rather than classic parity. Leg-level {@code inner_hits} do match classic exactly and are covered separately.
+     * rather than classic parity.
      */
     @SneakyThrows
     public void testFusedMode_whenCollapseInnerHits_thenMembersCarryTheirOwnFusedScore() {
@@ -373,6 +378,72 @@ public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
         }
     }
 
+    /**
+     * A collapse group's members are whatever share the representative's collapse key, which has nothing to do with the
+     * fused window — so expanding a group must not be limited to the window. Core's {@code ExpandSearchPhase} issues one
+     * search per returned group whose query is the self-erased fused query under a group-key filter; with Top only, a
+     * member that ranked outside the window matches no {@code constant_score} clause and silently disappears from the
+     * expansion, where classic hybrid (and any other query type) returns the whole group. That is why
+     * {@code collapse.inner_hits} forces the Tail on.
+     *
+     * <p>The probe: {@code window_size} one short of the document count, so exactly one member — the lowest-ranked, in the
+     * last group — sits outside the window, plus {@code track_total_hits:false} so nothing else would keep the Tail. Every
+     * document must still come back in its group's expansion. Without the Tail trigger the last group expands to one
+     * member instead of {@link #DOCS_PER_GROUP}.
+     *
+     * <p>Also pins the score split that remains, because it is a real difference from classic and is documented as such:
+     * an in-window member carries its own fused score, while the out-of-window member has no Top clause to score it and
+     * expands at {@code 0.0}.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenCollapseInnerHitsAndMemberOutsideWindow_thenGroupStillExpandsFully() {
+        ensureCollapseDataset();
+        int totalDocs = COLLAPSE_GROUPS * DOCS_PER_GROUP;
+        int window = totalDocs - 1;
+
+        // Ground truth: the fused score of each document that IS in the window, from the same Top-only query ungrouped.
+        Map<String, Double> fusedScoreById = new HashMap<>();
+        for (Map<String, Object> hit : getNestedHits(
+            searchRaw("/" + INDEX_FOR_COLLAPSE + "/_search", "{\"track_total_hits\":false,\"query\":" + collapseFusedQuery(window) + "}")
+        )) {
+            fusedScoreById.put((String) hit.get("_id"), ((Number) hit.get("_score")).doubleValue());
+        }
+        assertEquals("the window holds one document fewer than the corpus", window, fusedScoreById.size());
+
+        String body = "{\"track_total_hits\":false,\"query\":"
+            + collapseFusedQuery(window)
+            + ",\"collapse\":{\"field\":\""
+            + GRP_FIELD
+            + "\",\"inner_hits\":{\"name\":\"members\",\"size\":10}}}";
+
+        List<Map<String, Object>> groups = getNestedHits(searchRaw("/" + INDEX_FOR_COLLAPSE + "/_search", body));
+
+        assertEquals(COLLAPSE_GROUPS, groups.size());
+        Set<String> expanded = new HashSet<>();
+        for (Map<String, Object> group : groups) {
+            List<Map<String, Object>> members = innerHits(group, "members");
+            assertEquals("a group expands to all of its members, window membership notwithstanding", DOCS_PER_GROUP, members.size());
+            for (Map<String, Object> member : members) {
+                String memberId = (String) member.get("_id");
+                assertTrue("no document may be expanded twice", expanded.add(memberId));
+                double memberScore = ((Number) member.get("_score")).doubleValue();
+                if (fusedScoreById.containsKey(memberId)) {
+                    assertEquals(
+                        "in-window member " + memberId + " carries its own fused score",
+                        fusedScoreById.get(memberId),
+                        memberScore,
+                        1e-6
+                    );
+                } else {
+                    // Documented limitation: fusion ranked the window, so a document outside it has no fused score to
+                    // carry. It matches the Tail, which is a filter and therefore contributes nothing to the score.
+                    assertEquals("the out-of-window member matches only the non-scoring Tail", 0.0, memberScore, 1e-6);
+                }
+            }
+        }
+        assertEquals("every document is expanded into exactly one group", totalDocs, expanded.size());
+    }
+
     private String indexConfigWithGroupField() {
         return "{\"settings\":{\"number_of_shards\":2,\"number_of_replicas\":0,\"index.search.default_pipeline\":\""
             + NORM_PIPELINE
@@ -416,7 +487,14 @@ public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
     }
 
     private String collapseFusedQuery() {
-        return "{\"hybrid\":{\"fusion\":{\"normalization\":{\"technique\":\"min_max\"},"
+        return collapseFusedQuery(0);
+    }
+
+    /** The collapse-dataset fused query; {@code windowSize} of 0 leaves {@code window_size} at its default. */
+    private String collapseFusedQuery(int windowSize) {
+        return "{\"hybrid\":{\"fusion\":{"
+            + (windowSize > 0 ? "\"window_size\":" + windowSize + "," : "")
+            + "\"normalization\":{\"technique\":\"min_max\"},"
             + "\"combination\":{\"technique\":\"arithmetic_mean\"}},"
             + "\"queries\":["
             + collapseLeg()
