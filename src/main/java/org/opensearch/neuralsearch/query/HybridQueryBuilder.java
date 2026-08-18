@@ -24,8 +24,10 @@ import org.opensearch.ExceptionsHelper;
 import org.opensearch.OpenSearchStatusException;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.SetOnce;
 import org.opensearch.common.lucene.search.Queries;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.ParseField;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.ParsingException;
@@ -35,7 +37,9 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.query.AbstractQueryBuilder;
+import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.InnerHitContextBuilder;
+import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryCoordinatorContext;
 import org.opensearch.index.query.QueryRewriteContext;
@@ -54,6 +58,7 @@ import org.opensearch.neuralsearch.stats.events.EventStatName;
 import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
 import org.opensearch.neuralsearch.stats.events.EventStatsManager;
 
+import static org.opensearch.neuralsearch.settings.NeuralSearchSettings.MAX_FUSION_LEG_SEARCHES;
 import static org.opensearch.neuralsearch.common.MinClusterVersionUtil.isClusterOnOrAfterMinReqVersionForPaginationInHybridQuery;
 import static org.opensearch.neuralsearch.common.MinClusterVersionUtil.isVersionOnOrAfterMinReqVersionForFusedModeInHybridQuery;
 
@@ -457,6 +462,12 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      * </ul>
      */
     private QueryBuilder doRewriteFused(QueryRewriteContext queryRewriteContext) throws IOException {
+        // Only the match set is wanted (this builder is a leg inside an enclosing fused query's Tail): contribute what the
+        // legs match and do not fan them out again — they already ran, as the enclosing query's leg sub-search. Checked
+        // ahead of everything else: it is the one case where the correct answer is to do no work at all.
+        if (MatchSetRewriteContext.isMatchSetOnly(queryRewriteContext)) {
+            return matchSetQuery();
+        }
         // Round 2: the async self-erase already produced the standard query — swap to it (or stay put until it lands).
         if (Objects.nonNull(fusedSupplier)) {
             QueryBuilder fused = fusedSupplier.get();
@@ -470,6 +481,10 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             return this;
         }
         SearchRequest searchRequest = (SearchRequest) coordinatorContext.getSearchRequest();
+
+        // First, before any config resolution: the whole request's fan-out has to be within the cluster's budget. A body
+        // whose only purpose is to multiply sub-searches should cost one tree walk, not a pipeline lookup per hybrid.
+        validateFusedLegSearchBudget(searchRequest);
 
         FusionSpec fusionSpec = resolveFusionSpec(searchRequest);
         if (Objects.isNull(fusionSpec)) {
@@ -558,6 +573,139 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         marker.resolvedFusionSpec = this.resolvedFusionSpec;
         marker.fusedSupplier = fused::get;
         return marker;
+    }
+
+    /**
+     * This query's match set, as a plain {@code bool{should: legs}} that costs no fan-out.
+     *
+     * <p>Equal to what the fused query matches, clause for clause. A fused hybrid compiles to
+     * {@code bool{ should: [Top...], filter: Tail }} with no {@code minimum_should_match}, so its matches are its Tail's —
+     * and the Tail is {@code bool{should: legs}}, the union of the legs. The scores differ (this loses them entirely), which
+     * is exactly why this form is only ever used where scores are not read: inside the enclosing query's Tail
+     * {@code filter}. A doc that this bool matches while the real fused query would not (or the reverse) does not exist.
+     *
+     * <p>The legs are handed over as-is rather than rewritten here — the caller's rewrite loop keeps going. The one
+     * exception is a leg that is itself a fused hybrid: it contributes <i>its</i> match set in this same pass, rather than
+     * being left for the next rewrite round. Rewrite descends one level per round ({@code BoolQueryBuilder} rewrites each
+     * clause exactly once), and core allows {@link org.opensearch.index.query.Rewriteable#MAX_REWRITE_ROUNDS} rounds for the
+     * whole request, so substituting level by level would spend a round per level of nesting — a chain the leg budget admits
+     * would exhaust them and fail as an internal error instead of running. Collapsing the chain here makes the cost of a
+     * nested chain constant in rounds. Nesting reached through a container leg (a fused hybrid inside a {@code bool} inside
+     * a leg) is still substituted a level per round, since only core can rewrite core's containers.
+     *
+     * <p>{@code match_none} for a legless builder: {@code bool{should: []}} compiles to a {@code MatchAllDocsQuery}, which
+     * in a Tail {@code filter} would open the match set to the whole corpus (the same trap
+     * {@code HybridFusionOrchestrator#materializedLeg} guards for an empty ANN leg). Parsing rejects an empty
+     * {@code queries} array, so this is unreachable from a request — and stated rather than relied upon.
+     */
+    private QueryBuilder matchSetQuery() {
+        if (queries.isEmpty()) {
+            return new MatchNoneQueryBuilder();
+        }
+        BoolQueryBuilder matchSet = new BoolQueryBuilder();
+        for (QueryBuilder query : queries) {
+            boolean legIsFusedHybrid = query instanceof HybridQueryBuilder && Objects.nonNull(((HybridQueryBuilder) query).fusion());
+            matchSet.should(legIsFusedHybrid ? ((HybridQueryBuilder) query).matchSetQuery() : query);
+        }
+        matchSet.queryName(queryName);
+        matchSet.boost(boost);
+        return matchSet;
+    }
+
+    /**
+     * Reject a request that would fan out more leg sub-searches than the cluster allows.
+     *
+     * <p>The counted quantity is <b>declared leg sub-searches</b> — the sum of {@code queries} sizes over every fused
+     * {@code hybrid} in the request body — deliberately modelled on {@code indices.query.bool.max_clause_count}: one
+     * whole-request count of the units the user actually wrote, checked once at rewrite, against a dynamic cluster
+     * setting. Shards are not a factor. A user cannot be asked to reason about legs × shards × nesting: the shard count
+     * is a property of the indices they searched, not of the query they wrote, so folding it in would make the same body
+     * legal on one cluster and rejected on another, and the number in the error message unreproducible.
+     *
+     * <p>The default, {@value org.opensearch.neuralsearch.settings.NeuralSearchSettings#DEFAULT_MAX_FUSION_LEG_SEARCHES},
+     * is {@link #MAX_NUMBER_OF_SUB_QUERIES} squared — a hybrid may declare 5 legs, so 5 levels of fully-nested hybrids is
+     * the shape this admits, and the setting's own floor is {@code MAX_NUMBER_OF_SUB_QUERIES} so that a legal single-level
+     * hybrid can never be rejected by it.
+     *
+     * <p>Counted from the request's own query, not from this builder, so every fused hybrid in a request agrees on one
+     * number: sibling hybrids in a {@code bool} each pay for the others, which is the point — the request is what fans
+     * out. Nesting is walked through {@link QueryBuilder#visit}, so the count is exact for the query builders that expose
+     * their children (all of core's compound queries do) and a lower bound for one that does not — a {@code wrapper} query
+     * carries its inner query as bytes, so a hybrid hidden inside one is invisible here and is counted when the leg
+     * sub-search carrying it rewrites on its own coordinator. That leaves total cost linear in the size of the body the
+     * user had to spell out, which is the property this guard exists to keep.
+     */
+    private static void validateFusedLegSearchBudget(final SearchRequest searchRequest) {
+        if (Objects.isNull(searchRequest.source())) {
+            return;
+        }
+        int maxLegSearches = maxFusionLegSearches();
+        int legSearches = countFusedLegSearches(searchRequest.source().query());
+        if (legSearches > maxLegSearches) {
+            throw new IllegalArgumentException(
+                String.format(
+                    Locale.ROOT,
+                    "[%s] query [%s] declares %d leg sub-searches in this request, more than [%s] (%d). Each leg of each "
+                        + "fused [%s] runs as its own search across the targeted shards; reduce the number of legs or of "
+                        + "nested fused [%s] queries, or raise the setting",
+                    NAME,
+                    FUSION_FIELD.getPreferredName(),
+                    legSearches,
+                    MAX_FUSION_LEG_SEARCHES.getKey(),
+                    maxLegSearches,
+                    NAME,
+                    NAME
+                )
+            );
+        }
+    }
+
+    /**
+     * The live value of {@link NeuralSearchSettings#MAX_FUSION_LEG_SEARCHES} on this coordinator. Read from
+     * {@link org.opensearch.cluster.service.ClusterService}'s cluster settings so a dynamic update takes effect on the
+     * next request; falls back to the default when there is no cluster service to read (no running node — a guardrail
+     * must not become a new way to fail).
+     */
+    private static int maxFusionLegSearches() {
+        ClusterService clusterService = NeuralSearchClusterUtil.instance().getClusterService();
+        if (Objects.isNull(clusterService) || Objects.isNull(clusterService.getClusterSettings())) {
+            return MAX_FUSION_LEG_SEARCHES.getDefault(Settings.EMPTY);
+        }
+        return clusterService.getClusterSettings().get(MAX_FUSION_LEG_SEARCHES);
+    }
+
+    /**
+     * Total leg sub-searches the given query declares: the legs of every fused {@code hybrid} in the tree, itself
+     * included. Package-private so the count can be asserted per query shape without a cluster.
+     */
+    static int countFusedLegSearches(final QueryBuilder query) {
+        if (Objects.isNull(query)) {
+            return 0;
+        }
+        LegSearchCounter counter = new LegSearchCounter();
+        query.visit(counter);
+        return counter.legSearches;
+    }
+
+    /**
+     * Counts the legs of every fused hybrid it is shown. One instance walks the whole tree — it hands itself back as the
+     * child visitor, and {@link #visit} recurses into the legs — so a nested fused hybrid is counted at every depth the
+     * builders expose.
+     */
+    private static final class LegSearchCounter implements QueryBuilderVisitor {
+        private int legSearches;
+
+        @Override
+        public void accept(final QueryBuilder queryBuilder) {
+            if (queryBuilder instanceof HybridQueryBuilder && Objects.nonNull(((HybridQueryBuilder) queryBuilder).fusion())) {
+                legSearches += ((HybridQueryBuilder) queryBuilder).queries().size();
+            }
+        }
+
+        @Override
+        public QueryBuilderVisitor getChildVisitor(final Occur occur) {
+            return this;
+        }
     }
 
     /**

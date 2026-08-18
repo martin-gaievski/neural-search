@@ -4,6 +4,9 @@
  */
 package org.opensearch.neuralsearch.query;
 
+import static org.opensearch.neuralsearch.settings.NeuralSearchSettings.DEFAULT_MAX_FUSION_LEG_SEARCHES;
+import static org.opensearch.neuralsearch.settings.NeuralSearchSettings.MAX_FUSION_LEG_SEARCHES;
+
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -111,6 +114,27 @@ public class HybridQueryFusedModeNestedIT extends BaseNeuralSearchIT {
             + ","
             + leg()
             + "]}}";
+    }
+
+    /**
+     * A chain of {@code levels} fused hybrids, each holding the level below as its first leg plus one plain leg — so the
+     * body grows by one clause per level and declares {@code 2 x levels} leg sub-searches. One level is exactly
+     * {@link #fusedHybrid()}.
+     */
+    private String nestedFusedChain(int levels) {
+        String query = leg();
+        for (int level = 0; level < levels; level++) {
+            query = "{\"hybrid\":{\"fusion\":{\"window_size\":"
+                + WINDOW_SIZE
+                + ",\"normalization\":{\"technique\":\"min_max\"},"
+                + "\"combination\":{\"technique\":\"arithmetic_mean\",\"parameters\":{\"weights\":[0.5,0.5]}}},"
+                + "\"queries\":["
+                + query
+                + ","
+                + leg()
+                + "]}}";
+        }
+        return query;
     }
 
     /**
@@ -255,6 +279,49 @@ public class HybridQueryFusedModeNestedIT extends BaseNeuralSearchIT {
             "fused window (grp A) ranks first",
             ids.subList(0, Math.min(WINDOW_SIZE, ids.size())).stream().allMatch(id -> Integer.parseInt(id) <= WINDOW_LAST_ID)
         );
+    }
+
+    /**
+     * Nesting costs what the body spells out, and no more. Every level of this chain adds two leg sub-searches, and the
+     * deepest chain the leg budget admits ({@code max_leg_searches / 2} levels) has to actually run: each level is executed
+     * exactly once, as its parent's leg sub-search, and the enclosing Tail contributes the nested legs' union instead of
+     * firing them again. Two failures this rules out, both of which reproduce on a body of a few hundred bytes: the fan-out
+     * doubling per level ({@code 2^(depth+1) - 2} leg searches), and one rewrite round spent per level of nesting, which
+     * exhausts core's 16 and answers a within-budget request with an internal error.
+     */
+    @SneakyThrows
+    public void testFused_deepestNestingWithinTheLegBudget_runs() {
+        ensureDataset();
+        int levels = DEFAULT_MAX_FUSION_LEG_SEARCHES / 2;
+        String body = "{\"query\":" + nestedFusedChain(levels) + ",\"track_total_hits\":true}";
+
+        Map<String, Object> resp = searchRaw(body, 20);
+
+        assertFalse(levels + " levels of fused nesting must return hits", hitIds(resp).isEmpty());
+        assertEquals("and the Tail still covers the whole union at that depth", (long) TOTAL_DOCS, totalHits(resp));
+    }
+
+    /**
+     * One leg sub-search past the budget is the user's 400 — naming the count, the ceiling and the setting that raises it —
+     * not a 500. The rejection is decided from the request body alone, before the first fan-out, so an over-budget request
+     * costs one tree walk rather than the searches it asked for.
+     */
+    @SneakyThrows
+    public void testFused_whenNestingExceedsTheLegBudget_thenBadRequestNotServerError() {
+        ensureDataset();
+        int levels = DEFAULT_MAX_FUSION_LEG_SEARCHES / 2 + 1;
+        String body = "{\"query\":" + nestedFusedChain(levels) + "}";
+
+        ResponseException e = expectThrows(ResponseException.class, () -> searchRawExpectingFailure(body));
+
+        assertEquals(
+            "an over-budget body is a user error, not a server error",
+            RestStatus.BAD_REQUEST.getStatus(),
+            e.getResponse().getStatusLine().getStatusCode()
+        );
+        String message = EntityUtils.toString(e.getResponse().getEntity());
+        assertTrue("the response states what the body declares: " + message, message.contains("declares " + (2 * levels) + " leg"));
+        assertTrue("and how to raise it: " + message, message.contains(MAX_FUSION_LEG_SEARCHES.getKey()));
     }
 
     /**
