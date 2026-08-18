@@ -17,6 +17,7 @@ import java.util.TreeSet;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchType;
 import org.opensearch.action.support.IndicesOptions;
+import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.xcontent.XContentParser;
@@ -105,6 +106,8 @@ public class CandidateScopeTests extends OpenSearchTestCase {
         }
     }
 
+    @SuppressForbidden(reason = "the guard exists to see core's private state: getFields() returns only public fields, of which "
+        + "SearchRequest and SearchSourceBuilder have none, so it would pass vacuously")
     private List<Field> instanceFields(Class<?> type) {
         List<Field> fields = new ArrayList<>();
         for (Field field : type.getDeclaredFields()) {
