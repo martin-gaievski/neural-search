@@ -4,8 +4,6 @@
  */
 package org.opensearch.neuralsearch.processor.normalization;
 
-import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -17,8 +15,6 @@ import java.util.Set;
 
 import lombok.NonNull;
 import lombok.extern.log4j.Log4j2;
-import org.apache.commons.lang3.Range;
-import org.apache.commons.lang3.math.NumberUtils;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TopDocs;
 import org.opensearch.common.TriConsumer;
@@ -37,18 +33,18 @@ import static org.opensearch.neuralsearch.processor.explain.ExplanationUtils.get
 /**
  * Abstracts calculation of rank scores for each document returned as part of
  * reciprocal rank fusion. Rank scores are summed across subqueries in combination classes.
+ * <p>
+ * This class owns the traversal of shard side {@link CompoundTopDocs}; the RRF arithmetic itself lives in
+ * {@link RRFScoreNormalizer} so that coordinator side fusion can apply identical logic to its own result shape.
  */
 @ToString(onlyExplicitlyIncluded = true)
 @Log4j2
 public class RRFNormalizationTechnique implements ScoreNormalizationTechnique, ExplainableTechnique {
     @ToString.Include
     public static final String TECHNIQUE_NAME = "rrf";
-    public static final int DEFAULT_RANK_CONSTANT = 60;
-    public static final String PARAM_NAME_RANK_CONSTANT = "rank_constant";
+    public static final int DEFAULT_RANK_CONSTANT = RRFScoreNormalizer.DEFAULT_RANK_CONSTANT;
+    public static final String PARAM_NAME_RANK_CONSTANT = RRFScoreNormalizer.PARAM_NAME_RANK_CONSTANT;
     private static final Set<String> SUPPORTED_PARAMS = Set.of(PARAM_NAME_RANK_CONSTANT);
-    private static final int MIN_RANK_CONSTANT = 1;
-    private static final int MAX_RANK_CONSTANT = 10_000;
-    private static final Range<Integer> RANK_CONSTANT_RANGE = Range.of(MIN_RANK_CONSTANT, MAX_RANK_CONSTANT);
     @ToString.Include
     private final int rankConstant;
     // Comparator to compare ShardResultPerSubQuery
@@ -59,7 +55,7 @@ public class RRFNormalizationTechnique implements ScoreNormalizationTechnique, E
 
     public RRFNormalizationTechnique(final Map<String, Object> params, final ScoreNormalizationUtil scoreNormalizationUtil) {
         scoreNormalizationUtil.validateParameters(params, SUPPORTED_PARAMS, Map.of());
-        rankConstant = getRankConstant(params);
+        rankConstant = RRFScoreNormalizer.resolveRankConstant(params);
     }
 
     /**
@@ -119,16 +115,14 @@ public class RRFNormalizationTechnique implements ScoreNormalizationTechnique, E
         // We created docId-shardId format because docId can be same across different shards but the combination is unique.
         for (Map.Entry<Integer, PriorityQueue<ShardResultPerSubQuery>> entry : scoreDocsPerSubquery.entrySet()) {
             int subQueryNumber = entry.getKey();
-            globallySortedDocIdMap.putIfAbsent(subQueryNumber, new HashMap<>());
-
             PriorityQueue<ShardResultPerSubQuery> sortedScoreDocsAcrossAllShards = entry.getValue();
-            // first rank
-            int rank = 0;
-            while (!sortedScoreDocsAcrossAllShards.isEmpty()) {
-                ShardResultPerSubQuery shardResultPerSubQuery = sortedScoreDocsAcrossAllShards.poll();
-                globallySortedDocIdMap.get(subQueryNumber)
-                    .put(shardResultPerSubQuery.scoreDoc.doc + "_" + shardResultPerSubQuery.referenceShardId, rank++);
-            }
+            globallySortedDocIdMap.putIfAbsent(
+                subQueryNumber,
+                RRFScoreNormalizer.drainToRanks(
+                    sortedScoreDocsAcrossAllShards,
+                    shardResultPerSubQuery -> shardResultPerSubQuery.scoreDoc.doc + "_" + shardResultPerSubQuery.referenceShardId
+                )
+            );
         }
         return globallySortedDocIdMap;
     }
@@ -211,43 +205,10 @@ public class RRFNormalizationTechnique implements ScoreNormalizationTechnique, E
                     "Document not found in global ranking map: doc=" + scoreDoc.doc + ", shard=" + referenceShardId
                 );
             }
-            float normalizedScore = calculateNormalizedScore(rank);
+            float normalizedScore = RRFScoreNormalizer.scoreForRank(rank, rankConstant);
             DocIdAtSearchShard docIdAtSearchShard = new DocIdAtSearchShard(scoreDoc.doc, searchShard);
             scoreProcessor.apply(docIdAtSearchShard, normalizedScore, topDocsIndex);
             scoreDoc.score = normalizedScore;
-        }
-    }
-
-    private float calculateNormalizedScore(int position) {
-        return BigDecimal.ONE.divide(BigDecimal.valueOf(rankConstant + position + 1), 10, RoundingMode.HALF_UP).floatValue();
-    }
-
-    private int getRankConstant(final Map<String, Object> params) {
-        if (Objects.isNull(params) || !params.containsKey(PARAM_NAME_RANK_CONSTANT)) {
-            return DEFAULT_RANK_CONSTANT;
-        }
-        int rankConstant = getParamAsInteger(params, PARAM_NAME_RANK_CONSTANT);
-        validateRankConstant(rankConstant);
-        return rankConstant;
-    }
-
-    private void validateRankConstant(final int rankConstant) {
-        if (!RANK_CONSTANT_RANGE.contains(rankConstant)) {
-            throw new IllegalArgumentException(
-                String.format(
-                    Locale.ROOT,
-                    "rank constant must be in the interval between 1 and 10000, submitted rank constant: %d",
-                    rankConstant
-                )
-            );
-        }
-    }
-
-    private static int getParamAsInteger(final Map<String, Object> parameters, final String fieldName) {
-        try {
-            return NumberUtils.createInteger(String.valueOf(parameters.get(fieldName)));
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException(String.format(Locale.ROOT, "parameter [%s] must be an integer", fieldName));
         }
     }
 
