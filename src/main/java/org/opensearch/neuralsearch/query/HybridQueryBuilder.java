@@ -22,6 +22,7 @@ import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.OpenSearchStatusException;
+import org.opensearch.Version;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
@@ -59,6 +60,7 @@ import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
 import org.opensearch.neuralsearch.stats.events.EventStatsManager;
 
 import static org.opensearch.neuralsearch.settings.NeuralSearchSettings.MAX_FUSION_LEG_SEARCHES;
+import static org.opensearch.neuralsearch.common.MinClusterVersionUtil.MINIMAL_SUPPORTED_VERSION_FUSED_MODE_IN_HYBRID_QUERY;
 import static org.opensearch.neuralsearch.common.MinClusterVersionUtil.isClusterOnOrAfterMinReqVersionForPaginationInHybridQuery;
 import static org.opensearch.neuralsearch.common.MinClusterVersionUtil.isVersionOnOrAfterMinReqVersionForFusedModeInHybridQuery;
 
@@ -477,6 +479,10 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         if (Objects.isNull(coordinatorContext)) {
             return this;
         }
+        // Before anything about the request itself: a cluster that cannot run round 2 on every shard cannot run fused mode
+        // at all. Ahead of the SearchRequest cast on purpose — _explain and _validate/query rewrite on the coordinator with
+        // a non-search request and are dispatched still-fused, so they need the same refusal.
+        requireClusterSupportsFusedMode();
         if ((coordinatorContext.getSearchRequest() instanceof SearchRequest) == false) {
             return this;
         }
@@ -610,6 +616,45 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         matchSet.queryName(queryName);
         matchSet.boost(boost);
         return matchSet;
+    }
+
+    /**
+     * Refuse fused mode while any node in the cluster predates it.
+     *
+     * <p>Round 2 dispatches a {@link HybridFusionQueryBuilder} — a query type introduced together with fused mode — to
+     * every shard the request touches, and a node predating that version cannot resolve the {@code hybrid_fusion}
+     * {@link org.opensearch.core.common.io.stream.NamedWriteable} name at all, so it fails while deserializing the shard
+     * request. That is not a clean error to the client: with {@code allow_partial_search_results} at its default the
+     * request still answers 200, with every document on those shards silently missing. A leg fan-out that reached an old
+     * node fails the same way, and a still-fused builder dispatched by {@code _explain} / {@code _validate/query} is worse
+     * — the {@code fusion} field is gated off the wire, so the old node answers for a <i>classic</i> hybrid instead.
+     *
+     * <p>Cluster-wide minimum here, where the wire gates on the {@code fusion} field ({@link #doWriteTo} and the
+     * {@link StreamInput} constructor) use the peer stream's negotiated version: those pick a serialization format for one
+     * known peer, this decides whether the coordinator may enter a path whose recipients are not known yet. Checked at
+     * rewrite on the coordinator, before the fan-out, so the refusal costs less than the search it replaces.
+     *
+     * <p>Over-refuses in one shape — a cluster whose only lagging node holds none of the targeted shards, a
+     * cluster-manager-only or coordinating-only node — and that is the intended trade: routing is not knowable at rewrite,
+     * and the alternative is answering some of those requests with results silently missing.
+     */
+    private static void requireClusterSupportsFusedMode() {
+        Version clusterMinVersion = NeuralSearchClusterUtil.instance().getClusterMinVersion();
+        if (isVersionOnOrAfterMinReqVersionForFusedModeInHybridQuery(clusterMinVersion) == false) {
+            throw new IllegalArgumentException(
+                String.format(
+                    Locale.ROOT,
+                    "[%s] query [%s] requires all nodes in the cluster to be on version [%s] or later, but the minimum node "
+                        + "version is [%s], so the fused query cannot be dispatched to every shard. Upgrade the remaining "
+                        + "nodes, or drop the [%s] block and use classic hybrid with a normalization or score-ranker processor",
+                    NAME,
+                    FUSION_FIELD.getPreferredName(),
+                    MINIMAL_SUPPORTED_VERSION_FUSED_MODE_IN_HYBRID_QUERY,
+                    clusterMinVersion,
+                    FUSION_FIELD.getPreferredName()
+                )
+            );
+        }
     }
 
     /**

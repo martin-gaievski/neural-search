@@ -9,6 +9,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
+import static org.opensearch.neuralsearch.common.MinClusterVersionUtil.MINIMAL_SUPPORTED_VERSION_FUSED_MODE_IN_HYBRID_QUERY;
 import static org.opensearch.neuralsearch.settings.NeuralSearchSettings.DEFAULT_MAX_FUSION_LEG_SEARCHES;
 import static org.opensearch.neuralsearch.settings.NeuralSearchSettings.MAX_FUSION_LEG_SEARCHES;
 
@@ -31,6 +32,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
@@ -295,6 +297,80 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
         assertEquals("both siblings fan out, each once", List.of(2, 2), fanOut.legCountPerMultiSearch());
     }
 
+    // ---------------------------------------------- version guard ----------------------------------------------
+
+    /**
+     * Fused mode on a cluster that cannot run round 2 everywhere is refused before anything is fanned out. Round 2 is a
+     * {@code hybrid_fusion} query, a type a node predating fused mode cannot resolve at all — it fails deserializing the
+     * shard request, and a shard failure under the default {@code allow_partial_search_results} is a 200 with those shards'
+     * documents silently missing. So the cost of being wrong here is a wrong answer, not an error.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenAnyNodeIsBelowTheMinimumVersion_isRejectedBeforeAnyFanOut() {
+        initClusterUtil(null, Version.V_3_7_0);
+        QueryBuilder query = nestedChain(1);
+        List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+        QueryCoordinatorContext coordinatorContext = coordinatorContext(request(query), registered);
+
+        IllegalArgumentException error = expectThrows(IllegalArgumentException.class, () -> query.rewrite(coordinatorContext));
+
+        assertThat(
+            error.getMessage(),
+            containsString("on version [" + MINIMAL_SUPPORTED_VERSION_FUSED_MODE_IN_HYBRID_QUERY + "] or later")
+        );
+        assertThat("the message quotes what the cluster actually is", error.getMessage(), containsString("is [" + Version.V_3_7_0 + "]"));
+        assertTrue("refused before the fan-out whose results no node could be asked to fuse", registered.isEmpty());
+    }
+
+    /**
+     * The boundary is inclusive: a cluster exactly at the minimum runs fused mode. Spelled as the literal rather than as
+     * {@code MINIMAL_SUPPORTED_VERSION_FUSED_MODE_IN_HYBRID_QUERY} so it pins the version fused mode ships in — against
+     * the constant this assertion holds by construction and a bump would go unnoticed.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenEveryNodeIsExactlyAtTheMinimumVersion_thenItFansOut() {
+        initClusterUtil(null, Version.V_3_8_0);
+
+        FanOut fanOut = drive(request(nestedChain(1)));
+
+        assertEquals(1, fanOut.multiSearches());
+        assertEquals(List.of(2), fanOut.legCountPerMultiSearch());
+    }
+
+    /**
+     * The refusal sits above the {@code SearchRequest} cast on purpose. {@code _explain} and {@code _validate/query} rewrite
+     * on the coordinator with an {@code ExplainRequest}/{@code ValidateQueryRequest} and are then dispatched <i>still
+     * fused</i> to the node holding the document — where the {@code fusion} field is gated off the wire, so an old node
+     * answers for a classic hybrid instead. Refusing below the cast would leave that shape silently wrong.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenTheRequestIsNotASearch_thenItIsStillRefusedOnALaggingCluster() {
+        initClusterUtil(null, Version.V_3_7_0);
+        QueryBuilder query = nestedChain(1);
+        QueryCoordinatorContext coordinatorContext = mock(QueryCoordinatorContext.class);
+        when(coordinatorContext.convertToCoordinatorContext()).thenReturn(coordinatorContext);
+        when(coordinatorContext.getSearchRequest()).thenReturn(mock(org.opensearch.action.IndicesRequest.class));
+
+        IllegalArgumentException error = expectThrows(IllegalArgumentException.class, () -> query.rewrite(coordinatorContext));
+
+        assertThat(error.getMessage(), containsString("requires all nodes in the cluster to be on version"));
+    }
+
+    /** Scoped to fused mode: classic hybrid is answered by every version that can parse it, and stays version-free. */
+    @SneakyThrows
+    public void testClassicHybrid_onTheSameLaggingCluster_isUnaffected() {
+        initClusterUtil(null, Version.V_3_7_0);
+        HybridQueryBuilder classic = new HybridQueryBuilder();
+        classic.add(new MatchQueryBuilder(TEXT_FIELD_NAME, "hello"));
+        classic.add(QueryBuilders.termQuery(TEXT_FIELD_NAME, "kw"));
+        List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+
+        QueryBuilder rewritten = classic.rewrite(coordinatorContext(request(classic), registered));
+
+        assertNotNull(rewritten);
+        assertTrue("classic hybrid does not fan out at all", registered.isEmpty());
+    }
+
     // ------------------------------------------------ harness ------------------------------------------------
 
     /** A chain {@code depth} fused hybrids deep, each holding the level below plus one term leg: 2 legs per level. */
@@ -412,17 +488,26 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
         return hit;
     }
 
-    /**
-     * A cluster the fused rewrite can read: concrete indices for the window check, and cluster settings for the budget.
-     * {@code null} settings means nothing is configured, so the budget falls back to the setting's own default.
-     */
+    /** A cluster every node of which is on the current version — the fused rewrite's precondition. */
     private void initClusterUtil(final Settings clusterSettings) {
+        initClusterUtil(clusterSettings, Version.CURRENT);
+    }
+
+    /**
+     * A cluster the fused rewrite can read: a minimum node version, concrete indices for the window check, and cluster
+     * settings for the budget. {@code null} settings means nothing is configured, so the budget falls back to the
+     * setting's own default.
+     */
+    private void initClusterUtil(final Settings clusterSettings, final Version minNodeVersion) {
         Metadata metadata = mock(Metadata.class);
         ClusterState clusterState = mock(ClusterState.class);
         ClusterService clusterService = mock(ClusterService.class);
         when(clusterService.state()).thenReturn(clusterState);
         when(clusterState.metadata()).thenReturn(metadata);
         when(clusterState.getMetadata()).thenReturn(metadata);
+        DiscoveryNodes nodes = mock(DiscoveryNodes.class);
+        when(clusterState.getNodes()).thenReturn(nodes);
+        when(nodes.getMinNodeVersion()).thenReturn(minNodeVersion);
         when(metadata.custom(SearchPipelineMetadata.TYPE)).thenReturn(new SearchPipelineMetadata(Map.of()));
         if (clusterSettings != null) {
             when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(clusterSettings, Set.of(MAX_FUSION_LEG_SEARCHES)));

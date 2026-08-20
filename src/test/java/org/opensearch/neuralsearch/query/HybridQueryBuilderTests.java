@@ -746,6 +746,16 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         assertEquals(1, asyncRegistered.get());
     }
 
+    /**
+     * The cluster's minimum node version, which the fused rewrite reads before anything else about the request. Every
+     * helper below stubs it: without it {@code getMinNodeVersion()} answers null on a mock and the guardrail NPEs.
+     */
+    private static void stubClusterMinVersion(final org.opensearch.cluster.ClusterState clusterState, final Version minNodeVersion) {
+        org.opensearch.cluster.node.DiscoveryNodes nodes = mock(org.opensearch.cluster.node.DiscoveryNodes.class);
+        when(clusterState.getNodes()).thenReturn(nodes);
+        when(nodes.getMinNodeVersion()).thenReturn(minNodeVersion);
+    }
+
     /** Initialize NeuralSearchClusterUtil with a cluster state that resolves NO pipeline (empty metadata, no default). */
     private void initClusterUtilWithNoPipeline() {
         org.opensearch.cluster.metadata.Metadata metadata = mock(org.opensearch.cluster.metadata.Metadata.class);
@@ -754,6 +764,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         when(clusterService.state()).thenReturn(clusterState);
         when(clusterState.metadata()).thenReturn(metadata);
         when(clusterState.getMetadata()).thenReturn(metadata);
+        stubClusterMinVersion(clusterState, Version.CURRENT);
         org.opensearch.cluster.metadata.IndexNameExpressionResolver resolver = mock(
             org.opensearch.cluster.metadata.IndexNameExpressionResolver.class
         );
@@ -1021,6 +1032,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         when(clusterService.state()).thenReturn(clusterState);
         when(clusterState.metadata()).thenReturn(metadata);
         when(clusterState.getMetadata()).thenReturn(metadata);
+        stubClusterMinVersion(clusterState, Version.CURRENT);
         when(metadata.custom(org.opensearch.search.pipeline.SearchPipelineMetadata.TYPE)).thenReturn(
             new org.opensearch.search.pipeline.SearchPipelineMetadata(Map.of())
         );
@@ -1052,6 +1064,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         when(clusterService.state()).thenReturn(clusterState);
         when(clusterState.metadata()).thenReturn(metadata);
         when(clusterState.getMetadata()).thenReturn(metadata);
+        stubClusterMinVersion(clusterState, Version.CURRENT);
         when(metadata.custom(org.opensearch.search.pipeline.SearchPipelineMetadata.TYPE)).thenReturn(
             new org.opensearch.search.pipeline.SearchPipelineMetadata(Map.of())
         );

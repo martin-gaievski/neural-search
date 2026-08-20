@@ -88,7 +88,10 @@ import org.opensearch.index.query.TermQueryBuilder;
  * <p>This query is created internally by the coordinator self-erase and is never parseable from a search request. Its
  * wire form needs no version gate: the whole query type is new in the same version that introduced fused mode, and a
  * node predating that version cannot resolve this {@code NamedWriteable} name at all — so it fails on the query name
- * long before reading any field.
+ * long before reading any field. Which is precisely why it must never be sent to one: that failure is a shard failure,
+ * and a shard failure is a silently short answer under the default {@code allow_partial_search_results}. The coordinator
+ * refuses fused mode outright while the cluster's minimum node version is below it, so this query is only ever built for
+ * a cluster that can read it — see {@code HybridQueryBuilder#requireClusterSupportsFusedMode}.
  */
 public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQueryBuilder> {
 
