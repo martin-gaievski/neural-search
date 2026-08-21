@@ -34,6 +34,7 @@ import java.util.Set;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TermQuery;
@@ -705,9 +706,32 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
     }
 
     @SneakyThrows
+    public void testDoRewriteFused_whenRequestShapeIsUnsupported_thenRefusesBeforeTheFanOut() {
+        // A refusal must cost less than the search it replaces: CandidateScope validates before registerAsyncAction, so
+        // an unsupported request shape never burns a leg MultiSearch. terminate_after stands in for the whole
+        // REJECTED set; the per-field messages are covered in CandidateScopeTests.
+        initClusterUtilWithMaxResultWindow(10000);
+        HybridQueryBuilder builder = fusedBuilder(new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"))));
+        SearchRequest searchRequest = new SearchRequest("test-index").source(new SearchSourceBuilder().query(builder).terminateAfter(100));
+        QueryCoordinatorContext ctx = mock(QueryCoordinatorContext.class);
+        when(ctx.convertToCoordinatorContext()).thenReturn(ctx);
+        when(ctx.getSearchRequest()).thenReturn(searchRequest);
+        java.util.concurrent.atomic.AtomicInteger asyncRegistered = new java.util.concurrent.atomic.AtomicInteger();
+        doAnswer(invocation -> {
+            asyncRegistered.incrementAndGet();
+            return null;
+        }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.doRewrite(ctx));
+
+        assertThat(e.getMessage(), containsString("does not support [terminate_after]"));
+        assertEquals("the refusal must precede the leg fan-out", 0, asyncRegistered.get());
+    }
+
+    @SneakyThrows
     public void testDoRewriteFused_whenWindowSizeInFusion_thenSupportedAndRegisters() {
         // A fusion block carrying window_size + supported techniques resolves and registers without error (the leg
-        // size wiring itself is asserted in HybridFusionOrchestratorTests#testBuildLegMultiSearch_perLegSourceShape).
+        // request shape itself is asserted in CandidateScopeTests).
         initClusterUtilWithMaxResultWindow(10000);
         HybridQueryBuilder withWindow = fusedBuilder(
             new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"), "window_size", 25))
@@ -722,6 +746,16 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         assertEquals(1, asyncRegistered.get());
     }
 
+    /**
+     * The cluster's minimum node version, which the fused rewrite reads before anything else about the request. Every
+     * helper below stubs it: without it {@code getMinNodeVersion()} answers null on a mock and the guardrail NPEs.
+     */
+    private static void stubClusterMinVersion(final org.opensearch.cluster.ClusterState clusterState, final Version minNodeVersion) {
+        org.opensearch.cluster.node.DiscoveryNodes nodes = mock(org.opensearch.cluster.node.DiscoveryNodes.class);
+        when(clusterState.getNodes()).thenReturn(nodes);
+        when(nodes.getMinNodeVersion()).thenReturn(minNodeVersion);
+    }
+
     /** Initialize NeuralSearchClusterUtil with a cluster state that resolves NO pipeline (empty metadata, no default). */
     private void initClusterUtilWithNoPipeline() {
         org.opensearch.cluster.metadata.Metadata metadata = mock(org.opensearch.cluster.metadata.Metadata.class);
@@ -730,6 +764,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         when(clusterService.state()).thenReturn(clusterState);
         when(clusterState.metadata()).thenReturn(metadata);
         when(clusterState.getMetadata()).thenReturn(metadata);
+        stubClusterMinVersion(clusterState, Version.CURRENT);
         org.opensearch.cluster.metadata.IndexNameExpressionResolver resolver = mock(
             org.opensearch.cluster.metadata.IndexNameExpressionResolver.class
         );
@@ -749,6 +784,93 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         assertThat(e.getMessage(), containsString("requires a normalization or score-ranker processor"));
     }
 
+    /** An outer fused hybrid whose first leg is itself a fused hybrid taking its config from the pipeline. */
+    private HybridQueryBuilder outerWithNestedFusedLeg() {
+        HybridQueryBuilder nested = new HybridQueryBuilder();
+        nested.add(new MatchQueryBuilder(TEXT_FIELD_NAME, "inner-a"));
+        nested.add(new MatchQueryBuilder(TEXT_FIELD_NAME, "inner-b"));
+        nested.fusion(new HashMap<>()); // fusion:{} → no inline config, must come from the pipeline
+        HybridQueryBuilder outer = new HybridQueryBuilder();
+        outer.add(nested);
+        outer.add(QueryBuilders.termQuery(TEXT_FIELD_NAME, TERM_QUERY_TEXT));
+        outer.fusion(new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"))));
+        return outer;
+    }
+
+    @SneakyThrows
+    public void testProjectResolvedConfigOntoLegs_projectsOnlyFusedLegsWithoutInlineConfig() {
+        FusionSpec resolved = new FusionSpec(FusionSpec.TECHNIQUE_ARITHMETIC_MEAN, FusionSpec.NORMALIZATION_MIN_MAX, 60, new float[0]);
+
+        // A fused leg with no inline config is substituted by an equal-but-distinct copy carrying the resolved config.
+        List<QueryBuilder> legs = outerWithNestedFusedLeg().queries();
+        List<QueryBuilder> projected = HybridQueryBuilder.projectResolvedConfigOntoLegs(legs, resolved);
+        assertNotSame("a projectable leg forces a new list", legs, projected);
+        assertNotSame("the fused leg is replaced by a copy", legs.get(0), projected.get(0));
+        assertEquals("the copy is wire/equality-identical to the original leg", legs.get(0), projected.get(0));
+        assertSame("non-hybrid legs are left alone", legs.get(1), projected.get(1));
+
+        // Nothing to project: an inline-config fused leg and a plain leg both stay put, and the list is not copied.
+        HybridQueryBuilder inlineNested = new HybridQueryBuilder();
+        inlineNested.add(new MatchQueryBuilder(TEXT_FIELD_NAME, "inner"));
+        inlineNested.fusion(new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"))));
+        List<QueryBuilder> noneProjectable = List.of(inlineNested, QueryBuilders.termQuery(TEXT_FIELD_NAME, TERM_QUERY_TEXT));
+        assertSame(
+            "no projectable leg → the original list is reused",
+            noneProjectable,
+            HybridQueryBuilder.projectResolvedConfigOntoLegs(noneProjectable, resolved)
+        );
+    }
+
+    @SneakyThrows
+    public void testDoRewriteFused_whenNestedFusedLegOnPipelineDisabledLegRequest_thenInheritsResolvedConfig() {
+        // The blocker: legs are fanned out with pipeline=_none so per-leg processors do not run, so a nested fused
+        // hybrid could resolve no config from its own leg request and failed claiming the user had no pipeline.
+        // Drive the REAL leg-request builder, then rewrite the nested leg exactly as the leg sub-search would.
+        initClusterUtilWithNoPipeline();
+        HybridQueryBuilder outer = outerWithNestedFusedLeg();
+        SearchRequest userRequest = new SearchRequest("test-index").source(new SearchSourceBuilder().query(outer))
+            .pipeline("norm-pipeline");
+        FusionSpec resolved = new FusionSpec(FusionSpec.TECHNIQUE_ARITHMETIC_MEAN, FusionSpec.NORMALIZATION_MIN_MAX, 60, new float[0]);
+
+        org.opensearch.action.search.MultiSearchRequest fannedOut = HybridFusionOrchestrator.buildLegMultiSearch(
+            CandidateScope.from(userRequest),
+            HybridQueryBuilder.projectResolvedConfigOntoLegs(outer.queries(), resolved),
+            10
+        );
+        SearchRequest legRequest = fannedOut.requests().get(0);
+        assertEquals("leg sub-searches run with the search pipeline disabled", "_none", legRequest.pipeline());
+
+        QueryCoordinatorContext legCtx = mock(QueryCoordinatorContext.class);
+        when(legCtx.convertToCoordinatorContext()).thenReturn(legCtx);
+        when(legCtx.getSearchRequest()).thenReturn(legRequest);
+        java.util.concurrent.atomic.AtomicInteger asyncRegistered = new java.util.concurrent.atomic.AtomicInteger();
+        doAnswer(invocation -> {
+            asyncRegistered.incrementAndGet();
+            return null;
+        }).when(legCtx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+
+        QueryBuilder rewritten = legRequest.source().query().rewrite(legCtx);
+
+        assertEquals("the nested fused leg fans out its own legs instead of failing", 1, asyncRegistered.get());
+        assertTrue(rewritten instanceof HybridQueryBuilder);
+
+        // Negative control: the same nested leg WITHOUT the projected config still cannot resolve, and now says why.
+        org.opensearch.action.search.MultiSearchRequest unprojected = HybridFusionOrchestrator.buildLegMultiSearch(
+            CandidateScope.from(userRequest),
+            outer.queries(),
+            10
+        );
+        QueryCoordinatorContext bareCtx = mock(QueryCoordinatorContext.class);
+        when(bareCtx.convertToCoordinatorContext()).thenReturn(bareCtx);
+        when(bareCtx.getSearchRequest()).thenReturn(unprojected.requests().get(0));
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> unprojected.requests().get(0).source().query().rewrite(bareCtx)
+        );
+        assertThat(e.getMessage(), containsString("must carry an inline [fusion] config"));
+        assertThat(e.getMessage(), containsString("leg sub-search runs with the search pipeline disabled"));
+    }
+
     @SneakyThrows
     public void testDoRewriteFused_whenSearchRequestNotResolvable_thenReturnsThis() {
         // If the coordinator context's request is not a SearchRequest, doRewriteFused is a no-op (returns itself).
@@ -760,13 +882,25 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         assertSame(builder, builder.doRewrite(ctx));
     }
 
-    /** A MultiSearch item wrapping a SearchResponse whose hits carry the given (_id -> score) pairs. */
+    /**
+     * A MultiSearch item wrapping a SearchResponse whose hits carry the given (_id -> score) pairs. Each hit is given a
+     * shard target, which is how a real coordinator-side hit gets its {@code _index} — fusion identifies a document by
+     * {@code _index} plus {@code _id} and rejects a hit that carries no index.
+     */
     private org.opensearch.action.search.MultiSearchResponse.Item legItem(Map<String, Float> idToScore) {
         org.opensearch.search.SearchHit[] hits = new org.opensearch.search.SearchHit[idToScore.size()];
         int i = 0;
         for (Map.Entry<String, Float> e : idToScore.entrySet()) {
             org.opensearch.search.SearchHit hit = new org.opensearch.search.SearchHit(i, e.getKey(), Map.of(), Map.of());
             hit.score(e.getValue());
+            hit.shard(
+                new org.opensearch.search.SearchShardTarget(
+                    "node-1",
+                    new org.opensearch.core.index.shard.ShardId(new Index("test-index", "test-index-uuid"), 0),
+                    null,
+                    org.opensearch.action.OriginalIndices.NONE
+                )
+            );
             hits[i++] = hit;
         }
         org.opensearch.search.SearchHits searchHits = new org.opensearch.search.SearchHits(
@@ -845,20 +979,29 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
     }
 
     @SneakyThrows
-    public void testDoRewriteFused_whenMultipleIndices_thenFailsFast() {
-        // Fusion keys leg hits by _id, which is unique only within one index, so multi-index fused search is rejected
-        // until keying + the self-erase are index-aware (guards against conflated same-_id docs from different indices).
+    public void testDoRewriteFused_whenMultipleIndices_thenProceeds() {
+        // Multi-index fused search is supported now that fusion keys documents by _index + _id: the interim reject guard
+        // is gone, and the request registers its leg fan-out like any other. (That same-_id docs across indices stay
+        // distinct is asserted at the fusion/self-erase level in HybridFusionOrchestratorTests.)
         initClusterUtilWithConcreteIndexCount(2);
         HybridQueryBuilder builder = fusedBuilder(new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"))));
         QueryCoordinatorContext ctx = coordinatorContextFor(builder);
-        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.doRewrite(ctx));
-        assertThat(e.getMessage(), containsString("does not yet support searching multiple indices"));
+        java.util.concurrent.atomic.AtomicInteger asyncRegistered = new java.util.concurrent.atomic.AtomicInteger();
+        doAnswer(invocation -> {
+            asyncRegistered.incrementAndGet();
+            return null;
+        }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+
+        builder.doRewrite(ctx);
+
+        assertEquals("multi-index fused query fans out normally", 1, asyncRegistered.get());
     }
 
     @SneakyThrows
-    public void testDoRewriteFused_whenMultiSearchTransportFails_thenErrorIsHybridFramed() {
+    public void testDoRewriteFused_whenMultiSearchTransportFails_thenErrorIsHybridFramedAndKeepsStatus() {
         // Whole-MultiSearch transport failure (not a per-leg Item failure) is reframed as the user's hybrid/fused query
-        // instead of surfacing a bare multiSearch error.
+        // instead of surfacing a bare multiSearch error — while keeping the underlying status, so a rejected fan-out is
+        // still the retryable 429 it was and not an opaque 500.
         initClusterUtilWithMaxResultWindow(10000);
         HybridQueryBuilder builder = fusedBuilder(
             new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"), "combination", Map.of("technique", "arithmetic_mean")))
@@ -877,7 +1020,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         org.opensearch.transport.client.Client client = mock(org.opensearch.transport.client.Client.class);
         doAnswer(invocation -> {
             org.opensearch.core.action.ActionListener<org.opensearch.action.search.MultiSearchResponse> l = invocation.getArgument(1);
-            l.onFailure(new RuntimeException("msearch rejected"));
+            l.onFailure(new org.opensearch.core.concurrency.OpenSearchRejectedExecutionException("msearch rejected"));
             return null;
         }).when(client).multiSearch(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
 
@@ -886,6 +1029,11 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         assertNotNull(failure.get());
         assertThat(failure.get().getMessage(), containsString("failed to execute fused-mode sub-queries"));
         assertThat(failure.get().getMessage(), containsString("msearch rejected"));
+        assertEquals(
+            "a rejected fan-out must stay a 429 so client retry-on-429 fires",
+            org.opensearch.core.rest.RestStatus.TOO_MANY_REQUESTS,
+            org.opensearch.ExceptionsHelper.status(failure.get())
+        );
     }
 
     /** Initialize NeuralSearchClusterUtil so getIndexMetadataList resolves the given number of concrete indices. */
@@ -896,6 +1044,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         when(clusterService.state()).thenReturn(clusterState);
         when(clusterState.metadata()).thenReturn(metadata);
         when(clusterState.getMetadata()).thenReturn(metadata);
+        stubClusterMinVersion(clusterState, Version.CURRENT);
         when(metadata.custom(org.opensearch.search.pipeline.SearchPipelineMetadata.TYPE)).thenReturn(
             new org.opensearch.search.pipeline.SearchPipelineMetadata(Map.of())
         );
@@ -927,6 +1076,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         when(clusterService.state()).thenReturn(clusterState);
         when(clusterState.metadata()).thenReturn(metadata);
         when(clusterState.getMetadata()).thenReturn(metadata);
+        stubClusterMinVersion(clusterState, Version.CURRENT);
         when(metadata.custom(org.opensearch.search.pipeline.SearchPipelineMetadata.TYPE)).thenReturn(
             new org.opensearch.search.pipeline.SearchPipelineMetadata(Map.of())
         );
@@ -974,6 +1124,52 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
         builder.doRewrite(ctx);
         assertEquals(1, asyncRegistered.get());
+    }
+
+    @SneakyThrows
+    public void testDoRewriteFused_whenWindowSizeExceedsMaxClauseCount_thenFailsFast() {
+        // The self-erased query holds one bool clause per ranked doc, so window_size is bounded by Lucene's clause ceiling
+        // as well — a much lower limit than max_result_window, and the only one that would otherwise be discovered at query
+        // time on every shard. Set to a non-default value so this also pins that the check reads the live static (which
+        // SearchService keeps in sync with the dynamic indices.query.bool.max_clause_count setting) and not a constant.
+        initClusterUtilWithMaxResultWindow(10000);
+        int savedMaxClauseCount = IndexSearcher.getMaxClauseCount();
+        IndexSearcher.setMaxClauseCount(8);
+        try {
+            // 8 clauses fit only if the Tail is absent, and Tail presence is unknown until the legs have answered.
+            HybridQueryBuilder builder = fusedBuilder(
+                new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"), "window_size", 8))
+            );
+            QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+            doAnswer(invocation -> null).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.doRewrite(ctx));
+            assertThat(e.getMessage(), containsString("indices.query.bool.max_clause_count"));
+        } finally {
+            IndexSearcher.setMaxClauseCount(savedMaxClauseCount);
+        }
+    }
+
+    @SneakyThrows
+    public void testDoRewriteFused_whenWindowSizeLeavesRoomForTail_thenProceeds() {
+        // One below the ceiling: the window plus the single Tail clause exactly fills the bool, so the request proceeds.
+        initClusterUtilWithMaxResultWindow(10000);
+        int savedMaxClauseCount = IndexSearcher.getMaxClauseCount();
+        IndexSearcher.setMaxClauseCount(8);
+        try {
+            HybridQueryBuilder builder = fusedBuilder(
+                new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"), "window_size", 7))
+            );
+            QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+            java.util.concurrent.atomic.AtomicInteger asyncRegistered = new java.util.concurrent.atomic.AtomicInteger();
+            doAnswer(invocation -> {
+                asyncRegistered.incrementAndGet();
+                return null;
+            }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+            builder.doRewrite(ctx);
+            assertEquals(1, asyncRegistered.get());
+        } finally {
+            IndexSearcher.setMaxClauseCount(savedMaxClauseCount);
+        }
     }
 
     @SneakyThrows

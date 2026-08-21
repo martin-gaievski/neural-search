@@ -6,9 +6,20 @@ package org.opensearch.neuralsearch.query;
 
 import static org.opensearch.neuralsearch.util.AggregationsTestUtils.getNestedHits;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
+import org.apache.hc.core5.http.io.entity.EntityUtils;
+import org.opensearch.client.Request;
+import org.opensearch.client.Response;
+import org.opensearch.client.ResponseException;
+import org.opensearch.common.xcontent.XContentHelper;
+import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.neuralsearch.BaseNeuralSearchIT;
@@ -27,6 +38,22 @@ import lombok.SneakyThrows;
 public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
 
     private static final String TEXT_FIELD = "text";
+    /** Own index: the PIT test mutates the doc set mid-test, which would break the exact hit counts asserted above. */
+    private static final String INDEX_FOR_PIT = "test-hybrid-fused-pit";
+    private static final String RANK_FIELD = "rank";
+    /** Documents in the PIT index. The fused window is bound to this count so a post-PIT doc can only enter it by
+     *  evicting a real one — which is what lets this test detect legs that ignore the PIT. */
+    private static final int PIT_DOCS = 3;
+    /** Own index: the slice test partitions its corpus, so it must not share documents with the PIT test's mutations. */
+    private static final String INDEX_FOR_SLICE = "test-hybrid-fused-slice";
+    /** Enough documents that both of the index's shards hold some, so slicing partitions the corpus non-trivially. */
+    private static final int SLICE_DOCS = 20;
+    private static final int SLICES = 2;
+    /** Own index: collapse needs a low-cardinality keyword to group on, which the text-only indices above lack. */
+    private static final String INDEX_FOR_COLLAPSE = "test-hybrid-fused-collapse";
+    private static final String GRP_FIELD = "grp";
+    private static final int COLLAPSE_GROUPS = 2;
+    private static final int DOCS_PER_GROUP = 2;
     private static final String INDEX_WITH_DEFAULT_NORM = "test-hybrid-fused-default-norm";
     private static final String INDEX_NO_PIPELINE = "test-hybrid-fused-inline-config";
     private static final String NORM_PIPELINE = "fused-mode-norm-pipeline";
@@ -130,5 +157,512 @@ public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
             assertTrue("fused score must be > 0 for a matched doc", score > 0.0);
             previous = score;
         }
+    }
+
+    /**
+     * A user-supplied point-in-time must be honored by the whole fused flow, legs included.
+     *
+     * <p>Fused mode opens N leg searches plus the round-2 self-erased query, so without a shared view those are N+1
+     * independent reader instants and a concurrently indexed document can appear in some of them but not others. Passing
+     * the request's PIT down to every leg makes them all read one immutable snapshot.
+     *
+     * <p>The probe: take a PIT, then index a document that ranks ABOVE everything already there. Through the PIT it must
+     * stay invisible, while a live search sees it.
+     *
+     * <p>Three details make this a real regression guard rather than a tautology:
+     * <ul>
+     *   <li>Both legs score by a numeric field via {@code function_score}, so the fused order is exactly the field order —
+     *       deterministic and shard-independent, unlike BM25 (whose min_max floor can actually sink a newly added short
+     *       document to the BOTTOM of a leg, which would hide the defect entirely).</li>
+     *   <li>{@code window_size} is bound to the existing document count, so a document that should be invisible can only
+     *       enter the window by evicting a real one.</li>
+     *   <li>The query is Top-only ({@code track_total_hits:false}); with the Tail present the legs would be re-matched
+     *       directly and return the real documents regardless of what the Top holds, masking the defect.</li>
+     * </ul>
+     * Top-only, the returned hits ARE the fused window: if the legs ignored the PIT they would rank the new document in,
+     * round-2 would read the PIT, fail to match that id, and the request would return FEWER hits than the window holds.
+     * Verified by mutation — removing the PIT passthrough from the legs makes this test fail with 2 hits instead of 3.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenPointInTimeSupplied_thenLegsAndRoundTwoShareOneSnapshot() {
+        if (indexExists(INDEX_FOR_PIT) == false) {
+            createIndex(INDEX_FOR_PIT, indexConfigWithRankField());
+            for (int id = 1; id <= PIT_DOCS; id++) {
+                indexRankedDoc(id, id * 10);
+            }
+        }
+        String pitId = createPointInTime(INDEX_FOR_PIT);
+        try {
+            assertEquals("the Top-only fused window holds every document", PIT_DOCS, getHitCount(searchWithPit(pitId)));
+
+            // A document that outranks everything present, so live legs would put it at the head of the window.
+            indexRankedDoc(PIT_DOCS + 1, 100_000);
+
+            Map<String, Object> throughPit = searchWithPit(pitId);
+            assertEquals(
+                "PIT snapshot must not see the doc indexed after it was taken, and no window slot may be lost to it",
+                PIT_DOCS,
+                getHitCount(throughPit)
+            );
+            for (Map<String, Object> hit : getNestedHits(throughPit)) {
+                assertNotEquals("the post-PIT doc must not leak into the fused window", String.valueOf(PIT_DOCS + 1), hit.get("_id"));
+            }
+
+            // Sanity: a live search does rank it first, so the assertions above are about the snapshot — not about the
+            // document failing to index or to match the legs.
+            List<Map<String, Object>> liveHits = getNestedHits(searchLive());
+            assertEquals("a live search ranks the new doc first", String.valueOf(PIT_DOCS + 1), liveHits.get(0).get("_id"));
+        } finally {
+            deletePointInTime(pitId);
+        }
+    }
+
+    private String indexConfigWithRankField() {
+        return indexConfigWithRankField(3);
+    }
+
+    private String indexConfigWithRankField(int shards) {
+        return "{\"settings\":{\"number_of_shards\":"
+            + shards
+            + ",\"number_of_replicas\":0},\"mappings\":{\"properties\":{\""
+            + RANK_FIELD
+            + "\":{\"type\":\"integer\"}}}}";
+    }
+
+    private void indexRankedDoc(int id, int rank) {
+        indexRankedDoc(INDEX_FOR_PIT, id, rank);
+    }
+
+    @SneakyThrows
+    private void indexRankedDoc(String index, int id, int rank) {
+        Request request = new Request("PUT", "/" + index + "/_doc/" + id + "?refresh=true");
+        request.setJsonEntity("{\"" + RANK_FIELD + "\":" + rank + "}");
+        Response response = client().performRequest(request);
+        int code = response.getStatusLine().getStatusCode();
+        assertTrue("indexing doc " + id + " failed: " + code, code == RestStatus.OK.getStatus() || code == RestStatus.CREATED.getStatus());
+    }
+
+    /** Open a point-in-time over the index and return its id. */
+    @SneakyThrows
+    private String createPointInTime(String index) {
+        Request request = new Request("POST", "/" + index + "/_search/point_in_time?keep_alive=5m");
+        Response response = client().performRequest(request);
+        assertEquals(RestStatus.OK, RestStatus.fromCode(response.getStatusLine().getStatusCode()));
+        Map<String, Object> body = XContentHelper.convertToMap(
+            XContentType.JSON.xContent(),
+            EntityUtils.toString(response.getEntity()),
+            false
+        );
+        String pitId = (String) body.get("pit_id");
+        assertNotNull("pit_id must be returned", pitId);
+        return pitId;
+    }
+
+    @SneakyThrows
+    private void deletePointInTime(String pitId) {
+        Request request = new Request("DELETE", "/_search/point_in_time");
+        request.setJsonEntity("{\"pit_id\":[\"" + pitId + "\"]}");
+        client().performRequest(request);
+    }
+
+    /** Two legs that both score by the numeric rank field, so the fused order is exactly the rank order. */
+    private String rankedFusedQuery() {
+        return rankedFusedQuery(PIT_DOCS);
+    }
+
+    private String rankedFusedQuery(int windowSize) {
+        String leg = "{\"function_score\":{\"query\":{\"match_all\":{}},\"field_value_factor\":{\"field\":\""
+            + RANK_FIELD
+            + "\",\"modifier\":\"none\",\"missing\":1}}}";
+        return "{\"hybrid\":{\"fusion\":{\"window_size\":"
+            + windowSize
+            + ",\"normalization\":{\"technique\":\"min_max\"},"
+            + "\"combination\":{\"technique\":\"arithmetic_mean\"}},"
+            + "\"queries\":["
+            + leg
+            + ","
+            + leg
+            + "]}}";
+    }
+
+    /**
+     * Fused search against a PIT, Top-only. The index deliberately does NOT appear in the path: a PIT already pins its own
+     * indices and core rejects a PIT request that also names them.
+     */
+    @SneakyThrows
+    private Map<String, Object> searchWithPit(String pitId) {
+        return searchRaw(
+            "/_search",
+            "{\"pit\":{\"id\":\"" + pitId + "\",\"keep_alive\":\"5m\"},\"track_total_hits\":false,\"query\":" + rankedFusedQuery() + "}"
+        );
+    }
+
+    /** The same fused query without a PIT, for the live-visibility contrast. */
+    @SneakyThrows
+    private Map<String, Object> searchLive() {
+        return searchRaw("/" + INDEX_FOR_PIT + "/_search", "{\"track_total_hits\":false,\"query\":" + rankedFusedQuery() + "}");
+    }
+
+    private Map<String, Object> searchRaw(String endpoint, String jsonBody) {
+        return searchRaw(endpoint, jsonBody, 10);
+    }
+
+    @SneakyThrows
+    private Map<String, Object> searchRaw(String endpoint, String jsonBody, int size) {
+        Request request = new Request("POST", endpoint);
+        request.addParameter("size", String.valueOf(size));
+        request.setJsonEntity(jsonBody);
+        Response response = client().performRequest(request);
+        assertEquals(RestStatus.OK, RestStatus.fromCode(response.getStatusLine().getStatusCode()));
+        return XContentHelper.convertToMap(XContentType.JSON.xContent(), EntityUtils.toString(response.getEntity()), false);
+    }
+
+    /**
+     * {@code slice} must reach every leg. A sliced request returns only its slice, so legs that ignored the slice would
+     * fill the window with documents belonging to other slices, and each slice would come back an arbitrary fraction of
+     * itself. That is why {@code CandidateScope} classifies {@code sliceBuilder} as propagated rather than ignored.
+     *
+     * <p>Slicing is legal only over a scroll or a point-in-time, and fused mode refuses scroll
+     * ({@link #testFusedMode_whenScroll_thenRejectedWithValidationError}), so two slices over one PIT is the only shape
+     * that reaches this code at all — before this test the word "slice" appeared in no fused test.
+     *
+     * <p>The probe: learn each slice's true membership from core alone with a plain {@code match_all} over the same PIT,
+     * then run the fused query per slice with a {@code window_size} that covers the largest slice but is still smaller
+     * than the corpus. With the slice propagated, each slice's window holds exactly the documents that slice owns.
+     * Without it, both legs return the global top {@code window_size} by rank and round 2's slice filter keeps only the
+     * part that happens to fall inside the slice, so the slices together return fewer than {@link #SLICE_DOCS} documents
+     * and the per-slice equality fails.
+     *
+     * <p>Two details keep it honest: {@code window_size} is asserted to be below the corpus size, since a window that
+     * covered everything would make an unsliced leg indistinguishable from a sliced one; and the query is Top-only
+     * ({@code track_total_hits:false}), because with the Tail present round 2 re-matches the legs directly under the
+     * shard's slice filter and returns the whole slice regardless of what the Top holds.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenSlicedOverPointInTime_thenEachSliceReturnsItsOwnDocuments() {
+        ensureSliceDataset();
+        String pitId = createPointInTime(INDEX_FOR_SLICE);
+        try {
+            // Ground truth, established by core with no hybrid query involved: which documents each slice owns.
+            List<Set<String>> membership = new ArrayList<>();
+            for (int slice = 0; slice < SLICES; slice++) {
+                membership.add(idsOf(searchRaw("/_search", slicedPitBody(pitId, slice, "{\"match_all\":{}}"), SLICE_DOCS * 2)));
+            }
+            Set<String> union = new HashSet<>();
+            int largestSlice = 0;
+            for (Set<String> slice : membership) {
+                for (String id : slice) {
+                    assertTrue("core's own slices must not overlap", union.add(id));
+                }
+                largestSlice = Math.max(largestSlice, slice.size());
+            }
+            assertEquals("core's slices must together cover the corpus", SLICE_DOCS, union.size());
+            assertTrue(
+                "the window must stay below the corpus size or an unsliced leg would cover every slice anyway",
+                largestSlice < SLICE_DOCS
+            );
+
+            for (int slice = 0; slice < SLICES; slice++) {
+                Set<String> fused = idsOf(
+                    searchRaw("/_search", slicedPitBody(pitId, slice, rankedFusedQuery(largestSlice)), SLICE_DOCS * 2)
+                );
+                assertEquals("slice " + slice + " must return exactly the documents it owns", membership.get(slice), fused);
+            }
+        } finally {
+            deletePointInTime(pitId);
+        }
+    }
+
+    /**
+     * Fused mode refuses {@code scroll} with a validation error instead of letting it fail deep in the shards. A scroll
+     * pages one reader snapshot and that snapshot covers round 2 alone: the legs that chose the window ran as separate
+     * one-shot searches against their own reader instants and are never re-run, so later pages would be paged out of a
+     * ranking round 1 cannot reproduce. Classic hybrid refuses scroll too.
+     *
+     * <p>What this pins is the diagnosis, not just the failure. Left unguarded, {@code scroll} plus {@code slice} reaches
+     * the shards, where slicing rejects the scroll-less leg requests and the user gets "all shards failed" naming the
+     * slice — a whole-request failure with a misleading cause. The error asserted here names {@code scroll} as the
+     * unsupported parameter and points at {@code point_in_time}, which fused mode does support
+     * ({@link #testFusedMode_whenPointInTimeSupplied_thenLegsAndRoundTwoShareOneSnapshot}).
+     */
+    @SneakyThrows
+    public void testFusedMode_whenScroll_thenRejectedWithValidationError() {
+        ensureSliceDataset();
+        Request request = new Request("POST", "/" + INDEX_FOR_SLICE + "/_search");
+        request.addParameter("scroll", "1m");
+        request.addParameter("size", "10");
+        // No track_total_hits here: core itself rejects disabling it in a scroll context, which would pre-empt the
+        // rejection under test.
+        request.setJsonEntity("{\"query\":" + rankedFusedQuery(SLICE_DOCS) + "}");
+
+        ResponseException exception = expectThrows(ResponseException.class, () -> client().performRequest(request));
+
+        assertEquals(RestStatus.BAD_REQUEST.getStatus(), exception.getResponse().getStatusLine().getStatusCode());
+        String body = EntityUtils.toString(exception.getResponse().getEntity());
+        assertTrue("the error must name the unsupported parameter, not a shard-level symptom: " + body, body.contains("[scroll]"));
+        assertTrue("the error must point at the shape that does work: " + body, body.contains("point_in_time"));
+    }
+
+    /** A PIT-scoped search body for one slice. The index never appears in the path: a PIT already pins its own indices. */
+    private String slicedPitBody(String pitId, int slice, String query) {
+        return "{\"pit\":{\"id\":\""
+            + pitId
+            + "\",\"keep_alive\":\"5m\"},\"slice\":{\"id\":"
+            + slice
+            + ",\"max\":"
+            + SLICES
+            + "},\"track_total_hits\":false,\"query\":"
+            + query
+            + "}";
+    }
+
+    private Set<String> idsOf(Map<String, Object> response) {
+        Set<String> ids = new HashSet<>();
+        for (Map<String, Object> hit : getNestedHits(response)) {
+            ids.add((String) hit.get("_id"));
+        }
+        return ids;
+    }
+
+    @SneakyThrows
+    private void ensureSliceDataset() {
+        if (indexExists(INDEX_FOR_SLICE)) {
+            return;
+        }
+        // Two shards and two slices, so each slice maps to exactly one shard and the partition is deterministic.
+        createIndex(INDEX_FOR_SLICE, indexConfigWithRankField(SLICES));
+        for (int id = 1; id <= SLICE_DOCS; id++) {
+            indexRankedDoc(INDEX_FOR_SLICE, id, id * 10);
+        }
+    }
+
+    /**
+     * Collapse GROUPING over a fused query must match classic hybrid exactly — it is a plain query-phase operation over
+     * the fused ranking, with no fused-specific handling. This is a real parity guard, not a limitation pin.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenCollapse_thenGroupingMatchesClassic() {
+        ensureCollapseDataset();
+        String collapse = "\"collapse\":{\"field\":\"" + GRP_FIELD + "\"}";
+
+        List<Map<String, Object>> fusedHits = getNestedHits(
+            searchRaw("/" + INDEX_FOR_COLLAPSE + "/_search", "{\"query\":" + collapseFusedQuery() + "," + collapse + "}")
+        );
+        List<Map<String, Object>> classicHits = getNestedHits(
+            searchRaw("/" + INDEX_FOR_COLLAPSE + "/_search", "{\"query\":" + collapseClassicQuery() + "," + collapse + "}")
+        );
+
+        assertEquals("collapse yields one hit per group", COLLAPSE_GROUPS, fusedHits.size());
+        assertEquals("fused and classic collapse to the same number of groups", classicHits.size(), fusedHits.size());
+        // Same groups, in the same order, represented by the same documents.
+        for (int i = 0; i < fusedHits.size(); i++) {
+            assertEquals("group key order matches classic", collapseKey(classicHits.get(i)), collapseKey(fusedHits.get(i)));
+            assertEquals("group representative matches classic", classicHits.get(i).get("_id"), fusedHits.get(i).get("_id"));
+        }
+    }
+
+    /**
+     * With {@code collapse.inner_hits}, an expanded member that is <b>inside the fused window</b> carries ITS OWN fused
+     * score — the same score it receives in the ungrouped fused search, on the same scale as the group representative.
+     * Every document here is inside the default window, which is what makes that unconditional in this test; the
+     * out-of-window case is
+     * {@link #testFusedMode_whenCollapseInnerHitsAndMemberOutsideWindow_thenGroupStillExpandsFully}.
+     *
+     * <p>Core's {@code ExpandSearchPhase} re-runs {@code source().query()} once per collapse group. For a fused request
+     * that query is the self-erased Top (plus Tail), where each ranked document has its own {@code constant_score} clause,
+     * so each member is scored by its own clause rather than the representative's.
+     *
+     * <p>This differs from classic hybrid, which re-runs the real sub-queries and reports their raw, un-normalized scores
+     * — putting members on a different scale from the representative (classic yields a representative at {@code 1.0}
+     * beside members at {@code 198.0}). Fused is self-consistent instead, which is why this asserts the fused values
+     * rather than classic parity.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenCollapseInnerHits_thenMembersCarryTheirOwnFusedScore() {
+        ensureCollapseDataset();
+
+        // Ground truth: the fused score each document receives with no collapse applied.
+        Map<String, Double> fusedScoreById = new HashMap<>();
+        for (Map<String, Object> hit : getNestedHits(
+            searchRaw("/" + INDEX_FOR_COLLAPSE + "/_search", "{\"query\":" + collapseFusedQuery() + "}")
+        )) {
+            fusedScoreById.put((String) hit.get("_id"), ((Number) hit.get("_score")).doubleValue());
+        }
+        assertEquals("every document is fused", COLLAPSE_GROUPS * DOCS_PER_GROUP, fusedScoreById.size());
+
+        String body = "{\"query\":"
+            + collapseFusedQuery()
+            + ",\"collapse\":{\"field\":\""
+            + GRP_FIELD
+            + "\",\"inner_hits\":{\"name\":\"members\",\"size\":10}}}";
+
+        List<Map<String, Object>> groups = getNestedHits(searchRaw("/" + INDEX_FOR_COLLAPSE + "/_search", body));
+
+        assertEquals(COLLAPSE_GROUPS, groups.size());
+        for (Map<String, Object> group : groups) {
+            List<Map<String, Object>> members = innerHits(group, "members");
+            assertEquals("each group expands to all of its documents", DOCS_PER_GROUP, members.size());
+            for (Map<String, Object> member : members) {
+                String memberId = (String) member.get("_id");
+                assertEquals(
+                    "expanded member " + memberId + " must carry its own fused score, not the representative's",
+                    fusedScoreById.get(memberId),
+                    ((Number) member.get("_score")).doubleValue(),
+                    1e-6
+                );
+            }
+            // The representative is the group's best-scoring member, consistent with the fused ranking.
+            double representativeScore = ((Number) group.get("_score")).doubleValue();
+            for (Map<String, Object> member : members) {
+                assertTrue(
+                    "no member may outrank its group representative",
+                    ((Number) member.get("_score")).doubleValue() <= representativeScore + 1e-6
+                );
+            }
+        }
+    }
+
+    /**
+     * A collapse group's members are whatever share the representative's collapse key, which has nothing to do with the
+     * fused window — so expanding a group must not be limited to the window. Core's {@code ExpandSearchPhase} issues one
+     * search per returned group whose query is the self-erased fused query under a group-key filter; with Top only, a
+     * member that ranked outside the window matches no {@code constant_score} clause and silently disappears from the
+     * expansion, where classic hybrid (and any other query type) returns the whole group. That is why
+     * {@code collapse.inner_hits} forces the Tail on.
+     *
+     * <p>The probe: {@code window_size} one short of the document count, so exactly one member — the lowest-ranked, in the
+     * last group — sits outside the window, plus {@code track_total_hits:false} so nothing else would keep the Tail. Every
+     * document must still come back in its group's expansion. Without the Tail trigger the last group expands to one
+     * member instead of {@link #DOCS_PER_GROUP}.
+     *
+     * <p>Also pins the score split that remains, because it is a real difference from classic and is documented as such:
+     * an in-window member carries its own fused score, while the out-of-window member has no Top clause to score it and
+     * expands at {@code 0.0}.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenCollapseInnerHitsAndMemberOutsideWindow_thenGroupStillExpandsFully() {
+        ensureCollapseDataset();
+        int totalDocs = COLLAPSE_GROUPS * DOCS_PER_GROUP;
+        int window = totalDocs - 1;
+
+        // Ground truth: the fused score of each document that IS in the window, from the same Top-only query ungrouped.
+        Map<String, Double> fusedScoreById = new HashMap<>();
+        for (Map<String, Object> hit : getNestedHits(
+            searchRaw("/" + INDEX_FOR_COLLAPSE + "/_search", "{\"track_total_hits\":false,\"query\":" + collapseFusedQuery(window) + "}")
+        )) {
+            fusedScoreById.put((String) hit.get("_id"), ((Number) hit.get("_score")).doubleValue());
+        }
+        assertEquals("the window holds one document fewer than the corpus", window, fusedScoreById.size());
+
+        String body = "{\"track_total_hits\":false,\"query\":"
+            + collapseFusedQuery(window)
+            + ",\"collapse\":{\"field\":\""
+            + GRP_FIELD
+            + "\",\"inner_hits\":{\"name\":\"members\",\"size\":10}}}";
+
+        List<Map<String, Object>> groups = getNestedHits(searchRaw("/" + INDEX_FOR_COLLAPSE + "/_search", body));
+
+        assertEquals(COLLAPSE_GROUPS, groups.size());
+        Set<String> expanded = new HashSet<>();
+        for (Map<String, Object> group : groups) {
+            List<Map<String, Object>> members = innerHits(group, "members");
+            assertEquals("a group expands to all of its members, window membership notwithstanding", DOCS_PER_GROUP, members.size());
+            for (Map<String, Object> member : members) {
+                String memberId = (String) member.get("_id");
+                assertTrue("no document may be expanded twice", expanded.add(memberId));
+                double memberScore = ((Number) member.get("_score")).doubleValue();
+                if (fusedScoreById.containsKey(memberId)) {
+                    assertEquals(
+                        "in-window member " + memberId + " carries its own fused score",
+                        fusedScoreById.get(memberId),
+                        memberScore,
+                        1e-6
+                    );
+                } else {
+                    // Documented limitation: fusion ranked the window, so a document outside it has no fused score to
+                    // carry. It matches the Tail, which is a filter and therefore contributes nothing to the score.
+                    assertEquals("the out-of-window member matches only the non-scoring Tail", 0.0, memberScore, 1e-6);
+                }
+            }
+        }
+        assertEquals("every document is expanded into exactly one group", totalDocs, expanded.size());
+    }
+
+    private String indexConfigWithGroupField() {
+        return "{\"settings\":{\"number_of_shards\":2,\"number_of_replicas\":0,\"index.search.default_pipeline\":\""
+            + NORM_PIPELINE
+            + "\"},\"mappings\":{\"properties\":{\""
+            + GRP_FIELD
+            + "\":{\"type\":\"keyword\"},\""
+            + RANK_FIELD
+            + "\":{\"type\":\"integer\"}}}}";
+    }
+
+    @SneakyThrows
+    private void ensureCollapseDataset() {
+        // Classic hybrid needs a normalization pipeline; the index default supplies it for the comparison test.
+        createSearchPipeline(NORM_PIPELINE, "min_max", "arithmetic_mean", Map.of());
+        if (indexExists(INDEX_FOR_COLLAPSE)) {
+            return;
+        }
+        createIndex(INDEX_FOR_COLLAPSE, indexConfigWithGroupField());
+        int id = 1;
+        for (int group = 0; group < COLLAPSE_GROUPS; group++) {
+            for (int member = 0; member < DOCS_PER_GROUP; member++) {
+                Request request = new Request("PUT", "/" + INDEX_FOR_COLLAPSE + "/_doc/" + id + "?refresh=true");
+                // Distinct ranks so both the fused order and the per-group representative are deterministic.
+                request.setJsonEntity("{\"" + GRP_FIELD + "\":\"g" + group + "\",\"" + RANK_FIELD + "\":" + (100 - id) + "}");
+                Response response = client().performRequest(request);
+                int code = response.getStatusLine().getStatusCode();
+                assertTrue(
+                    "indexing doc " + id + " failed: " + code,
+                    code == RestStatus.OK.getStatus() || code == RestStatus.CREATED.getStatus()
+                );
+                id++;
+            }
+        }
+    }
+
+    /** Two legs scoring by the numeric rank field, so the fused order is deterministic and shard-independent. */
+    private String collapseLeg() {
+        return "{\"function_score\":{\"query\":{\"match_all\":{}},\"field_value_factor\":{\"field\":\""
+            + RANK_FIELD
+            + "\",\"modifier\":\"none\",\"missing\":1}}}";
+    }
+
+    private String collapseFusedQuery() {
+        return collapseFusedQuery(0);
+    }
+
+    /** The collapse-dataset fused query; {@code windowSize} of 0 leaves {@code window_size} at its default. */
+    private String collapseFusedQuery(int windowSize) {
+        return "{\"hybrid\":{\"fusion\":{"
+            + (windowSize > 0 ? "\"window_size\":" + windowSize + "," : "")
+            + "\"normalization\":{\"technique\":\"min_max\"},"
+            + "\"combination\":{\"technique\":\"arithmetic_mean\"}},"
+            + "\"queries\":["
+            + collapseLeg()
+            + ","
+            + collapseLeg()
+            + "]}}";
+    }
+
+    private String collapseClassicQuery() {
+        return "{\"hybrid\":{\"queries\":[" + collapseLeg() + "," + collapseLeg() + "]}}";
+    }
+
+    @SuppressWarnings("unchecked")
+    private String collapseKey(Map<String, Object> hit) {
+        List<Object> fields = (List<Object>) ((Map<String, Object>) hit.get("fields")).get(GRP_FIELD);
+        return String.valueOf(fields.get(0));
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> innerHits(Map<String, Object> hit, String name) {
+        Map<String, Object> inner = (Map<String, Object>) hit.get("inner_hits");
+        assertNotNull("collapse.inner_hits must be present", inner);
+        Map<String, Object> named = (Map<String, Object>) inner.get(name);
+        Map<String, Object> hits = (Map<String, Object>) named.get("hits");
+        return (List<Map<String, Object>>) hits.get("hits");
     }
 }

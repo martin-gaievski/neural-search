@@ -369,7 +369,8 @@ public class NeuralSearch extends Plugin
             SparseSettings.IS_SPARSE_INDEX_SETTING,
             NeuralSearchSettings.SPARSE_ALGO_PARAM_INDEX_THREAD_QTY_SETTING,
             NEURAL_CIRCUIT_BREAKER_LIMIT,
-            NEURAL_CIRCUIT_BREAKER_OVERHEAD
+            NEURAL_CIRCUIT_BREAKER_OVERHEAD,
+            NeuralSearchSettings.MAX_FUSION_LEG_SEARCHES
         );
     }
 

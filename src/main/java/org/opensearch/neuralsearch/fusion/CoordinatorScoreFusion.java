@@ -4,6 +4,7 @@
  */
 package org.opensearch.neuralsearch.fusion;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -17,11 +18,11 @@ import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
 
 /**
- * Coordinator-side score fusion for the resolver (fused) mode, over an {@code _id}-keyed per-leg score view (shape
- * that coordinator has after fanning legs out as a {@code MultiSearch}). It deliberately reuses the same relevance math
- * as classic shard-side hybrid — {@link MinMaxScoreNormalizer} for normalization and the caller-supplied
+ * Coordinator-side score fusion for the resolver (fused) mode, over a per-leg score view keyed by document key (the
+ * shape the coordinator has after fanning legs out as a {@code MultiSearch}). It deliberately reuses the same relevance
+ * math as classic shard-side hybrid — {@link MinMaxScoreNormalizer} for normalization and the caller-supplied
  * {@link ScoreCombinationTechnique#combine(float[])} for combination — so that, for an identical hit set, this path and
- * classic produce identical fused scores to float precision. Only the data shape differs ({@code _id} map here vs.
+ * classic produce identical fused scores to float precision. Only the data shape differs (a key→score map here vs.
  * {@code CompoundTopDocs} there), never the arithmetic.
  *
  * <p>Two classic behaviors are reproduced exactly:
@@ -34,59 +35,75 @@ import lombok.NoArgsConstructor;
  *       toward the denominator (its {@code score >= 0.0} participation rule), exactly as classic does.</li>
  * </ul>
  *
- * <p>Current scope: {@code min_max} normalization + the supplied combination technique (arithmetic_mean). Other techniques
- * (z_score, l2, RRF) join this path in a later change. This entry is not reachable from a live request yet — the
- * coordinator rewrite wiring lands with the execution path.
+ * <p>The normalization step is pluggable via {@link ScalarNormalizer} (resolved by name through
+ * {@link ScalarNormalizers}); the combination step is the caller-supplied {@link ScoreCombinationTechnique}. This
+ * class owns only the shape-level work that is identical for every technique: per-leg normalization dispatch, the doc
+ * union, and building each doc's per-leg input array. Adding a technique therefore touches neither this class nor the
+ * orchestrator. Current fused-mode scope is {@code min_max} + arithmetic_mean; the caller gates the rest at rewrite.
+ *
+ * <p>Document keys are treated as <b>opaque strings</b> throughout — this class never parses or builds them — so the
+ * caller can change its document identity scheme (e.g. to disambiguate same-{@code _id} docs across indices) without
+ * touching fusion or any normalizer.
  */
 @NoArgsConstructor(access = AccessLevel.PRIVATE)
 public final class CoordinatorScoreFusion {
 
     /**
-     * Fuse legs with {@code min_max} normalization followed by the given combination technique.
+     * Fuse legs with {@code min_max} normalization followed by the given combination technique. Convenience wrapper over
+     * {@link #fuse(List, ScalarNormalizer, ScoreCombinationTechnique)}; this is the pairing the classic-vs-fused
+     * differential test pins.
      *
-     * @param legRawScores        one entry per leg, each an {@code _id -> raw score} map of that leg's hits (order is
+     * @param legRawScores        one entry per leg, each a {@code key -> raw score} map of that leg's hits (order is
      *                            the leg order; a doc absent from a leg's map did not match that leg)
      * @param combinationTechnique the same combination technique classic would use (e.g. arithmetic_mean with weights)
-     * @return {@code _id -> fused score} for the union of all legs' docs
+     * @return {@code key -> fused score} for the union of all legs' docs
      */
     public static Map<String, Float> fuseMinMax(
         final List<Map<String, Float>> legRawScores,
         final ScoreCombinationTechnique combinationTechnique
     ) {
+        return fuse(legRawScores, MinMaxScalarNormalizer.INSTANCE, combinationTechnique);
+    }
+
+    /**
+     * Fuse legs: normalize each leg with {@code normalizer}, then combine across legs per doc.
+     *
+     * @param legRawScores        one entry per leg, each a {@code key -> raw score} map of that leg's hits
+     * @param normalizer          per-leg normalization step (e.g. {@code min_max})
+     * @param combinationTechnique cross-leg combination step (e.g. arithmetic_mean with weights)
+     * @return {@code key -> fused score} for the union of all legs' docs
+     */
+    public static Map<String, Float> fuse(
+        final List<Map<String, Float>> legRawScores,
+        final ScalarNormalizer normalizer,
+        final ScoreCombinationTechnique combinationTechnique
+    ) {
         final int legCount = legRawScores.size();
 
-        // Per-leg min/max, seeded exactly as classic (getMinScores/getMaxScores)
-        // picking array over List as it's slightly faster, we know size and access by index has identical behavior
-        final float[] minPerLeg = new float[legCount];
-        final float[] maxPerLeg = new float[legCount];
-        for (int leg = 0; leg < legCount; leg++) {
-            float min = Float.MAX_VALUE;
-            float max = Float.MIN_VALUE;
-            for (float raw : legRawScores.get(leg).values()) {
-                min = Math.min(min, raw);
-                max = Math.max(max, raw);
-            }
-            minPerLeg[leg] = min;
-            maxPerLeg[leg] = max;
+        // Normalize each leg independently. A leg's map is already the merged across-shard set, so the normalizer sees
+        // every value it needs to compute its own statistics (min/max here) with no cross-shard merging.
+        final List<Map<String, Float>> legNormalizedScores = new ArrayList<>(legCount);
+        for (Map<String, Float> legScores : legRawScores) {
+            legNormalizedScores.add(normalizer.normalizeLeg(legScores));
         }
 
-        // Union of ids across legs, preserving first-seen order for deterministic output.
-        final Set<String> allIds = new LinkedHashSet<>();
-        for (Map<String, Float> leg : legRawScores) {
-            allIds.addAll(leg.keySet());
+        // Union of keys across legs, preserving first-seen order for deterministic output.
+        final Set<String> allKeys = new LinkedHashSet<>();
+        for (Map<String, Float> legScores : legRawScores) {
+            allKeys.addAll(legScores.keySet());
         }
 
         final Map<String, Float> fused = new LinkedHashMap<>();
-        for (String id : allIds) {
+        for (String key : allKeys) {
             // float[legCount] initialized to 0.0; only matching legs are filled (mirrors classic per-doc array).
-            final float[] perLegNormalized = new float[legCount];
+            final float[] docScoresPerLeg = new float[legCount];
             for (int leg = 0; leg < legCount; leg++) {
-                Float raw = legRawScores.get(leg).get(id);
-                if (raw != null) {
-                    perLegNormalized[leg] = MinMaxScoreNormalizer.normalizeSingleScore(raw, minPerLeg[leg], maxPerLeg[leg]);
+                Float normalizedScore = legNormalizedScores.get(leg).get(key);
+                if (normalizedScore != null) {
+                    docScoresPerLeg[leg] = normalizedScore;
                 }
             }
-            fused.put(id, combinationTechnique.combine(perLegNormalized));
+            fused.put(key, combinationTechnique.combine(docScoresPerLeg));
         }
         return fused;
     }

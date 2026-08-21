@@ -9,6 +9,7 @@ import org.opensearch.common.settings.Setting;
 import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
 import org.opensearch.core.common.unit.ByteSizeValue;
+import org.opensearch.neuralsearch.query.HybridQueryBuilder;
 
 /**
  * Class defines settings specific to neural-search plugin
@@ -112,6 +113,33 @@ public final class NeuralSearchSettings {
     public static final Setting<ByteSizeValue> NEURAL_CIRCUIT_BREAKER_LIMIT = Setting.memorySizeSetting(
         "plugins.neural_search.circuit_breaker.limit",
         DEFAULT_CIRCUIT_BREAKER_LIMIT,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Kept in step with the per-query leg limit rather than picked: one {@code hybrid} may declare
+     * {@link HybridQueryBuilder#MAX_NUMBER_OF_SUB_QUERIES} legs, so the square is what a request nesting fused hybrids
+     * that deep costs, and no shape a single {@code hybrid} can express is affected by this ceiling.
+     */
+    public static final int DEFAULT_MAX_FUSION_LEG_SEARCHES = HybridQueryBuilder.MAX_NUMBER_OF_SUB_QUERIES
+        * HybridQueryBuilder.MAX_NUMBER_OF_SUB_QUERIES;
+
+    /**
+     * Ceiling on the leg sub-searches one search request may fan out in the {@code hybrid} query's fused mode — the sum of
+     * {@code queries} sizes over every fused {@code hybrid} in the request body, whether nested or side by side. Each such
+     * leg is a full search across the request's shards, so this is the request's fan-out multiplier and the reason the
+     * limit is expressed in the same units the user wrote.
+     *
+     * <p>Counterpart to {@code indices.query.bool.max_clause_count}, and deliberately shaped like it: a whole-request count
+     * of a declared unit, checked once, adjustable per cluster. The floor is
+     * {@link HybridQueryBuilder#MAX_NUMBER_OF_SUB_QUERIES} — lowering it below the number of legs a single {@code hybrid}
+     * is already allowed to declare would reject a plain, un-nested fused query, so that is not an available setting.
+     */
+    public static final Setting<Integer> MAX_FUSION_LEG_SEARCHES = Setting.intSetting(
+        "plugins.neural_search.hybrid.fusion.max_leg_searches",
+        DEFAULT_MAX_FUSION_LEG_SEARCHES,
+        HybridQueryBuilder.MAX_NUMBER_OF_SUB_QUERIES,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
