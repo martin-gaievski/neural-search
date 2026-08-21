@@ -28,7 +28,7 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.knn.index.query.KNNQueryBuilder;
 import org.opensearch.neuralsearch.fusion.CoordinatorScoreFusion;
 import org.opensearch.neuralsearch.fusion.ScalarNormalizer;
-import org.opensearch.neuralsearch.fusion.ScalarNormalizerFactory;
+import org.opensearch.neuralsearch.fusion.ScalarNormalizers;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationFactory;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationTechnique;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationUtil;
@@ -124,6 +124,9 @@ final class HybridFusionOrchestrator {
      * response {@code Warning} header names the affected legs so the degradation is not silent. Under an effective
      * {@code allow_partial_search_results=false} the leg itself fails, which the check below turns into a whole-request
      * failure — so honoring that flag needs no separate handling here.
+     *
+     * <p>Every leg's hits enter fusion through this method and nowhere else, which makes it the one place to assert the
+     * per-hit {@code _index} invariant both the Top and the Tail depend on — see {@link #requireHitsCarryTheirIndex}.
      */
     private static SearchHit[][] groupLegHits(MultiSearchResponse.Item[] items, int legCount) {
         if (items.length != legCount) {
@@ -156,10 +159,37 @@ final class HybridFusionOrchestrator {
             if (Objects.nonNull(shardFailures) && shardFailures.length > 0) {
                 degradedLegs.add(leg);
             }
-            legHits[leg] = item.getResponse().getHits().getHits();
+            legHits[leg] = requireHitsCarryTheirIndex(item.getResponse().getHits().getHits(), leg);
         }
         warnOnDegradedLegs(degradedLegs);
         return legHits;
+    }
+
+    /**
+     * Assert the property everything downstream relies on: every leg hit carries its {@code _index}. Fusion keys documents
+     * by {@code _index} + {@code _id} and round 2 addresses them the same way, so a hit without an index can neither be
+     * kept apart from a same-{@code _id} document in a sibling index nor addressed without also matching it.
+     *
+     * <p>An {@link IllegalStateException} rather than a fallback, on both counts: a coordinator sets a hit's index from its
+     * shard target, so a hit missing one means the leg response was not produced the way a search response is; and the only
+     * fallback available — {@code _id}-only addressing — merges distinct documents for the whole window, since its clauses
+     * are qualified as a set, not per hit.
+     */
+    private static SearchHit[] requireHitsCarryTheirIndex(final SearchHit[] hits, final int leg) {
+        for (SearchHit hit : hits) {
+            if (Objects.isNull(hit.getIndex())) {
+                throw new IllegalStateException(
+                    String.format(
+                        Locale.ROOT,
+                        "[hybrid] fused-mode sub-query %d returned a hit [_id: %s] with no [_index]; fused documents are "
+                            + "identified and addressed by [_index] plus [_id], so this hit cannot be fused",
+                        leg,
+                        hit.getId()
+                    )
+                );
+            }
+        }
+        return hits;
     }
 
     /**
@@ -209,26 +239,29 @@ final class HybridFusionOrchestrator {
             fusion.combinationTechnique(),
             weightsParams(fusion.weights())
         );
-        // Normalization is resolved by name, so widening technique support is a new ScalarNormalizer + factory entry —
-        // no change here. The caller already rejected techniques outside the current scope at rewrite.
-        ScalarNormalizer normalizer = ScalarNormalizerFactory.create(fusion.normalizationTechnique());
+        // Normalization is resolved by name, so widening technique support is a new ScalarNormalizer plus one entry in
+        // ScalarNormalizers — no change here. The caller already rejected out-of-scope techniques at rewrite.
+        ScalarNormalizer normalizer = ScalarNormalizers.forTechnique(fusion.normalizationTechnique());
         Map<String, Float> combined = CoordinatorScoreFusion.fuse(legRawScores, normalizer, combination);
         return toRankedDocs(combined, identityByKey, windowSize);
     }
 
     /**
-     * Fusion key for a hit: {@code _index}-qualified when the hit carries an index, else the bare {@code _id}.
+     * Fusion key for a hit: its {@code _index}, the separator, and its {@code _id}. Every leg hit carries an index —
+     * {@link #requireHitsCarryTheirIndex} asserts it as the hits enter — so the key is always qualified.
      *
-     * <p>Limitation in custom routing. {@code _index} + {@code _id} is not a total identity when custom routing is
-     * used: the same {@code _id} can be written to different shards of one index under different routing values, giving
-     * two genuinely distinct documents that share this key and are therefore fused as one. Qualifying further is not
-     * possible from here — a leg's {@link SearchHit} exposes {@link SearchHit#getShard()} but no routing value, so the
-     * coordinator has nothing to add to the key, and the {@code _routing} metadata field (queryable in principle) would
-     * first have to be fetched per leg hit, which the id-only leg deliberately does not do. One possible way to resolve this
-     * is leg-fetch.
+     * <p>Limitation in custom routing. {@code _index} + {@code _id} is not a total identity when custom routing is used:
+     * the same {@code _id} can be written to different shards of one index under different routing values, giving two
+     * genuinely distinct documents that share this key and are therefore fused as one.
+     *
+     * <p>Adding the routing value to the key would not fix it. Reading it is not the obstacle — round 2's matching surface
+     * is: the self-erased query addresses documents by {@code _id} and an {@code _index} term, with no way to express
+     * routing, so two docs split apart in the key resolve to the same clause, and Lucene folds identical SHOULD clauses by
+     * <i>summing</i> their boosts — both would come back scored as the sum, which is worse than fusing them as one. This
+     * is a limitation of how documents are addressed, not of how they are keyed.
      */
     private static String documentKey(SearchHit hit) {
-        return Objects.isNull(hit.getIndex()) ? hit.getId() : hit.getIndex() + KEY_SEPARATOR + hit.getId();
+        return hit.getIndex() + KEY_SEPARATOR + hit.getId();
     }
 
     /**
@@ -285,11 +318,9 @@ final class HybridFusionOrchestrator {
      * MatchNoDocs required clause and collapses away entirely. Measured post-rewrite, the qualified Top presents the same
      * number of clauses to Lucene's ceiling as the unqualified one.
      *
-     * <p>The returned {@code indices} array is null-or-fully-populated, never an array with null holes: a hole would NPE
-     * inside {@code StreamOutput.writeOptionalStringArray} (it handles a null array, not null elements) while the
-     * coordinator serializes the round-2 shard request — a 500 on a query that already succeeded through fusion. If any
-     * window hit cannot be resolved to a concrete index, the whole array is dropped and every clause falls back to
-     * {@code _id}-only.
+     * <p>The returned {@code indices} array is fully populated, with no null holes: every key came from a hit whose
+     * {@code _index} {@link #requireHitsCarryTheirIndex} already asserted, and the side map is built from those same hits.
+     * Nothing here tolerates a missing index on purpose — see that method for why a fallback would be worse.
      */
     private static RankedDocs toRankedDocs(Map<String, Float> scoresByKey, Map<String, SearchHit> identityByKey, int windowSize) {
         List<Map.Entry<String, Float>> ranked = new ArrayList<>(scoresByKey.entrySet());
@@ -300,18 +331,15 @@ final class HybridFusionOrchestrator {
         String[] ids = new String[ranked.size()];
         String[] indices = new String[ranked.size()];
         float[] scores = new float[ranked.size()];
-        boolean everyHitCarriesItsIndex = true;
         for (int i = 0; i < ranked.size(); i++) {
             String key = ranked.get(i).getKey();
+            // Resolved through the side map, never by parsing the composite key — an _id may contain the separator.
             SearchHit hit = identityByKey.get(key);
-            // Defensive: a key always has an identity (both maps are built from the same hits), but never fall back to
-            // parsing the composite key — an _id may contain the separator.
-            ids[i] = Objects.isNull(hit) ? key : hit.getId();
-            indices[i] = Objects.isNull(hit) ? null : hit.getIndex();
+            ids[i] = hit.getId();
+            indices[i] = hit.getIndex();
             scores[i] = ranked.get(i).getValue();
-            everyHitCarriesItsIndex &= Objects.nonNull(indices[i]);
         }
-        return new RankedDocs(ids, everyHitCarriesItsIndex ? indices : null, scores);
+        return new RankedDocs(ids, indices, scores);
     }
 
     /** The sub-query legs in their Tail form. groupLegHits fails fast on any leg failure, so every leg is present here
@@ -351,8 +379,9 @@ final class HybridFusionOrchestrator {
         if (hits.length == 0) {
             return new MatchNoneQueryBuilder();
         }
-        // Insertion-ordered and null-tolerant: a hit carrying no resolvable _index groups under the null key and is
-        // addressed by _id alone, matching documentKey and the Top's own fallback.
+        // Insertion-ordered, so a leg's clauses come out in the order its hits arrived — deterministic for the same
+        // response. Every hit carries an _index by the invariant requireHitsCarryTheirIndex asserts, so there is no
+        // unqualified group to address by _id alone.
         Map<String, List<String>> idsByIndex = new LinkedHashMap<>();
         for (SearchHit hit : hits) {
             idsByIndex.computeIfAbsent(hit.getIndex(), index -> new ArrayList<>()).add(hit.getId());
@@ -403,9 +432,15 @@ final class HybridFusionOrchestrator {
      *
      * <p>Deliberately NOT triggers:
      * <ul>
-     *   <li>{@code explain}/{@code profile} — the fused score is computed on the coordinator and the Top is a
-     *       {@code constant_score}, so the Lucene tree carries no fusion breakdown to explain, and profiling the Tail
-     *       would only time a redundant re-execution of legs that already ran in the fan-out.</li>
+     *   <li>{@code explain} — the Tail cannot recover a fused explanation: the fused score is arithmetic the coordinator
+     *       already did, and the clause carrying it into round 2 is a childless {@code constant_score} with nothing to
+     *       descend into (the Tail explains as a non-scoring filter either way). Describing the fusion belongs on the
+     *       response side, where classic hybrid puts it too — tracked as a fused-mode parity follow-up, see
+     *       {@link CandidateScope.Disposition#NOT_PROPAGATED}.</li>
+     *   <li>{@code profile} — the tree covers round 2, which is what executes under it, and only a leg's hits are read
+     *       from its response, so a leg tree has nowhere to go. Forcing the Tail would not add the legs' own timings: it
+     *       would time a fresh re-execution of them and change the very execution being measured. A materialized leg
+     *       appears there as the id/index filter it was reduced to, not as the ANN query it came from.</li>
      *   <li>leg {@code inner_hits} — inner_hits are built in the fetch phase from the <i>registered</i> inner-hit
      *       contexts per returned parent doc, so the leg never has to be executed for them to be returned. They are
      *       carried separately (see {@link #innerHitsLegs}), which keeps a Top-only query cheap without losing them.
@@ -449,7 +484,8 @@ final class HybridFusionOrchestrator {
         return Objects.isNull(trackTotalHitsUpTo) || trackTotalHitsUpTo > numRankedDocs;
     }
 
-    /** The fused window in score order. {@code indices} is parallel to {@code ids} and null-or-fully-populated. */
+    /** The fused window in score order. {@code indices} is parallel to {@code ids} and fully populated — every entry names
+     *  the index the document was found in, which is what lets round 2 address it unambiguously. */
     private record RankedDocs(String[] ids, String[] indices, float[] scores) {
     }
 }

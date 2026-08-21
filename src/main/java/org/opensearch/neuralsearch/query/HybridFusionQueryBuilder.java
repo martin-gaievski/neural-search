@@ -55,7 +55,9 @@ import org.opensearch.index.query.TermQueryBuilder;
  * execute against — and it is not a trade either: {@code _index} is a constant field, so on the shard's own index the
  * added filter is a MatchAll that {@code BooleanQuery.rewrite} removes (the clause collapses to exactly
  * {@code constant_score(ids)}), and on any other index's shard the clause collapses to MatchNoDocs. {@code indices} is
- * null only for a window whose hits carried no resolvable {@code _index}; when non-null it has no null elements.
+ * therefore required, not optional: there is no unqualified form of this query. A coordinator-side hit always carries its
+ * {@code _index} — it is set from the shard target the response came from — and {@code HybridFusionOrchestrator} asserts
+ * that on every leg's hits before fusing them, so the qualified form is always constructible.
  *
  * <p><b>inner_hits registration is decoupled from the Tail.</b> inner_hits are computed in the fetch phase from the
  * registered {@link InnerHitContextBuilder}s (per returned parent doc), not from whatever ran in the query phase — so a
@@ -102,9 +104,8 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
 
     private final String[] ids;
     /**
-     * Parallel to {@code ids}. Either null — no clause is qualified — or fully populated, one concrete index name per
-     * ranked doc. Never an array with null holes: {@code writeOptionalStringArray} handles a null array but writes
-     * elements through {@code writeString}, which NPEs on a null.
+     * Parallel to {@code ids} and required: one concrete index name per ranked doc, never null and with no null elements.
+     * Every Top clause is {@code _index}-qualified, so this array is what makes each one address exactly one document.
      */
     private final String[] indices;
     private final float[] scores;
@@ -120,9 +121,10 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         List<QueryBuilder> tailQueries,
         List<QueryBuilder> innerHitsQueries
     ) {
-        assert Objects.isNull(indices) || indices.length == ids.length : "indices must be parallel to ids";
-        assert Objects.isNull(indices) || Arrays.stream(indices).noneMatch(Objects::isNull)
-            : "indices must be null or fully populated — a null element NPEs in writeOptionalStringArray";
+        Objects.requireNonNull(indices, "indices is required: a fused document is addressed by its _index and _id together");
+        assert indices.length == ids.length : "indices must be parallel to ids";
+        assert Arrays.stream(indices).noneMatch(Objects::isNull)
+            : "indices must be fully populated — a null element NPEs in writeStringArray";
         this.ids = ids;
         this.indices = indices;
         this.scores = scores;
@@ -130,15 +132,15 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         this.innerHitsQueries = Objects.isNull(innerHitsQueries) ? new ArrayList<>() : innerHitsQueries;
     }
 
-    /** Unqualified convenience: {@code _id}-only Top clauses, and the Tail legs are also the inner_hits source. */
-    public HybridFusionQueryBuilder(String[] ids, float[] scores, List<QueryBuilder> tailQueries) {
-        this(ids, null, scores, tailQueries, tailQueries);
+    /** Convenience for the common shape where the Tail legs are also the inner_hits source. */
+    public HybridFusionQueryBuilder(String[] ids, String[] indices, float[] scores, List<QueryBuilder> tailQueries) {
+        this(ids, indices, scores, tailQueries, tailQueries);
     }
 
     public HybridFusionQueryBuilder(StreamInput in) throws IOException {
         super(in);
         this.ids = in.readStringArray();
-        this.indices = in.readOptionalStringArray();
+        this.indices = in.readStringArray();
         this.scores = in.readFloatArray();
         this.tailQueries = in.readNamedWriteableList(QueryBuilder.class);
         this.innerHitsQueries = in.readNamedWriteableList(QueryBuilder.class);
@@ -147,7 +149,7 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
     @Override
     protected void doWriteTo(StreamOutput out) throws IOException {
         out.writeStringArray(ids);
-        out.writeOptionalStringArray(indices);
+        out.writeStringArray(indices);
         out.writeFloatArray(scores);
         out.writeNamedWriteableList(tailQueries);
         out.writeNamedWriteableList(innerHitsQueries);
@@ -223,11 +225,11 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
 
     /**
      * Address one ranked document by {@code _id} intersected with its {@code _index} — {@code _id} is not unique on its
-     * own, and the fused score belongs to exactly one document. Falls back to {@code _id} alone only when no index could
-     * be resolved for the window at all; per-element fallback is impossible by the {@code indices} invariant.
+     * own, and the fused score belongs to exactly one document. There is no unqualified variant: {@code indices} is
+     * required, so every position resolves to the index the ranked document was found in.
      */
     private QueryBuilder rankedDocQuery(int position) {
-        return addressDocuments(Objects.isNull(indices) ? null : indices[position], ids[position]);
+        return addressDocuments(indices[position], ids[position]);
     }
 
     /**
@@ -238,18 +240,13 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
      * the Top was {@code _index}-qualified while the Tail addressed a materialized leg by {@code _id} alone, so every
      * same-{@code _id} sibling document in another index passed the Tail {@code filter} and was counted.
      *
-     * <p>{@code index} is null only when the caller could resolve no index for those hits, where addressing degrades to
-     * {@code _id} alone rather than failing. That degradation is per-call, so the Top (which drops its whole
-     * {@code indices} array if any window hit lacks an index) can be unqualified while the Tail still qualifies the groups
-     * it could resolve. That combination loses no legitimate document: every window document came from some leg, so it
-     * matches that leg's Tail clause, and the only docs the narrower Tail removes from the wider Top are the same-id
-     * siblings that should never have matched.
+     * <p>{@code index} is required. An unqualified form was the previous fallback for hits whose {@code _index} could not
+     * be resolved, but no coordinator-side hit is in that state, and the fallback's own semantics were the defect above:
+     * it addresses every same-{@code _id} document in the cluster. Both callers get their index from a leg hit, so both
+     * always have one.
      */
     static QueryBuilder addressDocuments(String index, String... ids) {
         IdsQueryBuilder idQuery = new IdsQueryBuilder().addIds(ids);
-        if (Objects.isNull(index)) {
-            return idQuery;
-        }
         return new BoolQueryBuilder().filter(idQuery).filter(new TermQueryBuilder(INDEX_FIELD, index));
     }
 

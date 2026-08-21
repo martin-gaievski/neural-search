@@ -19,9 +19,9 @@ import java.util.Map;
  *
  * <p>Notes for implementors:
  * <ul>
- *   <li><b>Keys are opaque.</b> A key identifies a document to the caller (today {@code _id}); a normalizer must only
- *       carry keys through unchanged, never parse or construct them. This is what lets the caller change its document
- *       identity scheme without touching any normalizer.</li>
+ *   <li><b>Keys are opaque.</b> A key identifies a document to the caller (today {@code _index} plus {@code _id}); a
+ *       normalizer must only carry keys through unchanged, never parse or construct them. This is what lets the caller
+ *       change its document identity scheme without touching any normalizer.</li>
  *   <li><b>Return one entry per input entry.</b> {@link CoordinatorScoreFusion} treats a key missing from the returned
  *       map as "this leg did not match that doc", so dropping keys silently changes fusion input.</li>
  *   <li><b>No shard merging.</b> On the coordinator a leg's map is already the merged across-shard result set, so a

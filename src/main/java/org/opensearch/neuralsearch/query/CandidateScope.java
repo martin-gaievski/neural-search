@@ -141,9 +141,10 @@ final class CandidateScope {
             table,
             SEARCH_REQUEST,
             "scroll",
-            Disposition.NOT_PROPAGATED,
-            "round 1 is a one-shot candidate query; the scroll context belongs to the user request, which pages through "
-                + "Top then Tail the same way a size beyond the window already does"
+            Disposition.REJECTED,
+            "a scroll pages one reader snapshot to exhaustion, and that snapshot is round 2's alone: the legs that chose "
+                + "the window ran as one-shot searches against their own reader instants and are never re-run. Classic "
+                + "hybrid rejects scroll too — use point_in_time instead, which every leg and round 2 do share"
         );
         put(
             table,
@@ -207,7 +208,9 @@ final class CandidateScope {
             SEARCH_SOURCE,
             "sliceBuilder",
             Disposition.PROPAGATED,
-            "round 2 returns only the slice, so unsliced legs would fill the window with documents outside it"
+            "round 2 returns only the slice, so unsliced legs would fill the window with documents outside it and leave "
+                + "the slice an arbitrary fraction of it. A slice is legal only alongside a point_in_time or a scroll, "
+                + "and scroll is rejected, so the reachable shape is a slice over a PIT — inherited together with it"
         );
         put(
             table,
@@ -287,7 +290,10 @@ final class CandidateScope {
             SEARCH_SOURCE,
             "explain",
             Disposition.NOT_PROPAGATED,
-            "round 2 can only explain the self-erased query, a known fused-mode limitation independent of the legs"
+            "round 2 explains the self-erased query, where a matching Top clause is a childless constant_score carrying "
+                + "the fused score — the right number with no breakdown under it. Normalization and combination run on "
+                + "the coordinator, so assembling the full tree is a response-side concern, exactly as it is for classic "
+                + "hybrid. Tracked as a fused-mode parity follow-up"
         );
         put(table, SEARCH_SOURCE, "version", Disposition.NOT_PROPAGATED, "fetch-phase metadata; a leg fetches nothing but ids");
         put(table, SEARCH_SOURCE, "seqNoAndPrimaryTerm", Disposition.NOT_PROPAGATED, "as version");
@@ -306,7 +312,15 @@ final class CandidateScope {
         put(table, SEARCH_SOURCE, "suggestBuilder", Disposition.NOT_PROPAGATED, "suggestions do not depend on the query");
         put(table, SEARCH_SOURCE, "stats", Disposition.NOT_PROPAGATED, "propagating would count every leg into the user's stats groups");
         put(table, SEARCH_SOURCE, "extBuilders", Disposition.NOT_PROPAGATED, "plugin response extensions, not selection");
-        put(table, SEARCH_SOURCE, "profile", Disposition.NOT_PROPAGATED, "profiles the user's search, not the candidate query");
+        put(
+            table,
+            SEARCH_SOURCE,
+            "profile",
+            Disposition.NOT_PROPAGATED,
+            "only a leg's hits are read from its response, so a leg profile tree has nowhere to go: cost with no output, "
+                + "and profiling perturbs the execution that picks the window. The request profiles round 2 instead, "
+                + "where the legs do appear, timed as the non-scoring Tail filters they are there"
+        );
         put(table, SEARCH_SOURCE, "verbosePipeline", Disposition.NOT_PROPAGATED, "pipeline debug output, and a leg runs no pipeline");
 
         return Map.copyOf(table);
@@ -376,16 +390,22 @@ final class CandidateScope {
      * request never trips one, and the messages name the field the user wrote rather than the field this class keys on.
      */
     private static void rejectUnsupported(final SearchRequest request) {
-        // A remote hit's _index is "cluster:index", which no shard of the remote index matches, so the _index-qualified
-        // Top clauses would silently drop every remote document.
+        // Cross-cluster first, since this runs before index resolution: a literal `cluster:index` would otherwise fail
+        // as `no such index`, which says nothing about fused mode, while a wildcard alias (`*:index`) resolves cleanly
+        // and would reach round 2 — so neither case can be left to resolution.
         for (String index : request.indices()) {
             if (index.indexOf(':') >= 0) {
                 throw unsupported(
                     "cross-cluster search",
-                    "the fused candidate window addresses documents by [_index] plus [_id], and a remote document's "
-                        + "[_index] carries a cluster alias that no shard of the remote index matches"
+                    "the fused window keys and addresses documents by [_index] plus [_id], and neither survives a cluster "
+                        + "hop: a remote hit carries the bare index name with its alias held separately, so same-named "
+                        + "indices in two clusters collapse into one key, and round 2's [_index] term never matches on a "
+                        + "remote shard. Remote documents would reach the user through the Tail alone, at [_score: 0.0]"
                 );
             }
+        }
+        if (Objects.nonNull(request.scroll())) {
+            throw unsupported("scroll", reasonFor(SEARCH_REQUEST, "scroll"));
         }
         SearchSourceBuilder source = request.source();
         if (Objects.isNull(source)) {

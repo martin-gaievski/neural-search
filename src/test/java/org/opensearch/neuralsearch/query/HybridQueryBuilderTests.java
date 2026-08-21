@@ -882,13 +882,25 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         assertSame(builder, builder.doRewrite(ctx));
     }
 
-    /** A MultiSearch item wrapping a SearchResponse whose hits carry the given (_id -> score) pairs. */
+    /**
+     * A MultiSearch item wrapping a SearchResponse whose hits carry the given (_id -> score) pairs. Each hit is given a
+     * shard target, which is how a real coordinator-side hit gets its {@code _index} — fusion identifies a document by
+     * {@code _index} plus {@code _id} and rejects a hit that carries no index.
+     */
     private org.opensearch.action.search.MultiSearchResponse.Item legItem(Map<String, Float> idToScore) {
         org.opensearch.search.SearchHit[] hits = new org.opensearch.search.SearchHit[idToScore.size()];
         int i = 0;
         for (Map.Entry<String, Float> e : idToScore.entrySet()) {
             org.opensearch.search.SearchHit hit = new org.opensearch.search.SearchHit(i, e.getKey(), Map.of(), Map.of());
             hit.score(e.getValue());
+            hit.shard(
+                new org.opensearch.search.SearchShardTarget(
+                    "node-1",
+                    new org.opensearch.core.index.shard.ShardId(new Index("test-index", "test-index-uuid"), 0),
+                    null,
+                    org.opensearch.action.OriginalIndices.NONE
+                )
+            );
             hits[i++] = hit;
         }
         org.opensearch.search.SearchHits searchHits = new org.opensearch.search.SearchHits(

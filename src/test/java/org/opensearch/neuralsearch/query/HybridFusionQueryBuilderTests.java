@@ -23,8 +23,22 @@ public class HybridFusionQueryBuilderTests extends OpenSearchTestCase {
     }
 
     public void testWriteableName() {
-        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(new String[] { "d1" }, new float[] { 1.0f }, List.of());
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
+            new String[] { "d1" },
+            new String[] { "idx" },
+            new float[] { 1.0f },
+            List.of()
+        );
         assertEquals("hybrid_fusion", query.getWriteableName());
+    }
+
+    public void testIndicesAreRequired() {
+        // A fused document is addressed by _index and _id together; there is no unqualified form of this query, so a
+        // caller that lost the per-doc index fails here rather than silently addressing every same-_id document.
+        expectThrows(
+            NullPointerException.class,
+            () -> new HybridFusionQueryBuilder(new String[] { "d1" }, null, new float[] { 1.0f }, List.of())
+        );
     }
 
     public void testNotParseableFromXContent() {
@@ -35,6 +49,7 @@ public class HybridFusionQueryBuilderTests extends OpenSearchTestCase {
     public void testSerializationRoundTrip() throws Exception {
         HybridFusionQueryBuilder original = new HybridFusionQueryBuilder(
             new String[] { "d1", "d2" },
+            new String[] { "idx", "idx" },
             new float[] { 0.9f, 0.4f },
             List.of(new MatchQueryBuilder("title", "apple"), new MatchQueryBuilder("body", "banana"))
         );
@@ -46,6 +61,7 @@ public class HybridFusionQueryBuilderTests extends OpenSearchTestCase {
     public void testSelfErasedShape_whenSourceQueriesPresent_thenTopPlusTail() {
         HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
             new String[] { "d1", "d2" },
+            new String[] { "idx", "idx" },
             new float[] { 0.9f, 0.4f },
             List.of(new MatchQueryBuilder("title", "apple"), new MatchQueryBuilder("body", "banana"))
         );
@@ -60,7 +76,12 @@ public class HybridFusionQueryBuilderTests extends OpenSearchTestCase {
     }
 
     public void testSelfErasedShape_whenNoSourceQueries_thenTopOnly() {
-        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(new String[] { "d1", "d2" }, new float[] { 0.9f, 0.4f }, List.of());
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
+            new String[] { "d1", "d2" },
+            new String[] { "idx", "idx" },
+            new float[] { 0.9f, 0.4f },
+            List.of()
+        );
         BoolQueryBuilder self = query.buildSelfErasedQuery();
         assertEquals(2, self.should().size());
         assertEquals("Top-only fused query carries no Tail filter", 0, self.filter().size());
@@ -68,7 +89,7 @@ public class HybridFusionQueryBuilderTests extends OpenSearchTestCase {
 
     public void testSelfErasedShape_whenEmptyWindow_thenEmptyBool() {
         // An empty fused window produces an empty bool (no should, no filter) → compiles to match-no-docs.
-        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(new String[0], new float[0], List.of());
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(new String[0], new String[0], new float[0], List.of());
         BoolQueryBuilder self = query.buildSelfErasedQuery();
         assertEquals(0, self.should().size());
         assertEquals(0, self.filter().size());
@@ -77,6 +98,7 @@ public class HybridFusionQueryBuilderTests extends OpenSearchTestCase {
     public void testDoXContent_isInformationalOnly() throws Exception {
         HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
             new String[] { "d1", "d2", "d3" },
+            new String[] { "idx", "idx", "idx" },
             new float[] { 0.9f, 0.5f, 0.1f },
             List.of()
         );
@@ -92,6 +114,7 @@ public class HybridFusionQueryBuilderTests extends OpenSearchTestCase {
         // Tail source queries that don't rewrite (already terminal term queries) → doRewrite returns the same instance.
         HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
             new String[] { "d1" },
+            new String[] { "idx" },
             new float[] { 0.7f },
             List.of(new org.opensearch.index.query.TermQueryBuilder("text", "keyword"))
         );
@@ -110,6 +133,7 @@ public class HybridFusionQueryBuilderTests extends OpenSearchTestCase {
         };
         HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
             new String[] { "d1", "d2" },
+            new String[] { "idx", "idx" },
             new float[] { 0.7f, 0.3f },
             List.of(alwaysRewrites)
         );
@@ -130,7 +154,12 @@ public class HybridFusionQueryBuilderTests extends OpenSearchTestCase {
             new org.opensearch.index.query.MatchQueryBuilder("user.name", "alice"),
             org.apache.lucene.search.join.ScoreMode.None
         ).innerHit(new org.opensearch.index.query.InnerHitBuilder());
-        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(new String[] { "d1" }, new float[] { 0.9f }, List.of(nested));
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
+            new String[] { "d1" },
+            new String[] { "idx" },
+            new float[] { 0.9f },
+            List.of(nested)
+        );
 
         java.util.Map<String, org.opensearch.index.query.InnerHitContextBuilder> innerHits = new java.util.HashMap<>();
         query.extractInnerHitBuilders(innerHits);

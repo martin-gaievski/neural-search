@@ -18,11 +18,11 @@ import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
 
 /**
- * Coordinator-side score fusion for the resolver (fused) mode, over an {@code _id}-keyed per-leg score view (shape
- * that coordinator has after fanning legs out as a {@code MultiSearch}). It deliberately reuses the same relevance math
- * as classic shard-side hybrid — {@link MinMaxScoreNormalizer} for normalization and the caller-supplied
+ * Coordinator-side score fusion for the resolver (fused) mode, over a per-leg score view keyed by document key (the
+ * shape the coordinator has after fanning legs out as a {@code MultiSearch}). It deliberately reuses the same relevance
+ * math as classic shard-side hybrid — {@link MinMaxScoreNormalizer} for normalization and the caller-supplied
  * {@link ScoreCombinationTechnique#combine(float[])} for combination — so that, for an identical hit set, this path and
- * classic produce identical fused scores to float precision. Only the data shape differs ({@code _id} map here vs.
+ * classic produce identical fused scores to float precision. Only the data shape differs (a key→score map here vs.
  * {@code CompoundTopDocs} there), never the arithmetic.
  *
  * <p>Two classic behaviors are reproduced exactly:
@@ -36,7 +36,7 @@ import lombok.NoArgsConstructor;
  * </ul>
  *
  * <p>The normalization step is pluggable via {@link ScalarNormalizer} (resolved by name through
- * {@link ScalarNormalizerFactory}); the combination step is the caller-supplied {@link ScoreCombinationTechnique}. This
+ * {@link ScalarNormalizers}); the combination step is the caller-supplied {@link ScoreCombinationTechnique}. This
  * class owns only the shape-level work that is identical for every technique: per-leg normalization dispatch, the doc
  * union, and building each doc's per-leg input array. Adding a technique therefore touches neither this class nor the
  * orchestrator. Current fused-mode scope is {@code min_max} + arithmetic_mean; the caller gates the rest at rewrite.
@@ -82,28 +82,28 @@ public final class CoordinatorScoreFusion {
 
         // Normalize each leg independently. A leg's map is already the merged across-shard set, so the normalizer sees
         // every value it needs to compute its own statistics (min/max here) with no cross-shard merging.
-        final List<Map<String, Float>> normalizedPerLeg = new ArrayList<>(legCount);
-        for (Map<String, Float> leg : legRawScores) {
-            normalizedPerLeg.add(normalizer.normalizeLeg(leg));
+        final List<Map<String, Float>> legNormalizedScores = new ArrayList<>(legCount);
+        for (Map<String, Float> legScores : legRawScores) {
+            legNormalizedScores.add(normalizer.normalizeLeg(legScores));
         }
 
         // Union of keys across legs, preserving first-seen order for deterministic output.
-        final Set<String> allIds = new LinkedHashSet<>();
-        for (Map<String, Float> leg : legRawScores) {
-            allIds.addAll(leg.keySet());
+        final Set<String> allKeys = new LinkedHashSet<>();
+        for (Map<String, Float> legScores : legRawScores) {
+            allKeys.addAll(legScores.keySet());
         }
 
         final Map<String, Float> fused = new LinkedHashMap<>();
-        for (String id : allIds) {
+        for (String key : allKeys) {
             // float[legCount] initialized to 0.0; only matching legs are filled (mirrors classic per-doc array).
-            final float[] perLegNormalized = new float[legCount];
+            final float[] docScoresPerLeg = new float[legCount];
             for (int leg = 0; leg < legCount; leg++) {
-                Float normalized = normalizedPerLeg.get(leg).get(id);
-                if (normalized != null) {
-                    perLegNormalized[leg] = normalized;
+                Float normalizedScore = legNormalizedScores.get(leg).get(key);
+                if (normalizedScore != null) {
+                    docScoresPerLeg[leg] = normalizedScore;
                 }
             }
-            fused.put(id, combinationTechnique.combine(perLegNormalized));
+            fused.put(key, combinationTechnique.combine(docScoresPerLeg));
         }
         return fused;
     }

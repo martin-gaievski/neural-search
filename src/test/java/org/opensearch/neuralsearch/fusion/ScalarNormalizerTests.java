@@ -30,25 +30,26 @@ public class ScalarNormalizerTests extends OpenSearchTestCase {
         return leg;
     }
 
-    // ---- factory ----
+    // ---- technique lookup ----
 
-    public void testFactory_resolvesMinMax() {
-        ScalarNormalizer normalizer = ScalarNormalizerFactory.create("min_max");
+    public void testForTechnique_resolvesMinMax() {
+        ScalarNormalizer normalizer = ScalarNormalizers.forTechnique("min_max");
         assertSame(MinMaxScalarNormalizer.INSTANCE, normalizer);
         assertEquals("min_max", normalizer.techniqueName());
     }
 
-    public void testFactory_whenTechniqueNotWiredYet_thenThrows() {
+    public void testForTechnique_whenTechniqueNotWiredYet_thenThrows() {
         // z_score / l2 / rrf parse but have no coordinator implementation yet — the caller rejects them at rewrite, so
         // this is the defense-in-depth backstop.
         for (String notWired : List.of("z_score", "l2", "rrf", "none")) {
-            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> ScalarNormalizerFactory.create(notWired));
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> ScalarNormalizers.forTechnique(notWired));
             assertTrue(e.getMessage().contains("is not supported in fused mode"));
         }
     }
 
-    public void testFactory_whenNullTechnique_thenThrows() {
-        expectThrows(IllegalArgumentException.class, () -> ScalarNormalizerFactory.create(null));
+    public void testForTechnique_whenNullTechnique_thenThrows() {
+        // A null technique reaches the same refusal rather than an NPE from the immutable lookup map.
+        expectThrows(IllegalArgumentException.class, () -> ScalarNormalizers.forTechnique(null));
     }
 
     // ---- min_max normalizer ----

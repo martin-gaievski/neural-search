@@ -14,11 +14,12 @@ import lombok.NoArgsConstructor;
 /**
  * Resolves a coordinator-side {@link ScalarNormalizer} by technique name — the extension point for widening fused-mode
  * normalization support. Adding a technique is a new {@link ScalarNormalizer} plus one entry here; neither
- * {@link CoordinatorScoreFusion} nor the orchestrator changes.
+ * {@link CoordinatorScoreFusion} nor the orchestrator changes. A static holder rather than a factory, since nothing is
+ * constructed: every technique is a stateless singleton, so the lookup hands back a shared instance.
  *
- * <p>Only {@code min_max} is registered today, matching the fused-mode scope gate in
- * {@code HybridQueryBuilder#requireSupportedTechniques} (which rejects other techniques earlier, at rewrite). This
- * factory's throw is therefore a defense-in-depth backstop, not the user-facing validation.
+ * <p>Only {@code min_max} is wired today, matching the fused-mode scope gate in
+ * {@code HybridQueryBuilder#requireSupportedTechniques} (which rejects other techniques earlier, at rewrite). The throw
+ * below is therefore a defense-in-depth backstop, not the user-facing validation.
  *
  * <p>When adding techniques, two things need a decision that this seam intentionally leaves open:
  * <ul>
@@ -37,7 +38,7 @@ import lombok.NoArgsConstructor;
  * </ul>
  */
 @NoArgsConstructor(access = AccessLevel.PRIVATE)
-public final class ScalarNormalizerFactory {
+public final class ScalarNormalizers {
 
     private static final Map<String, ScalarNormalizer> NORMALIZERS = Map.of(
         MinMaxScalarNormalizer.INSTANCE.techniqueName(),
@@ -49,7 +50,7 @@ public final class ScalarNormalizerFactory {
      * @return the normalizer for that technique
      * @throws IllegalArgumentException when the technique has no coordinator-side implementation yet
      */
-    public static ScalarNormalizer create(final String techniqueName) {
+    public static ScalarNormalizer forTechnique(final String techniqueName) {
         ScalarNormalizer normalizer = Objects.isNull(techniqueName) ? null : NORMALIZERS.get(techniqueName);
         if (Objects.isNull(normalizer)) {
             throw new IllegalArgumentException(

@@ -23,6 +23,7 @@ import java.util.function.BiConsumer;
 
 import org.apache.lucene.search.TotalHits;
 import org.opensearch.Version;
+import org.opensearch.action.OriginalIndices;
 import org.opensearch.action.search.MultiSearchRequest;
 import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
@@ -38,6 +39,8 @@ import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.Index;
+import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
@@ -47,6 +50,7 @@ import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.query.Rewriteable;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
+import org.opensearch.search.SearchShardTarget;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.pipeline.SearchPipelineMetadata;
 import org.opensearch.transport.client.Client;
@@ -78,6 +82,9 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
 
     private static final String TEXT_FIELD_NAME = "field";
     private static final String INDEX_NAME = "test-index";
+
+    /** The cluster service the current {@link #initClusterUtil} call installed, so a test can swap only the resolver. */
+    private ClusterService clusterService;
 
     /** What a coordinator paid to rewrite one request: one entry in {@code legCountPerMultiSearch} per fan-out. */
     private record FanOut(List<Integer> legCountPerMultiSearch, QueryBuilder finalQuery) {
@@ -356,6 +363,39 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
         assertThat(error.getMessage(), containsString("requires all nodes in the cluster to be on version"));
     }
 
+    // ------------------------------------------- request-shape refusals -------------------------------------------
+
+    /**
+     * Where the request-shape refusal sits. {@code CandidateScope.from} runs ahead of everything that resolves index
+     * metadata — the fusion-config lookup reads the targeted indices' default pipelines, the window ceiling reads their
+     * {@code max_result_window} — because a literal {@code cluster:index} expression dies in that resolution with
+     * {@code no such index}, a message that says nothing about fused mode. This models resolution failing exactly there and
+     * asserts fused mode's own explanation is what the user gets.
+     */
+    @SneakyThrows
+    public void testCrossClusterRequest_isRefusedBeforeIndexMetadataIsResolved() {
+        initClusterUtilWhereIndexResolutionFails();
+        QueryBuilder query = nestedChain(1);
+        List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+        SearchRequest crossCluster = new SearchRequest(INDEX_NAME, "remote-cluster:" + INDEX_NAME).source(
+            new SearchSourceBuilder().query(query)
+        );
+
+        IllegalArgumentException error = expectThrows(
+            IllegalArgumentException.class,
+            () -> query.rewrite(coordinatorContext(crossCluster, registered))
+        );
+
+        assertThat(error.getMessage(), containsString("does not support [cross-cluster search]"));
+        assertTrue("refused before any leg is fanned out", registered.isEmpty());
+
+        // Non-vacuity: with resolution failing the same way, a request that gets past this refusal really does reach it and
+        // die there — so the assertion above is about ordering, not about resolution being unreachable in this harness.
+        QueryBuilder localOnly = nestedChain(1);
+        SearchRequest localRequest = request(localOnly);
+        expectThrows(IndexNotFoundException.class, () -> localOnly.rewrite(coordinatorContext(localRequest, new ArrayList<>())));
+    }
+
     /** Scoped to fused mode: classic hybrid is answered by every version that can parse it, and stays version-free. */
     @SneakyThrows
     public void testClassicHybrid_onTheSameLaggingCluster_isUnaffected() {
@@ -482,9 +522,11 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
         return new MultiSearchResponse.Item(new SearchResponse(sections, null, 1, 1, 0, 10, null, null), null);
     }
 
+    /** A leg hit as the coordinator sees one: its {@code _index} comes from the shard target the response was read from. */
     private SearchHit hit(final int docId, final String id, final float score) {
         SearchHit hit = new SearchHit(docId, id, Map.of(), Map.of());
         hit.score(score);
+        hit.shard(new SearchShardTarget("node-1", new ShardId(new Index(INDEX_NAME, "uuid-1"), 0), null, OriginalIndices.NONE));
         return hit;
     }
 
@@ -501,7 +543,7 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
     private void initClusterUtil(final Settings clusterSettings, final Version minNodeVersion) {
         Metadata metadata = mock(Metadata.class);
         ClusterState clusterState = mock(ClusterState.class);
-        ClusterService clusterService = mock(ClusterService.class);
+        clusterService = mock(ClusterService.class);
         when(clusterService.state()).thenReturn(clusterState);
         when(clusterState.metadata()).thenReturn(metadata);
         when(clusterState.getMetadata()).thenReturn(metadata);
@@ -524,5 +566,18 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
             new Index[] { index }
         );
         NeuralSearchClusterUtil.instance().initialize(clusterService, resolver);
+    }
+
+    /**
+     * The same cluster, except index resolution fails the way core's does for a literal expression it cannot look up —
+     * which is what a {@code cluster:index} expression hits when there is no such remote alias.
+     */
+    private void initClusterUtilWhereIndexResolutionFails() {
+        initClusterUtil(null);
+        IndexNameExpressionResolver failing = mock(IndexNameExpressionResolver.class);
+        when(failing.concreteIndices(any(ClusterState.class), any(org.opensearch.action.IndicesRequest.class))).thenThrow(
+            new IndexNotFoundException("cluster:index")
+        );
+        NeuralSearchClusterUtil.instance().initialize(clusterService, failing);
     }
 }

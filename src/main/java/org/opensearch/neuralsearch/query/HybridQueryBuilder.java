@@ -491,6 +491,12 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         // First, before any config resolution: the whole request's fan-out has to be within the cluster's budget. A body
         // whose only purpose is to multiply sub-searches should cost one tree walk, not a pipeline lookup per hybrid.
         validateFusedLegSearchBudget(searchRequest);
+        // Then the request's own shape, in one place: what each leg inherits, and a refusal for the shapes fused mode
+        // cannot answer correctly. Ahead of every check that resolves index metadata — config resolution reads the
+        // targeted indices' default pipelines, and the window ceiling reads their max_result_window — because a request
+        // naming a remote index dies in index resolution with `no such index [cluster:index]`, which would hide this
+        // class's explanation of why fused mode refuses cross-cluster search at all.
+        CandidateScope candidateScope = CandidateScope.from(searchRequest);
 
         FusionSpec fusionSpec = resolveFusionSpec(searchRequest);
         if (Objects.isNull(fusionSpec)) {
@@ -523,9 +529,6 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         // ceiling — a different (and much lower) limit than max_result_window, and the only one that would otherwise be
         // discovered at query time on every shard.
         validateWindowSizeAgainstMaxClauseCount(window);
-        // Decide, in one place, what each leg inherits from this request — and refuse the shapes fused mode cannot answer
-        // correctly. Done here, before the fan-out is registered, so a refusal costs less than the search it replaces.
-        CandidateScope candidateScope = CandidateScope.from(searchRequest);
         List<QueryBuilder> legs = queries;
         // Validate weights (range, sum, count) before the leg fan-out — a bad weights array otherwise burns a full
         // MultiSearch before the combiner is built in the async callback.

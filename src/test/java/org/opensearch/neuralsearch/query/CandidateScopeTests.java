@@ -272,10 +272,40 @@ public class CandidateScopeTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A scroll pages one reader snapshot, and that snapshot covers round 2 alone: the legs that chose the window ran as
+     * separate one-shot searches against their own reader instants and are never re-run. Classic hybrid refuses scroll too.
+     * Note this is refused from {@code SearchRequest} rather than the source, and before the {@code source == null} return —
+     * a scroll needs no source to be a scroll.
+     */
+    public void testRejectsScroll() {
+        SearchRequest request = new SearchRequest(INDEX).scroll(TimeValue.timeValueMinutes(1));
+
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> CandidateScope.from(request));
+
+        assertThat(e.getMessage(), containsString("does not support [scroll]"));
+        assertThat("points at the shape that does work", e.getMessage(), containsString("point_in_time instead"));
+    }
+
     public void testRejectsCrossClusterSearch() {
-        // A remote hit's _index carries the cluster alias, which no shard of the remote index matches, so the
-        // _index-qualified Top clauses would silently drop every remote document.
+        // Neither half of a fused document's identity works across clusters: a remote hit's _index arrives as the bare
+        // index name with the cluster alias held separately, so two clusters holding an index of the same name collapse into
+        // one fusion key, and round 2's _index term matches nothing on a remote shard, which tests that term against its
+        // cluster-aliased target. Remote documents would reach the user through the Tail only, unranked at _score 0.
         SearchRequest request = new SearchRequest("local-index", "remote-cluster:other-index");
+
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> CandidateScope.from(request));
+
+        assertThat(e.getMessage(), containsString("does not support [cross-cluster search]"));
+    }
+
+    /**
+     * A wildcard cluster pattern is the shape that would otherwise slip through. Index resolution rejects a literal
+     * {@code cluster:index} on its own (as {@code no such index}), but {@code *:index} resolves without error, so this
+     * guard is what refuses it — and it must not depend on where in the rewrite index resolution happens to run.
+     */
+    public void testRejectsWildcardClusterPattern() {
+        SearchRequest request = new SearchRequest("*:other-index");
 
         IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> CandidateScope.from(request));
 

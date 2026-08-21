@@ -53,19 +53,16 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         );
     }
 
-    /** One MultiSearch item wrapping a SearchResponse whose hits carry the given (_id -> score) pairs. */
+    /**
+     * One MultiSearch item wrapping a SearchResponse whose hits carry the given (_id -> score) pairs, all from the default
+     * index. Every hit carries an {@code _index}, as a real leg response's hits always do — it comes from the shard target
+     * the response was read from — and fusion requires it.
+     */
     private MultiSearchResponse.Item legItem(Map<String, Float> idToScore) {
-        SearchHit[] hits = new SearchHit[idToScore.size()];
-        int i = 0;
-        for (Map.Entry<String, Float> e : idToScore.entrySet()) {
-            SearchHit hit = new SearchHit(i, e.getKey(), Map.of(), Map.of());
-            hit.score(e.getValue());
-            hits[i++] = hit;
-        }
-        return successfulItem(hits);
+        return legItemFromIndex(INDEX, idToScore);
     }
 
-    /** Like {@link #legItem} but the hits carry an {@code _index}, as real leg responses do. */
+    /** Like {@link #legItem} but from a named index, for asserting cross-index document identity. */
     private MultiSearchResponse.Item legItemFromIndex(String index, Map<String, Float> idToScore) {
         SearchHit[] hits = new SearchHit[idToScore.size()];
         int i = 0;
@@ -98,6 +95,22 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         return hit;
     }
 
+    /**
+     * A leg item whose hits carry no {@code _index} — no shard target was ever set on them. Not a shape a real leg response
+     * can have (a coordinator-side hit's {@code _index} comes from the shard it was read from), which is exactly why fusion
+     * treats it as an invariant violation rather than something to work around.
+     */
+    private MultiSearchResponse.Item indexlessLegItem(Map<String, Float> idToScore) {
+        SearchHit[] hits = new SearchHit[idToScore.size()];
+        int i = 0;
+        for (Map.Entry<String, Float> e : idToScore.entrySet()) {
+            SearchHit hit = new SearchHit(i, e.getKey(), Map.of(), Map.of());
+            hit.score(e.getValue());
+            hits[i++] = hit;
+        }
+        return successfulItem(hits);
+    }
+
     private MultiSearchResponse.Item successfulItem(SearchHit[] hits) {
         SearchHits searchHits = new SearchHits(hits, new TotalHits(hits.length, TotalHits.Relation.EQUAL_TO), 1.0f);
         SearchResponseSections sections = new SearchResponseSections(searchHits, null, null, false, false, null, 0);
@@ -120,9 +133,8 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         SearchHit[] hits = new SearchHit[idToScore.size()];
         int i = 0;
         for (Map.Entry<String, Float> e : idToScore.entrySet()) {
-            SearchHit hit = new SearchHit(i, e.getKey(), Map.of(), Map.of());
-            hit.score(e.getValue());
-            hits[i++] = hit;
+            hits[i] = hitFrom(i, INDEX, e.getKey(), e.getValue());
+            i++;
         }
         SearchHits searchHits = new SearchHits(hits, new TotalHits(hits.length, TotalHits.Relation.EQUAL_TO), 1.0f);
         SearchResponseSections sections = new SearchResponseSections(searchHits, null, null, false, false, null, 0);
@@ -452,29 +464,28 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         }
     }
 
-    public void testBuildFusedQuery_whenHitsCarryNoIndex_thenTopFallsBackToIdOnlyForEveryClause() {
-        // The array handed to the self-erased query is null-or-fully-populated: a null hole would NPE in
-        // writeOptionalStringArray while serializing the round-2 shard request. Hits with no resolvable _index drop it
-        // wholesale rather than leaving holes.
+    /**
+     * A hit with no {@code _index} cannot be fused, and the request fails rather than degrading. The previous behaviour was
+     * to drop the whole {@code indices} array and address the window by {@code _id} alone — which is the same-{@code _id}
+     * conflation the two tests above exist to prevent, reintroduced for every clause because one hit lacked an index. Since
+     * a coordinator-side hit always carries its {@code _index}, this shape is a broken invariant, not user input.
+     */
+    public void testBuildFusedQuery_whenAnyHitCarriesNoIndex_thenFailsRatherThanDegrading() {
         List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
-        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)), legItemFromIndex("idx-a", Map.of("2", 0.8f)));
+        MultiSearchResponse ms = multiSearch(legItemFromIndex("idx-a", Map.of("2", 0.8f)), indexlessLegItem(Map.of("1", 0.9f)));
 
-        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(
-            new SearchSourceBuilder().trackTotalHits(false),
-            ms,
-            legs,
-            minMaxArithmetic(),
-            10
+        IllegalStateException e = expectThrows(
+            IllegalStateException.class,
+            () -> HybridFusionOrchestrator.buildFusedQuery(
+                new SearchSourceBuilder().trackTotalHits(false),
+                ms,
+                legs,
+                minMaxArithmetic(),
+                10
+            )
         );
-
-        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
-        assertEquals(2, self.should().size());
-        for (QueryBuilder clause : self.should()) {
-            assertTrue(
-                "one unresolvable index drops qualification for the whole window, not just its own clause",
-                ((ConstantScoreQueryBuilder) clause).innerQuery() instanceof IdsQueryBuilder
-            );
-        }
+        assertTrue("names the offending leg and hit: " + e.getMessage(), e.getMessage().contains("sub-query 1 returned a hit [_id: 1]"));
+        assertTrue(e.getMessage().contains("no [_index]"));
     }
 
     // ---- inner_hits are registered without executing the legs ----
@@ -603,17 +614,18 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         assertEquals("Top and Tail must address the same document identically", topAddress, tailAddress);
     }
 
-    public void testBuildFusedQuery_whenKnnLegHitsCarryNoIndex_thenTailFallsBackToIdsOnly() {
-        // Defensive parity with documentKey and the Top: a hit with no resolvable _index is addressed by _id alone rather
-        // than failing or dropping the leg.
+    public void testBuildFusedQuery_whenMaterializedLegHitsCarryNoIndex_thenFailsRatherThanDegrading() {
+        // The Tail is a filter, so an _id-only clause here widens the match set to every same-_id document in the cluster —
+        // inflating total_hits and every aggregation bucket. The invariant is asserted once, where every leg's hits enter
+        // fusion, so the Tail path refuses the same shape the Top path does.
         List<QueryBuilder> legs = List.of(legNamed("knn"));
-        MultiSearchResponse ms = multiSearch(legItem(Map.of("2", 0.8f, "3", 0.7f)));
+        MultiSearchResponse ms = multiSearch(indexlessLegItem(Map.of("2", 0.8f, "3", 0.7f)));
 
-        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(sourceWithAggregation(), ms, legs, minMaxArithmetic(), 10);
-
-        QueryBuilder legClause = tailOf(fused).should().get(0);
-        assertTrue("no index to qualify with → bare ids, not a bool", legClause instanceof IdsQueryBuilder);
-        assertEquals(Set.of("2", "3"), ((IdsQueryBuilder) legClause).ids());
+        IllegalStateException e = expectThrows(
+            IllegalStateException.class,
+            () -> HybridFusionOrchestrator.buildFusedQuery(sourceWithAggregation(), ms, legs, minMaxArithmetic(), 10)
+        );
+        assertTrue(e.getMessage().contains("cannot be fused"));
     }
 
     /**
