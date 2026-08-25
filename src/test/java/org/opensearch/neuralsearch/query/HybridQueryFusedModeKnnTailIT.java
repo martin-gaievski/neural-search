@@ -49,6 +49,7 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
     private static final String OWNER_B = "owner-b";
     private static final int COLLIDING_IDS = 3;
     private static final int WINDOW_SIZE = 10;
+    private static final String VECTOR_LEG_NAME = "vector_leg";
 
     private String indexConfig() {
         return "{\"settings\":{\"index\":{\"knn\":true,\"number_of_shards\":1,\"number_of_replicas\":0,"
@@ -100,6 +101,11 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
     /** A materializable leg: {@code knn} is replaced in the Tail by an address of the hits it returned. */
     private String knnLeg(String filter) {
         return "{\"knn\":{\"" + VECTOR_FIELD + "\":{\"vector\":[1.1,1.0],\"k\":" + WINDOW_SIZE + filter + "}}}";
+    }
+
+    /** The same leg carrying a {@code _name}, which {@code matched_queries} must report it under. */
+    private String namedKnnLeg(String queryName) {
+        return knnLeg(",\"_name\":\"" + queryName + "\"");
     }
 
     /** A non-materializable leg, kept as the real query in the Tail. Matches index-a's documents only. */
@@ -200,7 +206,59 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
         );
     }
 
+    /**
+     * A materialized ANN leg answers to its own {@code _name}. The substitute is a fresh builder addressing the returned
+     * hits, so it carried no name at all and the leg silently lost {@code matched_queries} — in <i>every</i> configuration,
+     * Tail included, since materialization happens on both paths. What it reports is the documents the leg returned, which
+     * is the same bound the match set already accepts for a materialized leg.
+     */
+    @SneakyThrows
+    public void testFusedKnnTail_whenAnnLegIsNamed_thenTheMaterializedSubstituteKeepsTheName() {
+        ensureDataset();
+        String body = "{\"query\":"
+            + fusedHybrid(namedKnnLeg(VECTOR_LEG_NAME), ownerLeg())
+            + ",\"aggregations\":{\"by_owner\":{\"terms\":{\"field\":\""
+            + OWNER_FIELD
+            + "\",\"size\":10}}},\"track_total_hits\":true}";
+
+        Map<String, Object> response = searchRaw(body, 20);
+
+        assertEquals(COLLIDING_IDS, hits(response).size());
+        for (Map<String, Object> hit : hits(response)) {
+            assertEquals(
+                "the materialized ANN leg must still report its name for " + hit.get("_id"),
+                List.of(VECTOR_LEG_NAME),
+                matchedQueries(hit)
+            );
+        }
+    }
+
+    /** Both halves at once: the ANN leg is materialized <i>and</i> the request is Top-only, so nothing executes the legs. */
+    @SneakyThrows
+    public void testFusedKnnTail_whenTopOnlyAndAnnLegIsNamed_thenTheNameIsStillReported() {
+        ensureDataset();
+        String body = "{\"query\":" + fusedHybrid(namedKnnLeg(VECTOR_LEG_NAME), ownerLeg()) + ",\"track_total_hits\":false}";
+
+        Map<String, Object> response = searchRaw(body, 20);
+
+        assertEquals("the fused window is index-a's three documents", COLLIDING_IDS, hits(response).size());
+        for (Map<String, Object> hit : hits(response)) {
+            assertEquals(
+                "a Top-only query registers the leg without executing it, for " + hit.get("_id"),
+                List.of(VECTOR_LEG_NAME),
+                matchedQueries(hit)
+            );
+        }
+    }
+
     // ------------------------------------------------ helpers ------------------------------------------------
+
+    /** A hit's {@code matched_queries}; an absent field reads as empty, which is the loss under test. */
+    @SuppressWarnings("unchecked")
+    private List<String> matchedQueries(Map<String, Object> hit) {
+        Object matched = hit.get("matched_queries");
+        return matched instanceof List ? (List<String>) matched : new ArrayList<>();
+    }
 
     @SneakyThrows
     private Map<String, Object> searchRaw(String jsonBody, int size) {

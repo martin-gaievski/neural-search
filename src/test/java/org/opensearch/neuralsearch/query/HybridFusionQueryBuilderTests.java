@@ -4,7 +4,12 @@
  */
 package org.opensearch.neuralsearch.query;
 
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 
 import java.util.List;
 
@@ -12,7 +17,11 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ConstantScoreQueryBuilder;
+import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.MatchQueryBuilder;
+import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.QueryRewriteContext;
+import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.search.SearchModule;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -144,6 +153,145 @@ public class HybridFusionQueryBuilderTests extends OpenSearchTestCase {
         assertTrue(rewritten instanceof HybridFusionQueryBuilder);
         assertNotSame("changed source → new copy", query, rewritten);
         assertEquals(2, ((HybridFusionQueryBuilder) rewritten).buildSelfErasedQuery().should().size());
+    }
+
+    // ---- name-only legs: carried so matched_queries survives a Top-only query, never executed ----
+
+    /** A leg whose conversion needs no mappings, so registration can be asserted against a mocked shard context. */
+    private QueryBuilder contextFreeLeg(String queryName) {
+        QueryBuilder leg = new MatchAllQueryBuilder();
+        return queryName == null ? leg : leg.queryName(queryName);
+    }
+
+    public void testSerializationRoundTrip_whenNamedOnlyQueriesPresent_thenPreserved() throws Exception {
+        HybridFusionQueryBuilder original = new HybridFusionQueryBuilder(
+            new String[] { "d1" },
+            new String[] { "idx" },
+            new float[] { 0.9f },
+            List.of(),
+            List.of(),
+            List.of(new MatchQueryBuilder("title", "apple").queryName("lexical_leg"))
+        );
+        HybridFusionQueryBuilder deserialized = copyWriteable(original, namedWriteableRegistry(), HybridFusionQueryBuilder::new);
+        assertEquals(original, deserialized);
+        assertEquals(original.hashCode(), deserialized.hashCode());
+        assertEquals(1, deserialized.namedOnlyQueries().size());
+        assertEquals("lexical_leg", deserialized.namedOnlyQueries().get(0).queryName());
+    }
+
+    public void testEquals_whenOnlyNamedOnlyQueriesDiffer_thenNotEqual() {
+        // The name-only list is part of this query's identity: it changes what the shard registers, hence the response.
+        HybridFusionQueryBuilder withNames = new HybridFusionQueryBuilder(
+            new String[] { "d1" },
+            new String[] { "idx" },
+            new float[] { 0.9f },
+            List.of(),
+            List.of(),
+            List.of(new MatchQueryBuilder("title", "apple").queryName("lexical_leg"))
+        );
+        HybridFusionQueryBuilder withoutNames = new HybridFusionQueryBuilder(
+            new String[] { "d1" },
+            new String[] { "idx" },
+            new float[] { 0.9f },
+            List.of()
+        );
+        assertNotEquals(withNames, withoutNames);
+    }
+
+    public void testSelfErasedShape_whenOnlyNamedOnlyQueriesPresent_thenStillTopOnly() {
+        // The whole point of the name-only list: it is registered, never executed. A non-empty list must leave the
+        // compiled query untouched — no Tail filter appears, so a Top-only request stays Top-only.
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
+            new String[] { "d1", "d2" },
+            new String[] { "idx", "idx" },
+            new float[] { 0.9f, 0.4f },
+            List.of(),
+            List.of(),
+            List.of(new MatchQueryBuilder("title", "apple").queryName("lexical_leg"))
+        );
+        BoolQueryBuilder self = query.buildSelfErasedQuery();
+        assertEquals(2, self.should().size());
+        assertEquals("name-only legs must never become an executed clause", 0, self.filter().size());
+    }
+
+    public void testDoRewrite_whenNamedOnlyQueryRewrites_thenCarriedIntoTheCopy() throws Exception {
+        // A name is registered against the query the builder compiles to, so an un-rewritten name-only leg either compiles
+        // to something else or refuses to compile — it has to travel through doRewrite like the other two lists.
+        QueryBuilder alwaysRewrites = new MatchAllQueryBuilder() {
+            @Override
+            protected QueryBuilder doRewrite(QueryRewriteContext c) {
+                return new MatchAllQueryBuilder().queryName("lexical_leg");
+            }
+        }.queryName("lexical_leg");
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
+            new String[] { "d1" },
+            new String[] { "idx" },
+            new float[] { 0.7f },
+            List.of(),
+            List.of(),
+            List.of(alwaysRewrites)
+        );
+        QueryRewriteContext ctx = mock(QueryRewriteContext.class);
+
+        QueryBuilder rewritten = query.rewrite(ctx);
+        assertNotSame("a changed name-only leg produces a new copy", query, rewritten);
+        List<QueryBuilder> carried = ((HybridFusionQueryBuilder) rewritten).namedOnlyQueries();
+        assertEquals(1, carried.size());
+        assertEquals("lexical_leg", carried.get(0).queryName());
+    }
+
+    /**
+     * The fix itself: converting the query registers each name-only leg's {@code _name}, which is the only thing
+     * {@code matched_queries} is built from in the fetch phase. Ids are empty so the self-erased query is an empty
+     * {@code bool} — this asserts the registration, not the Top's compilation.
+     */
+    public void testDoToQuery_whenNamedOnlyLegsCarried_thenTheirNamesAreRegistered() throws Exception {
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
+            new String[0],
+            new String[0],
+            new float[0],
+            List.of(),
+            List.of(),
+            List.of(contextFreeLeg("lexical_leg"), contextFreeLeg("vector_leg"))
+        );
+        QueryShardContext context = mock(QueryShardContext.class);
+
+        query.doToQuery(context);
+
+        verify(context).addNamedQuery(eq("lexical_leg"), any());
+        verify(context).addNamedQuery(eq("vector_leg"), any());
+    }
+
+    public void testDoToQuery_whenNamedOnlyLegHasNoName_thenNothingIsRegistered() throws Exception {
+        // Registration follows the user's _name and invents none: an unnamed leg carried here reports nothing.
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
+            new String[0],
+            new String[0],
+            new float[0],
+            List.of(),
+            List.of(),
+            List.of(contextFreeLeg(null))
+        );
+        QueryShardContext context = mock(QueryShardContext.class);
+
+        query.doToQuery(context);
+
+        verify(context, never()).addNamedQuery(anyString(), any());
+    }
+
+    /**
+     * The self-erase does not cost the {@code hybrid} clause its own {@code _name}: {@code queryName} is copied onto this
+     * builder and {@code AbstractQueryBuilder#toQuery} — which is {@code final} — registers it. Pinned because the opposite
+     * was assumed while diagnosing the leg-name loss.
+     */
+    public void testToQuery_whenTheFusedQueryItselfIsNamed_thenItsOwnNameIsRegistered() throws Exception {
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(new String[0], new String[0], new float[0], List.of());
+        query.queryName("my_hybrid");
+        QueryShardContext context = mock(QueryShardContext.class);
+
+        query.toQuery(context);
+
+        verify(context).addNamedQuery(eq("my_hybrid"), any());
     }
 
     public void testExtractInnerHitBuilders_recursesIntoSourceQueries() {

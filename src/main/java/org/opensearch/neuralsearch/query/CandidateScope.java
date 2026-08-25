@@ -307,7 +307,10 @@ final class CandidateScope {
             SEARCH_SOURCE,
             "includeNamedQueriesScore",
             Disposition.NOT_PROPAGATED,
-            "matched_queries reporting, which the self-erased round-2 query cannot carry anyway"
+            "scoring variant of matched_queries reporting: only a leg's hits are read from its response, so a leg's own "
+                + "named-query report has nowhere to go. Round 2 answers for the user's named queries itself — the legs "
+                + "are converted on the shard for exactly that, whether or not the Tail executes them (see "
+                + "HybridFusionQueryBuilder#registerNamedOnlyQueries)"
         );
         put(table, SEARCH_SOURCE, "suggestBuilder", Disposition.NOT_PROPAGATED, "suggestions do not depend on the query");
         put(table, SEARCH_SOURCE, "stats", Disposition.NOT_PROPAGATED, "propagating would count every leg into the user's stats groups");

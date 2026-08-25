@@ -113,13 +113,21 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
     private final List<QueryBuilder> tailQueries;
     /** Legs registered for fetch-phase inner_hits extraction; never executed by this query. */
     private final List<QueryBuilder> innerHitsQueries;
+    /**
+     * Legs converted only so that any {@code _name} they carry is registered for {@code matched_queries}; never executed,
+     * and never part of the query this builder compiles to. Non-empty only for a Top-only query whose legs are named —
+     * when the Tail is built it registers the very same forms as a side effect of executing them, so the two lists are
+     * never both populated. See {@link #registerNamedOnlyQueries}.
+     */
+    private final List<QueryBuilder> namedOnlyQueries;
 
     public HybridFusionQueryBuilder(
         String[] ids,
         String[] indices,
         float[] scores,
         List<QueryBuilder> tailQueries,
-        List<QueryBuilder> innerHitsQueries
+        List<QueryBuilder> innerHitsQueries,
+        List<QueryBuilder> namedOnlyQueries
     ) {
         Objects.requireNonNull(indices, "indices is required: a fused document is addressed by its _index and _id together");
         assert indices.length == ids.length : "indices must be parallel to ids";
@@ -130,11 +138,23 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         this.scores = scores;
         this.tailQueries = Objects.isNull(tailQueries) ? new ArrayList<>() : tailQueries;
         this.innerHitsQueries = Objects.isNull(innerHitsQueries) ? new ArrayList<>() : innerHitsQueries;
+        this.namedOnlyQueries = Objects.isNull(namedOnlyQueries) ? new ArrayList<>() : namedOnlyQueries;
+    }
+
+    /** Convenience for a query with no name-only registrations — the Tail, where present, registers its own. */
+    public HybridFusionQueryBuilder(
+        String[] ids,
+        String[] indices,
+        float[] scores,
+        List<QueryBuilder> tailQueries,
+        List<QueryBuilder> innerHitsQueries
+    ) {
+        this(ids, indices, scores, tailQueries, innerHitsQueries, List.of());
     }
 
     /** Convenience for the common shape where the Tail legs are also the inner_hits source. */
     public HybridFusionQueryBuilder(String[] ids, String[] indices, float[] scores, List<QueryBuilder> tailQueries) {
-        this(ids, indices, scores, tailQueries, tailQueries);
+        this(ids, indices, scores, tailQueries, tailQueries, List.of());
     }
 
     public HybridFusionQueryBuilder(StreamInput in) throws IOException {
@@ -144,6 +164,9 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         this.scores = in.readFloatArray();
         this.tailQueries = in.readNamedWriteableList(QueryBuilder.class);
         this.innerHitsQueries = in.readNamedWriteableList(QueryBuilder.class);
+        // No wire-version gate: this query is built only for a cluster whose every node supports fused mode (see
+        // HybridQueryBuilder#requireClusterSupportsFusedMode), and it has never shipped in a released version.
+        this.namedOnlyQueries = in.readNamedWriteableList(QueryBuilder.class);
     }
 
     @Override
@@ -153,6 +176,7 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         out.writeFloatArray(scores);
         out.writeNamedWriteableList(tailQueries);
         out.writeNamedWriteableList(innerHitsQueries);
+        out.writeNamedWriteableList(namedOnlyQueries);
     }
 
     @Override
@@ -176,13 +200,22 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
             rewrittenInnerHits.add(r);
             changed |= r != q;
         }
+        // The name-only legs must be rewritten too: a name is registered against the query its builder compiles to, and an
+        // un-rewritten builder either compiles to something else or refuses to compile at all.
+        List<QueryBuilder> rewrittenNamedOnly = new ArrayList<>(namedOnlyQueries.size());
+        for (QueryBuilder q : namedOnlyQueries) {
+            QueryBuilder r = q.rewrite(matchSetContext);
+            rewrittenNamedOnly.add(r);
+            changed |= r != q;
+        }
         if (changed) {
             HybridFusionQueryBuilder rewrittenBuilder = new HybridFusionQueryBuilder(
                 ids,
                 indices,
                 scores,
                 rewrittenTail,
-                rewrittenInnerHits
+                rewrittenInnerHits,
+                rewrittenNamedOnly
             );
             rewrittenBuilder.boost(boost());
             rewrittenBuilder.queryName(queryName());
@@ -193,7 +226,36 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
 
     @Override
     protected Query doToQuery(QueryShardContext context) throws IOException {
+        registerNamedOnlyQueries(context);
         return buildSelfErasedQuery().toQuery(context);
+    }
+
+    /**
+     * Convert the carried leg forms purely for the side effect of {@link QueryShardContext#addNamedQuery}, and discard the
+     * result — nothing here reaches the executed query, which is {@link #buildSelfErasedQuery()} alone.
+     *
+     * <p>{@code matched_queries} is reported in the fetch phase from {@code ParsedQuery#namedFilters()}, and
+     * {@code MatchedQueriesPhase} builds its own {@link org.apache.lucene.search.Weight} per entry there — so a named leg
+     * has to be <i>registered</i>, never <i>executed</i>, exactly as a leg's {@code inner_hits} do (see
+     * {@link #extractInnerHitBuilders}). Without this, a Top-only query would convert no leg at all and the field would
+     * silently vanish from a response classic hybrid always carries it in.
+     *
+     * <p>Registering a name twice is a plain map overwrite in the shard context, so this stays correct even if a form here
+     * also appears in the Tail. The coordinator does not populate both lists (see {@code HybridFusionOrchestrator}), which
+     * keeps the wire payload free of the duplicate rather than relying on that.
+     */
+    private void registerNamedOnlyQueries(QueryShardContext context) throws IOException {
+        for (QueryBuilder namedOnlyQuery : namedOnlyQueries) {
+            namedOnlyQuery.toQuery(context);
+        }
+    }
+
+    /**
+     * The legs carried for name registration alone. Exposed for the same reason {@link #buildSelfErasedQuery()} is: what
+     * the coordinator decides to carry is a structural contract, and asserting it should not require a shard context.
+     */
+    List<QueryBuilder> namedOnlyQueries() {
+        return namedOnlyQueries;
     }
 
     /**
@@ -274,12 +336,20 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
             && Arrays.equals(indices, other.indices)
             && Arrays.equals(scores, other.scores)
             && Objects.equals(tailQueries, other.tailQueries)
-            && Objects.equals(innerHitsQueries, other.innerHitsQueries);
+            && Objects.equals(innerHitsQueries, other.innerHitsQueries)
+            && Objects.equals(namedOnlyQueries, other.namedOnlyQueries);
     }
 
     @Override
     protected int doHashCode() {
-        return Objects.hash(Arrays.hashCode(ids), Arrays.hashCode(indices), Arrays.hashCode(scores), tailQueries, innerHitsQueries);
+        return Objects.hash(
+            Arrays.hashCode(ids),
+            Arrays.hashCode(indices),
+            Arrays.hashCode(scores),
+            tailQueries,
+            innerHitsQueries,
+            namedOnlyQueries
+        );
     }
 
     @Override
