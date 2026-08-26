@@ -15,11 +15,13 @@ import static org.opensearch.neuralsearch.settings.NeuralSearchSettings.MAX_FUSI
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
+import java.util.function.Function;
 
 import org.apache.lucene.search.TotalHits;
 import org.opensearch.Version;
@@ -51,7 +53,10 @@ import org.opensearch.index.query.Rewriteable;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.SearchShardTarget;
+import org.opensearch.search.aggregations.AggregationBuilders;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.fetch.subphase.highlight.HighlightBuilder;
+import org.opensearch.search.rescore.QueryRescorerBuilder;
 import org.opensearch.search.pipeline.SearchPipelineMetadata;
 import org.opensearch.transport.client.Client;
 import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
@@ -304,6 +309,125 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
         assertEquals("both siblings fan out, each once", List.of(2, 2), fanOut.legCountPerMultiSearch());
     }
 
+    // ---------------------------------------------- position guard ----------------------------------------------
+
+    /**
+     * A body's {@code query} is not the only thing core rewrites against the coordinator context: {@code post_filter},
+     * aggregations, sorts, {@code rescore} and {@code highlight} are rewritten alongside it, and fused mode would fan out
+     * from any of them — while the budget above counts the request's {@code query} alone, so those placements were admitted
+     * at a counted budget of zero. Worse, a leg sub-search inherits the request's {@code post_filter}, so a fused hybrid
+     * there is copied onto every leg it creates and re-enters the rewrite with the same body. Both are refused now, before
+     * a single leg is dispatched.
+     */
+    @SneakyThrows
+    public void testFusedHybridOutsideTheRequestQuery_isRefusedBeforeAnyFanOut() {
+        Map<String, Function<HybridQueryBuilder, SearchSourceBuilder>> positions = new LinkedHashMap<>();
+        positions.put("post_filter", hybrid -> requestQuery().postFilter(hybrid));
+        positions.put("aggregation filter", hybrid -> requestQuery().aggregation(AggregationBuilders.filter("probe", hybrid)));
+        positions.put("rescore", hybrid -> requestQuery().addRescorer(new QueryRescorerBuilder(hybrid)));
+        positions.put(
+            "highlight query",
+            hybrid -> requestQuery().highlighter(
+                new HighlightBuilder().field(new HighlightBuilder.Field(TEXT_FIELD_NAME).highlightQuery(hybrid))
+            )
+        );
+
+        for (Map.Entry<String, Function<HybridQueryBuilder, SearchSourceBuilder>> position : positions.entrySet()) {
+            SearchSourceBuilder source = position.getValue().apply(nestedChain(1));
+            SearchRequest searchRequest = new SearchRequest(INDEX_NAME).source(source);
+            List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+            QueryCoordinatorContext coordinatorContext = coordinatorContext(searchRequest, registered);
+
+            IllegalArgumentException error = expectThrows(IllegalArgumentException.class, () -> source.rewrite(coordinatorContext));
+
+            assertThat(position.getKey(), error.getMessage(), containsString("must be part of the request's [query]"));
+            assertThat(position.getKey() + ": the message names the way out", error.getMessage(), containsString("[bool]"));
+            assertTrue(position.getKey() + ": refused before the fan-out it would have created", registered.isEmpty());
+        }
+    }
+
+    /**
+     * The same refusal when there is no {@code query} for the hybrid to be part of. A body may carry only a
+     * {@code post_filter}, or only aggregations, and core rewrites those against this context all the same — so what an
+     * absent query means has to be decided rather than assumed. It means refused: admitting a hybrid because nothing
+     * contradicts it is how the unbounded case gets back in, and here there is no query to bound it with at all.
+     */
+    @SneakyThrows
+    public void testFusedHybridInABodyWithNoRequestQuery_isRefusedBeforeAnyFanOut() {
+        Map<String, Function<HybridQueryBuilder, SearchSourceBuilder>> bodies = new LinkedHashMap<>();
+        bodies.put("post_filter only", hybrid -> new SearchSourceBuilder().postFilter(hybrid));
+        bodies.put("aggregations only", hybrid -> new SearchSourceBuilder().aggregation(AggregationBuilders.filter("probe", hybrid)));
+
+        for (Map.Entry<String, Function<HybridQueryBuilder, SearchSourceBuilder>> body : bodies.entrySet()) {
+            SearchSourceBuilder source = body.getValue().apply(nestedChain(1));
+            SearchRequest searchRequest = new SearchRequest(INDEX_NAME).source(source);
+            List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+            QueryCoordinatorContext coordinatorContext = coordinatorContext(searchRequest, registered);
+
+            IllegalArgumentException error = expectThrows(IllegalArgumentException.class, () -> source.rewrite(coordinatorContext));
+
+            assertThat(body.getKey(), error.getMessage(), containsString("must be part of the request's [query]"));
+            assertTrue(body.getKey() + ": refused before the fan-out it would have created", registered.isEmpty());
+        }
+    }
+
+    /**
+     * And when the request carries no source at all — a {@code SearchRequest} may hold none, which is why every read of it in
+     * core is null-checked. Same answer for the same reason: fused mode is refused rather than fanning out against a body no
+     * guard can then count. Spelled with the no-argument constructor deliberately, since {@code new SearchRequest(index)}
+     * installs an empty source and would exercise the absent-query case above instead.
+     */
+    @SneakyThrows
+    public void testFusedHybrid_whenTheRequestHasNoSource_isRefusedBeforeAnyFanOut() {
+        QueryBuilder query = nestedChain(1);
+        SearchRequest sourceless = new SearchRequest();
+        assertNull("the shape under test is a request with no body", sourceless.source());
+        List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+        QueryCoordinatorContext coordinatorContext = coordinatorContext(sourceless, registered);
+
+        IllegalArgumentException error = expectThrows(IllegalArgumentException.class, () -> query.rewrite(coordinatorContext));
+
+        assertThat(error.getMessage(), containsString("must be part of the request's [query]"));
+        assertTrue("refused before any fan-out", registered.isEmpty());
+    }
+
+    /** Inside the request's query, at any depth a query builder exposes, is admitted — the shape users actually write. */
+    @SneakyThrows
+    public void testFusedHybridNestedInsideTheRequestQuery_isAdmitted() {
+        BoolQueryBuilder inBool = QueryBuilders.boolQuery().filter(QueryBuilders.termQuery(TEXT_FIELD_NAME, "kw")).should(nestedChain(1));
+
+        FanOut fanOut = drive(request(inBool));
+
+        assertEquals("a fused hybrid nested in a bool still fans out", 1, fanOut.multiSearches());
+        assertEquals(List.of(2), fanOut.legCountPerMultiSearch());
+    }
+
+    /**
+     * A fused hybrid that is a leg of another one stays admissible: its leg sub-search carries it as that request's own
+     * query, which is where the guard looks. Pinned separately because a guard reading only the original request would
+     * refuse every nested fused hybrid instead — the shape this class's first test exists for.
+     */
+    @SneakyThrows
+    public void testLegSubSearch_carriesItsLegAsItsOwnQuery_soANestedFusedLegIsStillAdmitted() {
+        HybridQueryBuilder outer = nestedChain(2);
+        List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+        outer.rewrite(coordinatorContext(request(outer), registered));
+        assertEquals("the outer hybrid fans out once", 1, registered.size());
+
+        List<MultiSearchRequest> multiSearches = new ArrayList<>();
+        Client client = mock(Client.class);
+        doAnswer(invocation -> multiSearches.add(invocation.getArgument(0))).when(client).multiSearch(any(), any());
+        registered.getFirst().accept(client, ActionListener.wrap(response -> {}, e -> fail("leg fan-out failed: " + e.getMessage())));
+
+        SearchRequest legRequest = multiSearches.getFirst().requests().getFirst();
+        assertTrue("the inner fused hybrid is its leg request's query", legRequest.source().query() instanceof HybridQueryBuilder);
+
+        List<BiConsumer<Client, ActionListener<?>>> legRegistered = new ArrayList<>();
+        legRequest.source().query().rewrite(coordinatorContext(legRequest, legRegistered));
+
+        assertEquals("and it fans out its own legs from there", 1, legRegistered.size());
+    }
+
     // ---------------------------------------------- version guard ----------------------------------------------
 
     /**
@@ -453,6 +577,11 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
 
     private SearchRequest request(final QueryBuilder query) {
         return new SearchRequest(INDEX_NAME).source(new SearchSourceBuilder().query(query));
+    }
+
+    /** A source whose {@code query} is something other than the hybrid under test, for the positions that are not it. */
+    private SearchSourceBuilder requestQuery() {
+        return new SearchSourceBuilder().query(QueryBuilders.matchAllQuery());
     }
 
     private QueryCoordinatorContext coordinatorContext(
