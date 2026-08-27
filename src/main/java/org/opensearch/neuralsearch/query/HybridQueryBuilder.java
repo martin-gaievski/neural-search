@@ -125,6 +125,16 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     @Setter(AccessLevel.NONE)
     private FusionSpec resolvedFusionSpec;
 
+    /**
+     * The request's {@code rescore}, confined to this hybrid's fused window at round 1 by {@link FusedRescoreScope}. Carried
+     * on the marker for one reason: round 2 verifies the confinement landed on the request core is dispatching before it
+     * hands the fused query over. {@code null} when the request has no rescore, and — like {@link #fusedSupplier} and
+     * {@link #resolvedFusionSpec} — never parsed, never serialized, absent from {@link #doEquals}/{@link #doHashCode}.
+     */
+    @Getter(AccessLevel.NONE)
+    @Setter(AccessLevel.NONE)
+    private FusedRescoreScope fusedRescoreScope;
+
     public static final int MAX_NUMBER_OF_SUB_QUERIES = 5;
     private static final int LOWER_BOUND_OF_PAGINATION_DEPTH = 0;
     private static final int DEFAULT_FUSION_WINDOW_SIZE = 100;
@@ -463,12 +473,17 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      * {@link #doToQuery} throws, so the coordinator rewrite is the sole entry.
      *
      * <ul>
-     *   <li><b>Round 1</b>: resolve the {@link FusionSpec} (inline block, else the attached pipeline), fire the legs as
-     *       a parallel {@code MultiSearch} via {@link QueryRewriteContext#registerAsyncAction}, and return a marker
-     *       carrying a {@link SetOnce}-backed supplier.</li>
+     *   <li><b>Round 1</b>: resolve the {@link FusionSpec} (inline block, else the attached pipeline), confine the
+     *       request's {@code rescore} to the window the legs are about to produce ({@link FusedRescoreScope}), fire the
+     *       legs as a parallel {@code MultiSearch} via {@link QueryRewriteContext#registerAsyncAction}, and return a
+     *       marker carrying a {@link SetOnce}-backed supplier.</li>
      *   <li><b>Round 2</b>: the async action has produced the standard query — return it ({@link HybridFusionQueryBuilder} or
      *       {@code match_none}).</li>
      * </ul>
+     *
+     * <p>Round 1 is also the only place anything about the request is written back, and the rescore confinement is why:
+     * core rewrites the query and the rescore list in that order within one pass, so a rescore can only be reached from
+     * inside the query's own rewrite. Everything else here reads the request and returns.
      */
     private QueryBuilder doRewriteFused(QueryRewriteContext queryRewriteContext) throws IOException {
         // Only the match set is wanted (this builder is a leg inside an enclosing fused query's Tail): contribute what the
@@ -480,7 +495,16 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         // Round 2: the async self-erase already produced the standard query — swap to it (or stay put until it lands).
         if (Objects.nonNull(fusedSupplier)) {
             QueryBuilder fused = fusedSupplier.get();
-            return Objects.isNull(fused) ? this : fused;
+            if (Objects.isNull(fused)) {
+                return this;
+            }
+            // Before handing the query over: the rescore confinement installed at round 1 has to be on the request core is
+            // actually dispatching. It is checked here because this is the first moment after core's own pass over the
+            // rescore list, and it fails the request rather than answering it — see FusedRescoreScope.
+            if (Objects.nonNull(fusedRescoreScope)) {
+                fusedRescoreScope.requireReachedTheExecutedRequest();
+            }
+            return fused;
         }
         QueryCoordinatorContext coordinatorContext = queryRewriteContext.convertToCoordinatorContext();
         if (Objects.isNull(coordinatorContext)) {
@@ -547,15 +571,34 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         // pipeline), but the fanned-out legs run with the pipeline disabled — so hand the resolved config down.
         List<QueryBuilder> fanOutLegs = projectResolvedConfigOntoLegs(legs, fusionSpec);
 
+        // Last, and the only write-back to the request source: rescore is never propagated to a leg, so it runs on the shard
+        // against the query this self-erases into — where the Tail's non-scoring matches are rescore candidates too, and a
+        // rescore query matching one would lift a document fusion never ranked. Confining each rescore query to the fused
+        // window keeps a rescore able to reorder the hybrid's hits but unable to add to them. It has to happen here, on the
+        // pass that fires the legs rather than in the callback that receives them, because core snapshots the rescore list
+        // later in this same pass — FusedRescoreScope carries the not-yet-known window in as a placeholder instead. After
+        // every validation above, so a refused request leaves the source untouched.
+        FusedRescoreScope rescoreScope = FusedRescoreScope.install(searchRequest.source());
+
         SetOnce<QueryBuilder> fused = new SetOnce<>();
         queryRewriteContext.registerAsyncAction(
             (client, listener) -> client.multiSearch(
                 HybridFusionOrchestrator.buildLegMultiSearch(candidateScope, fanOutLegs, window),
                 ActionListener.wrap(multiSearchResponse -> {
                     try {
-                        fused.set(
-                            HybridFusionOrchestrator.buildFusedQuery(searchRequest.source(), multiSearchResponse, legs, fusionSpec, window)
+                        QueryBuilder fusedQuery = HybridFusionOrchestrator.buildFusedQuery(
+                            searchRequest.source(),
+                            multiSearchResponse,
+                            legs,
+                            fusionSpec,
+                            window
                         );
+                        // Hand the now-known window to the placeholders installed above. Mutates nothing the request holds:
+                        // the placeholders are already in it, and core rewrites them into the window on its next pass.
+                        if (Objects.nonNull(rescoreScope)) {
+                            rescoreScope.resolve(fusedQuery);
+                        }
+                        fused.set(fusedQuery);
                         listener.onResponse(null);
                     } catch (Exception e) {
                         listener.onFailure(e);
@@ -591,6 +634,7 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         marker.fusion(this.fusion);
         marker.resolvedFusionSpec = this.resolvedFusionSpec;
         marker.fusedSupplier = fused::get;
+        marker.fusedRescoreScope = rescoreScope;
         return marker;
     }
 

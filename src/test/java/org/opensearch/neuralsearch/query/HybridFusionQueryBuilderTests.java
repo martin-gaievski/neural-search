@@ -14,19 +14,25 @@ import static org.mockito.Mockito.verify;
 import static org.opensearch.neuralsearch.common.MinClusterVersionUtil.MINIMAL_SUPPORTED_VERSION_FUSED_MODE_IN_HYBRID_QUERY;
 
 import java.util.List;
+import java.util.Set;
 
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.io.stream.FilterStreamInput;
 import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
+import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.index.query.AbstractQueryBuilder;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ConstantScoreQueryBuilder;
+import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.MatchAllQueryBuilder;
+import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.query.QueryShardContext;
+import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.search.SearchModule;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -347,5 +353,117 @@ public class HybridFusionQueryBuilderTests extends OpenSearchTestCase {
         java.util.Map<String, org.opensearch.index.query.InnerHitContextBuilder> innerHits = new java.util.HashMap<>();
         query.extractInnerHitBuilders(innerHits);
         assertFalse("leg inner_hits must be surfaced", innerHits.isEmpty());
+    }
+
+    // ---- the fused window as a filter, for confining a rescore ----
+
+    private void assertAddressedTo(QueryBuilder clause, String index, String... ids) {
+        assertTrue("expected an _index-qualified bool, got " + clause, clause instanceof BoolQueryBuilder);
+        BoolQueryBuilder qualified = (BoolQueryBuilder) clause;
+        assertEquals("qualified by _id AND _index", 2, qualified.filter().size());
+        assertEquals(Set.of(ids), ((IdsQueryBuilder) qualified.filter().get(0)).ids());
+        TermQueryBuilder indexTerm = (TermQueryBuilder) qualified.filter().get(1);
+        assertEquals("_index", indexTerm.fieldName());
+        assertEquals(index, indexTerm.value());
+    }
+
+    public void testFusedWindowFilter_singleIndex_isOneQualifiedClause() {
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
+            new String[] { "d1", "d2" },
+            new String[] { "idx", "idx" },
+            new float[] { 0.9f, 0.4f },
+            List.of()
+        );
+        // The window filter goes through the same addressing primitive as the Top, so one index means one clause — no
+        // pointless bool wrapper around a single group.
+        assertAddressedTo(query.fusedWindowFilter(), "idx", "d1", "d2");
+    }
+
+    public void testFusedWindowFilter_multipleIndices_isQualifiedPerIndexGroup() {
+        // Same-_id documents in two indices: the reason the window filter cannot be an _id-only ids query. An unqualified
+        // filter would readmit idx-b/d1 — a document outside the window — into whatever the filter is scoping.
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
+            new String[] { "d1", "d2", "d1" },
+            new String[] { "idx-a", "idx-a", "idx-b" },
+            new float[] { 0.9f, 0.5f, 0.4f },
+            List.of()
+        );
+
+        QueryBuilder window = query.fusedWindowFilter();
+
+        assertTrue(window instanceof BoolQueryBuilder);
+        BoolQueryBuilder perIndex = (BoolQueryBuilder) window;
+        assertEquals("one OR-ed clause per index in the window", 2, perIndex.should().size());
+        assertAddressedTo(perIndex.should().get(0), "idx-a", "d1", "d2");
+        assertAddressedTo(perIndex.should().get(1), "idx-b", "d1");
+    }
+
+    public void testFusedWindowFilter_emptyWindow_isMatchNone() {
+        // An empty window has to compile to match_none, not to the empty bool that addressing an empty set would produce —
+        // an empty bool filter matches everything, which as a rescore scope would be the whole defect back again.
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(new String[0], new String[0], new float[0], List.of());
+        assertTrue(query.fusedWindowFilter() instanceof MatchNoneQueryBuilder);
+    }
+
+    // ---- fused scores must be usable as clause boosts ----
+
+    public void testScoresMustBeUsableAsBoosts() {
+        // Each score becomes a constant_score boost. Negative dies in AbstractQueryBuilder#boost per shard; NaN and
+        // +Infinity slip past that guard (Float.compare(NaN, 0f) > 0) and die inside Lucene's BoostQuery instead. -0.0f is
+        // the interesting one: `< 0.0f` is false for it, but core's checkNegativeBoost uses Float.compare and rejects it.
+        for (float rejected : new float[] { -1.0f, -0.0f, Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY }) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                "expected [" + rejected + "] to be refused",
+                () -> new HybridFusionQueryBuilder(new String[] { "d1" }, new String[] { "idx" }, new float[] { rejected }, List.of())
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("fused scores must all be finite and non-negative"));
+        }
+    }
+
+    public void testScoresOfZeroAreAcceptedByTheBuilder() {
+        // The builder enforces only the boost contract. Keeping a ranked document strictly above the non-scoring Tail is a
+        // stronger, fusion-specific guarantee, and it lives where the ranking is decided — not here.
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
+            new String[] { "d1" },
+            new String[] { "idx" },
+            new float[] { 0.0f },
+            List.of()
+        );
+        assertEquals(1, query.buildSelfErasedQuery().should().size());
+    }
+
+    public void testScoresAreRevalidatedOffTheWire() throws Exception {
+        // The wire constructor is why this is a real check rather than an assert: a bad score arriving from a peer would
+        // otherwise be discovered per shard, at query-build time, as what reads like an engine bug. Core re-validates its
+        // own boost on deserialization for exactly this reason.
+        assertNotNull("baseline: this byte layout deserializes when the score is valid", readBackWithScore(0.5f));
+
+        for (float rejected : new float[] { -1.0f, Float.NaN, Float.POSITIVE_INFINITY }) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                "expected [" + rejected + "] to be refused off the wire",
+                () -> readBackWithScore(rejected)
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("fused scores must all be finite and non-negative"));
+        }
+    }
+
+    /** Hand-writes this query's wire form with one chosen fused score — the only way to present a value the ctor refuses. */
+    private HybridFusionQueryBuilder readBackWithScore(float score) throws Exception {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            out.writeFloat(AbstractQueryBuilder.DEFAULT_BOOST); // AbstractQueryBuilder#writeTo: boost, then queryName
+            out.writeOptionalString(null);
+            out.writeStringArray(new String[] { "d1" });
+            out.writeStringArray(new String[] { "idx" });
+            out.writeFloatArray(new float[] { score });
+            // tailQueries, innerHitsQueries, namedOnlyQueries — one per list in doWriteTo, in that order
+            out.writeNamedWriteableList(List.of());
+            out.writeNamedWriteableList(List.of());
+            out.writeNamedWriteableList(List.of());
+            try (StreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), namedWriteableRegistry())) {
+                return new HybridFusionQueryBuilder(in);
+            }
+        }
     }
 }

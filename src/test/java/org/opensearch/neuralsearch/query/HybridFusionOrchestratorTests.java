@@ -901,4 +901,106 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
     private int tailFilterCount(QueryBuilder fused) {
         return ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().filter().size();
     }
+
+    // ---- fused scores are floored above the non-scoring Tail ----
+
+    private FusionSpec l2Arithmetic() {
+        return new FusionSpec(FusionSpec.TECHNIQUE_ARITHMETIC_MEAN, "l2", FusionSpec.DEFAULT_RANK_CONSTANT, new float[0]);
+    }
+
+    private FusionSpec minMaxWeighted(float... weights) {
+        return new FusionSpec(
+            FusionSpec.TECHNIQUE_ARITHMETIC_MEAN,
+            FusionSpec.NORMALIZATION_MIN_MAX,
+            FusionSpec.DEFAULT_RANK_CONSTANT,
+            weights
+        );
+    }
+
+    private ConstantScoreQueryBuilder topClause(QueryBuilder fused, int position) {
+        return (ConstantScoreQueryBuilder) ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().should().get(position);
+    }
+
+    /**
+     * The tie this closes. The Top scores and the Tail does not, which is the whole mechanism separating the fused window
+     * from everything else; a ranked document at exactly {@code 0.0} ties with the Tail-only documents it is meant to
+     * outrank, and Lucene then breaks that tie by ascending doc id — so a document fusion did not rank can be returned
+     * ahead of one it did, and with {@code size == window_size} the ranked one is dropped outright.
+     *
+     * <p>{@code l2} is one of the two ways to reach exactly {@code 0.0}: a leg whose raw scores are all {@code 0.0} has a
+     * zero norm, and {@code L2ScoreNormalizer.MIN_SCORE} is {@code 0.0f} — unlike min_max's and z_score's {@code 0.001f}.
+     * A document appearing only in such a leg therefore fuses to {@code 0.0} under default weights.
+     */
+    public void testBuildFusedQuery_whenL2LegHasZeroNorm_thenRankedScoreIsFlooredAboveTheTail() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        // Leg 0's only hit scores 0.0 → zero norm → normalizes to L2's MIN_SCORE of 0.0f. Doc 3 is in no other leg.
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("3", 0.0f)), legItem(Map.of("1", 5.0f, "2", 3.0f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, l2Arithmetic(), 10);
+
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
+        assertEquals("union of {1,2,3} ranked", 3, self.should().size());
+        assertAddressedTo(((ConstantScoreQueryBuilder) self.should().get(2)).innerQuery(), INDEX, "3");
+        assertEquals(
+            "a fused score of exactly 0.0 is floored, so it still outranks the Tail",
+            HybridFusionOrchestrator.MIN_RANKED_SCORE,
+            topClause(fused, 2).boost(),
+            0.0f
+        );
+        assertTrue("every ranked document outscores a Tail-only document", topClause(fused, 0).boost() > 0.0f);
+    }
+
+    /**
+     * What the floor's <i>value</i> has to satisfy, and the reason it is not {@link Float#MIN_VALUE}: the score does not
+     * reach Lucene's comparison untouched. An enclosing clause's {@code boost}, a rescore's {@code query_weight} (core's
+     * {@code QueryRescorer} multiplies every window document's first-pass score by it, matched or not) and a
+     * {@code score_mode: multiply} rescore all attenuate it first, and {@code Float.MIN_VALUE} is subnormal — any factor at
+     * or below {@code 0.5} rounds it back to exactly {@code 0.0} and restores the tie the floor exists to break.
+     *
+     * <p>Asserted on the constant rather than through a query because that is where the requirement lives: the arithmetic
+     * below is core's and Lucene's, and this is the only place the plugin gets to choose a value that survives it.
+     */
+    public void testMinRankedScore_survivesTheAttenuationAFusedScoreMeetsDownstream() {
+        assertEquals(
+            "subnormal, so a factor of 0.5 annihilates it — the trap this constant exists to avoid",
+            0.0f,
+            Float.MIN_VALUE * 0.5f,
+            0.0f
+        );
+
+        for (float factor : new float[] { 0.5f, 0.1f, 0.001f, 1e-6f, 1e-12f }) {
+            assertTrue(
+                "the floor must stay above the Tail's 0.0 after being multiplied by " + factor,
+                HybridFusionOrchestrator.MIN_RANKED_SCORE * factor > 0.0f
+            );
+        }
+        assertTrue(
+            "and it must stay far below the smallest score a real config produces — min_max floors a normalized score at "
+                + "0.001 and arithmetic_mean divides by a weight sum of 1.0",
+            HybridFusionOrchestrator.MIN_RANKED_SCORE < 0.001f * 1e-9f
+        );
+    }
+
+    /**
+     * The second route to exactly {@code 0.0}, and the one that works with any normalization technique: a {@code weights}
+     * entry of {@code 0.0} zeroes its leg's contribution, so a document that matched only that leg fuses to {@code 0.0}.
+     * Two such documents also pin down what the floor must NOT do: they were tied at {@code 0.0} before it and stay tied
+     * after, in the same key order — flooring is not allowed to invent an order fusion did not produce, only to lift the
+     * whole tie above the Tail.
+     */
+    public void testBuildFusedQuery_whenLegWeightIsZero_thenAllZeroScoresAreFlooredAndKeepTheirOrder() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 5.0f, "2", 3.0f)), legItem(Map.of("3", 7.0f, "4", 2.0f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, minMaxWeighted(1.0f, 0.0f), 10);
+
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
+        assertEquals(4, self.should().size());
+        assertEquals("leg 0 at weight 1.0 still ranks normally", 1.0f, topClause(fused, 0).boost(), 0.001f);
+        // Docs 3 and 4 matched only the zero-weighted leg, so both fused to exactly 0.0 and were tied on the composite key.
+        assertAddressedTo(((ConstantScoreQueryBuilder) self.should().get(2)).innerQuery(), INDEX, "3");
+        assertAddressedTo(((ConstantScoreQueryBuilder) self.should().get(3)).innerQuery(), INDEX, "4");
+        assertEquals(HybridFusionOrchestrator.MIN_RANKED_SCORE, topClause(fused, 2).boost(), 0.0f);
+        assertEquals(HybridFusionOrchestrator.MIN_RANKED_SCORE, topClause(fused, 3).boost(), 0.0f);
+    }
 }

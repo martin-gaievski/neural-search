@@ -7,6 +7,7 @@ package org.opensearch.neuralsearch.query;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -22,6 +23,7 @@ import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ConstantScoreQueryBuilder;
 import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.InnerHitContextBuilder;
+import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.query.QueryShardContext;
@@ -135,7 +137,7 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
             : "indices must be fully populated — a null element NPEs in writeStringArray";
         this.ids = ids;
         this.indices = indices;
-        this.scores = scores;
+        this.scores = requireUsableAsBoosts(scores);
         this.tailQueries = Objects.isNull(tailQueries) ? new ArrayList<>() : tailQueries;
         this.innerHitsQueries = Objects.isNull(innerHitsQueries) ? new ArrayList<>() : innerHitsQueries;
         this.namedOnlyQueries = Objects.isNull(namedOnlyQueries) ? new ArrayList<>() : namedOnlyQueries;
@@ -152,6 +154,41 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         this(ids, indices, scores, tailQueries, innerHitsQueries, List.of());
     }
 
+    /**
+     * Every fused score becomes a clause boost in {@link #buildSelfErasedQuery}, so the array has to hold values a boost
+     * accepts: finite and non-negative. Checked in both constructors, and the wire one is the reason it is a real check
+     * rather than an assert — {@code scores} is the only boost-bearing field on this builder, and the base class re-validates
+     * its own {@code boost} on deserialization for the same reason ({@code AbstractQueryBuilder(StreamInput)} calls
+     * {@code checkNegativeBoost}). Left unchecked, a bad value survives to {@link #doToQuery} and fails <i>per shard</i>: a
+     * negative score dies in {@code AbstractQueryBuilder#boost} and a non-finite one slips past that guard entirely
+     * ({@code Float.compare(NaN, 0f) > 0}) to die inside Lucene's {@code BoostQuery} with a Lucene-internal message. Both
+     * read as an engine bug rather than as the coordinator handing down something it should never have built.
+     *
+     * <p>Deliberately the boost contract, not fusion's stronger one. The coordinator additionally guarantees every fused
+     * score is <i>strictly</i> positive so a ranked document cannot tie the non-scoring Tail — that is
+     * {@code HybridFusionOrchestrator#scoreAboveTail}'s job, and it belongs there, where the ranking is decided. This
+     * constructor only refuses what cannot be turned into a query at all.
+     */
+    private static float[] requireUsableAsBoosts(final float[] scores) {
+        for (float score : scores) {
+            // Float.compare rather than `<`, matching core's own checkNegativeBoost: -0.0f is not less than 0.0f under `<`
+            // but compares as negative, and boost() rejects it — so this check has to reject it too or it lets through the
+            // one value that would fail per shard.
+            if (Float.isFinite(score) == false || Float.compare(score, 0.0f) < 0) {
+                throw new IllegalArgumentException(
+                    String.format(
+                        Locale.ROOT,
+                        "[%s] fused scores must all be finite and non-negative — each one is used as a clause boost — but "
+                            + "one was [%s]",
+                        NAME,
+                        score
+                    )
+                );
+            }
+        }
+        return scores;
+    }
+
     /** Convenience for the common shape where the Tail legs are also the inner_hits source. */
     public HybridFusionQueryBuilder(String[] ids, String[] indices, float[] scores, List<QueryBuilder> tailQueries) {
         this(ids, indices, scores, tailQueries, tailQueries, List.of());
@@ -161,7 +198,7 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         super(in);
         this.ids = in.readStringArray();
         this.indices = in.readStringArray();
-        this.scores = in.readFloatArray();
+        this.scores = requireUsableAsBoosts(in.readFloatArray());
         this.tailQueries = in.readNamedWriteableList(QueryBuilder.class);
         this.innerHitsQueries = in.readNamedWriteableList(QueryBuilder.class);
         // No wire-version gate: this query is built only for a cluster whose every node supports fused mode (see
@@ -310,6 +347,61 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
     static QueryBuilder addressDocuments(String index, String... ids) {
         IdsQueryBuilder idQuery = new IdsQueryBuilder().addIds(ids);
         return new BoolQueryBuilder().filter(idQuery).filter(new TermQueryBuilder(INDEX_FIELD, index));
+    }
+
+    /**
+     * Address a set of documents spread across indices: one qualified {@link #addressDocuments} clause per index, OR-ed
+     * together. The Tail calls it for a materialized leg's hits and {@link #fusedWindowFilter} calls it for the ranked
+     * window, so "these documents, wherever they live" has a single definition just as one document does.
+     *
+     * <p>Grouped by index rather than one clause per document, so a single-index search still presents a single clause —
+     * and with one group the {@code bool} wrapper is dropped altogether, since a lone {@code should} is that clause.
+     *
+     * @param idsByIndex index name to the {@code _id}s to address in it; iteration order decides clause order, so pass an
+     *                   order-preserving map for a deterministic query. Must be non-empty: {@code bool{should: []}}
+     *                   compiles to {@code MatchAllDocsQuery}, the exact opposite of addressing nothing, so a caller whose
+     *                   set may be empty must return {@code match_none} instead of calling this.
+     */
+    static QueryBuilder addressDocumentGroups(Map<String, List<String>> idsByIndex) {
+        assert idsByIndex.isEmpty() == false : "addressing an empty document set compiles to match_all, not match_none";
+        List<QueryBuilder> perIndex = new ArrayList<>(idsByIndex.size());
+        for (Map.Entry<String, List<String>> group : idsByIndex.entrySet()) {
+            perIndex.add(addressDocuments(group.getKey(), group.getValue().toArray(new String[0])));
+        }
+        if (perIndex.size() == 1) {
+            return perIndex.get(0);
+        }
+        BoolQueryBuilder inAnyIndex = new BoolQueryBuilder();
+        perIndex.forEach(inAnyIndex::should);
+        return inAnyIndex;
+    }
+
+    /**
+     * A non-scoring filter matching exactly the fused window — the documents the Top scores, addressed the same way the Top
+     * addresses them. Used to confine a request's {@code rescore} to the hybrid's own hits (see {@link FusedRescoreScope}):
+     * {@code rescore} is never propagated to a leg, so it runs on the shard against this whole query, where the Tail's
+     * non-scoring matches are candidates too. Intersecting the rescore query with this filter is what makes a Tail-only
+     * document unliftable.
+     *
+     * <p>Built from {@code ids} and {@code indices} through {@link #addressDocumentGroups}, deliberately: the filter has to
+     * select the same documents the Top clauses do, and the only way to guarantee that is to address them with the same
+     * definition rather than a parallel one. In particular it is {@code _index}-qualified, so a sibling index's
+     * same-{@code _id} document is outside the window here exactly as it is outside the Top.
+     *
+     * <p>An empty window yields {@code match_none} rather than an empty {@code bool}, which would compile to
+     * {@code MatchAllDocsQuery} and confine the rescore to nothing at all. The coordinator never builds this query with an
+     * empty window ({@code HybridFusionOrchestrator#buildFusedQuery} returns {@code match_none} instead), so this is a
+     * guard against the failure mode being silent, not a case in the normal flow.
+     */
+    QueryBuilder fusedWindowFilter() {
+        if (ids.length == 0) {
+            return new MatchNoneQueryBuilder();
+        }
+        Map<String, List<String>> idsByIndex = new LinkedHashMap<>();
+        for (int i = 0; i < ids.length; i++) {
+            idsByIndex.computeIfAbsent(indices[i], index -> new ArrayList<>()).add(ids[i]);
+        }
+        return addressDocumentGroups(idsByIndex);
     }
 
     /**
