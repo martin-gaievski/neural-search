@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.opensearch.client.Request;
@@ -50,6 +51,7 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
     private static final int COLLIDING_IDS = 3;
     private static final int WINDOW_SIZE = 10;
     private static final String VECTOR_LEG_NAME = "vector_leg";
+    private static final String OWNER_LEG_NAME = "owner_leg";
 
     private String indexConfig() {
         return "{\"settings\":{\"index\":{\"knn\":true,\"number_of_shards\":1,\"number_of_replicas\":0,"
@@ -100,7 +102,15 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
 
     /** A materializable leg: {@code knn} is replaced in the Tail by an address of the hits it returned. */
     private String knnLeg(String filter) {
-        return "{\"knn\":{\"" + VECTOR_FIELD + "\":{\"vector\":[1.1,1.0],\"k\":" + WINDOW_SIZE + filter + "}}}";
+        return knnLeg(filter, WINDOW_SIZE);
+    }
+
+    /**
+     * The same leg with an explicit {@code k}. Fused mode deliberately does not rewrite a leg's {@code k}, so a {@code k}
+     * above {@code window_size} is how a leg comes to match documents it never returns.
+     */
+    private String knnLeg(String filter, int k) {
+        return "{\"knn\":{\"" + VECTOR_FIELD + "\":{\"vector\":[1.1,1.0],\"k\":" + k + filter + "}}}";
     }
 
     /** The same leg carrying a {@code _name}, which {@code matched_queries} must report it under. */
@@ -108,20 +118,40 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
         return knnLeg(",\"_name\":\"" + queryName + "\"");
     }
 
+    private String namedKnnLeg(String queryName, int k) {
+        return knnLeg(",\"_name\":\"" + queryName + "\"", k);
+    }
+
     /** A non-materializable leg, kept as the real query in the Tail. Matches index-a's documents only. */
     private String ownerLeg() {
+        return ownerLeg("none", null);
+    }
+
+    /**
+     * The owner leg, optionally named and with a chosen {@code field_value_factor} modifier. {@code reciprocal} inverts the
+     * ranking to {@code 1/s}, which is how a document the ANN leg ranks last is pulled into the fused window.
+     */
+    private String ownerLeg(String modifier, String queryName) {
         return "{\"function_score\":{\"query\":{\"term\":{\""
             + OWNER_FIELD
             + "\":\""
             + OWNER_A
             + "\"}},\"field_value_factor\":{\"field\":\""
             + SCORE_FIELD
-            + "\",\"modifier\":\"none\",\"missing\":1}}}";
+            + "\",\"modifier\":\""
+            + modifier
+            + "\",\"missing\":1}"
+            + (queryName == null ? "" : ",\"_name\":\"" + queryName + "\"")
+            + "}}";
     }
 
     private String fusedHybrid(String... legs) {
+        return fusedHybrid(WINDOW_SIZE, legs);
+    }
+
+    private String fusedHybrid(int windowSize, String... legs) {
         return "{\"hybrid\":{\"fusion\":{\"window_size\":"
-            + WINDOW_SIZE
+            + windowSize
             + ",\"normalization\":{\"technique\":\"min_max\"},"
             + "\"combination\":{\"technique\":\"arithmetic_mean\"}},"
             + "\"queries\":["
@@ -251,6 +281,115 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
         }
     }
 
+    /**
+     * What a materialized leg's {@code _name} is worth under {@code include_named_queries_score}. The substitute is a
+     * {@code bool} of {@code filter} clauses addressing the leg's returned ids, and {@code MatchedQueriesPhase} reports each
+     * name from a weight built out of the named query alone — a query with no scoring clause, hence {@code 0.0}. The ANN
+     * similarity is not recoverable here: the shard never sees the vector query, and re-running it for a reporting field is
+     * the graph walk materialization exists to avoid.
+     *
+     * <p>The non-materialized leg in the same request is the control: it goes to the shard as the real
+     * {@code function_score} query, so its name reports the score it actually computes. The delta is a property of
+     * materialization, not of fused mode.
+     */
+    @SneakyThrows
+    public void testFusedKnnTail_whenIncludeNamedQueriesScore_thenMaterializedLegReportsZeroAndRealLegReportsItsScore() {
+        ensureDataset();
+        String body = "{\"query\":"
+            + fusedHybrid(namedKnnLeg(VECTOR_LEG_NAME), ownerLeg("none", OWNER_LEG_NAME))
+            + ",\"track_total_hits\":true}";
+
+        Map<String, Object> response = searchRaw(body, 20, Map.of("include_named_queries_score", "true"));
+
+        assertEquals(COLLIDING_IDS, hits(response).size());
+        for (Map<String, Object> hit : hits(response)) {
+            Map<String, Double> scores = matchedQueryScores(hit);
+            String id = (String) hit.get("_id");
+            // Pin the oracle first: reading the array shape here would leave the map empty and every check below vacuous.
+            assertEquals(
+                "doc " + id + ": both legs are named, so both are reported",
+                Set.of(VECTOR_LEG_NAME, OWNER_LEG_NAME),
+                scores.keySet()
+            );
+            assertEquals("doc " + id + ": the materialized ANN leg has no scoring clause", 0.0d, scores.get(VECTOR_LEG_NAME), 0.0d);
+            assertTrue(
+                "doc " + id + ": the leg that reached the shard intact scores for real, got " + scores.get(OWNER_LEG_NAME),
+                scores.get(OWNER_LEG_NAME) > 0.0d
+            );
+        }
+    }
+
+    /**
+     * The recall bound a materialized leg accepts, made executable. {@code newLegRequest} caps every leg at
+     * {@code size = window_size}, so the substitute stands for {@code min(matches, window_size)} documents — while the leg's
+     * own {@code k} decides how many it actually matched. With {@code k} (3) above {@code window_size} (2) the ANN leg
+     * matches all three of index-a's documents and returns two, so a document that enters the fused window through the other
+     * leg carries no evidence that the ANN leg matched it.
+     *
+     * <p>Classic hybrid re-evaluates the named leg's weight per hit and would report the name; fused mode cannot without the
+     * graph walk materialization exists to avoid. This is a characterization test of that documented bound (see
+     * {@code HybridFusionOrchestrator#isMaterializableLeg}), not a parity assertion — raising {@code window_size} to at
+     * least {@code k} × shards removes the gap.
+     *
+     * <p>The reciprocal owner leg ranks {@code 1/s}, i.e. doc 3 first, so doc 3 is returned even at {@code window_size} 2 and
+     * is the truncated case. The same query at a {@code window_size} above {@code k} is run as the control: the name comes
+     * back, which is what makes the absence a recall bound rather than a lost name. Doc 1 is the control in the other
+     * direction — the owner leg did not return it either, but that leg is <i>not</i> materialized, so it reaches the shard as
+     * the real query and its name is reported over its full match set.
+     */
+    public void testFusedKnnTail_whenAnnLegMatchedBeyondItsWindow_thenTheTruncatedDocLosesTheAnnName() {
+        ensureDataset();
+        int annK = COLLIDING_IDS;              // the ANN leg matches every one of index-a's documents...
+        int truncatingWindow = annK - 1;       // ...and window_size lets it return one fewer than it matched.
+
+        Map<String, List<String>> truncated = matchedQueriesById(annK, truncatingWindow);
+        Map<String, List<String>> exact = matchedQueriesById(annK, WINDOW_SIZE);
+
+        // Precondition: doc 3 has to come back from both runs, or the comparison below is about nothing. Note that a returned
+        // document is not the same as a ranked one — the Tail is a filter, so the response is the legs' union and can exceed
+        // window_size; the ranked window bounds the scored Top, not the hit count.
+        assertTrue(
+            "doc 3 must be returned by both runs, got " + truncated + " and " + exact,
+            truncated.containsKey("3") && exact.containsKey("3")
+        );
+
+        assertEquals(
+            "doc 3 was matched by the ANN leg (k=3) but sat outside the two hits window_size=2 let it return, so the "
+                + "materialized substitute does not address it and the ANN name is absent — classic hybrid would report it",
+            List.of(OWNER_LEG_NAME),
+            truncated.get("3")
+        );
+        assertTrue(
+            "the same document keeps the ANN name once window_size >= k, which is what makes the absence above a recall "
+                + "bound of materialization and not a lost name, got "
+                + exact,
+            exact.get("3").contains(VECTOR_LEG_NAME)
+        );
+        assertTrue(
+            "doc 1: a leg that is NOT materialized reaches the shard as the real query, so its name covers its whole "
+                + "match set and not just the hits it returned, got "
+                + truncated,
+            truncated.get("1").contains(OWNER_LEG_NAME)
+        );
+        assertTrue(
+            "doc 1 was inside the ANN leg's returned set even at window_size=2, so it keeps that name, got " + truncated,
+            truncated.get("1").contains(VECTOR_LEG_NAME)
+        );
+    }
+
+    /** {@code matched_queries} per returned document, for the two-named-leg fused query at a given {@code k} and window. */
+    @SneakyThrows
+    private Map<String, List<String>> matchedQueriesById(int annK, int windowSize) {
+        String body = "{\"query\":"
+            + fusedHybrid(windowSize, namedKnnLeg(VECTOR_LEG_NAME, annK), ownerLeg("reciprocal", OWNER_LEG_NAME))
+            + ",\"track_total_hits\":true}";
+        Map<String, List<String>> namesById = new LinkedHashMap<>();
+        for (Map<String, Object> hit : hits(searchRaw(body, 20))) {
+            namesById.put((String) hit.get("_id"), matchedQueries(hit));
+        }
+        return namesById;
+    }
+
     // ------------------------------------------------ helpers ------------------------------------------------
 
     /** A hit's {@code matched_queries}; an absent field reads as empty, which is the loss under test. */
@@ -260,11 +399,33 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
         return matched instanceof List ? (List<String>) matched : new ArrayList<>();
     }
 
-    @SneakyThrows
+    /**
+     * A hit's {@code matched_queries} in the {@code include_named_queries_score} shape — an object of name to score rather
+     * than an array of names. A wrong shape reads as an empty map, so callers must assert the key set before the values.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Double> matchedQueryScores(Map<String, Object> hit) {
+        Map<String, Double> out = new LinkedHashMap<>();
+        Object matched = hit.get("matched_queries");
+        if (matched instanceof Map == false) {
+            return out;
+        }
+        for (Map.Entry<String, Object> entry : ((Map<String, Object>) matched).entrySet()) {
+            out.put(entry.getKey(), ((Number) entry.getValue()).doubleValue());
+        }
+        return out;
+    }
+
     private Map<String, Object> searchRaw(String jsonBody, int size) {
+        return searchRaw(jsonBody, size, Map.of());
+    }
+
+    @SneakyThrows
+    private Map<String, Object> searchRaw(String jsonBody, int size, Map<String, String> params) {
         Request request = new Request("POST", "/" + INDEX_A + "," + INDEX_B + "/_search");
         request.setJsonEntity(jsonBody);
         request.addParameter("size", Integer.toString(size));
+        params.forEach(request::addParameter);
         Response response = client().performRequest(request);
         assertEquals(request.getEndpoint() + ": failed", RestStatus.OK, RestStatus.fromCode(response.getStatusLine().getStatusCode()));
         return XContentHelper.convertToMap(XContentType.JSON.xContent(), EntityUtils.toString(response.getEntity()), false);

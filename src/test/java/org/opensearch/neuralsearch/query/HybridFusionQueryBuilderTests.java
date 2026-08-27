@@ -11,9 +11,14 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
+import static org.opensearch.neuralsearch.common.MinClusterVersionUtil.MINIMAL_SUPPORTED_VERSION_FUSED_MODE_IN_HYBRID_QUERY;
+
 import java.util.List;
 
+import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.common.io.stream.FilterStreamInput;
+import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ConstantScoreQueryBuilder;
@@ -177,6 +182,36 @@ public class HybridFusionQueryBuilderTests extends OpenSearchTestCase {
         assertEquals(original.hashCode(), deserialized.hashCode());
         assertEquals(1, deserialized.namedOnlyQueries().size());
         assertEquals("lexical_leg", deserialized.namedOnlyQueries().get(0).queryName());
+    }
+
+    public void testSerializationRoundTrip_whenStreamPinnedToMinimumSupportedVersion_thenAllThreeListsSurvive() throws Exception {
+        // This query's wire form carries three query lists and reads them unconditionally, with no TransportVersion gate:
+        // it is built only for a cluster whose every node supports fused mode (HybridQueryBuilder#requireClusterSupportsFusedMode)
+        // and has never shipped in a released version, so there is no older reader to stay compatible with. That makes the
+        // minimum supported version the ONLY version the format has to hold at — pin it here, so a future field added
+        // without a gate fails against the oldest peer the gate admits rather than only against Version.CURRENT.
+        HybridFusionQueryBuilder original = new HybridFusionQueryBuilder(
+            new String[] { "d1", "d2" },
+            new String[] { "idx", "idx" },
+            new float[] { 0.9f, 0.4f },
+            List.of(new MatchQueryBuilder("title", "apple").queryName("tail_leg")),
+            List.of(new MatchQueryBuilder("body", "banana")),
+            List.of(new MatchQueryBuilder("title", "cherry").queryName("named_only_leg"))
+        );
+
+        BytesStreamOutput out = new BytesStreamOutput();
+        out.setVersion(MINIMAL_SUPPORTED_VERSION_FUSED_MODE_IN_HYBRID_QUERY);
+        original.writeTo(out);
+
+        FilterStreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), namedWriteableRegistry());
+        in.setVersion(MINIMAL_SUPPORTED_VERSION_FUSED_MODE_IN_HYBRID_QUERY);
+        HybridFusionQueryBuilder deserialized = new HybridFusionQueryBuilder(in);
+
+        // equals() covers all three lists, so this alone pins the format; the assertions below name what would break.
+        assertEquals(original, deserialized);
+        assertEquals("the stream must be fully consumed — a trailing list would leave bytes behind", 0, in.available());
+        assertEquals("named_only_leg", deserialized.namedOnlyQueries().get(0).queryName());
+        assertEquals("the Tail must survive as the compiled query's single filter", 1, deserialized.buildSelfErasedQuery().filter().size());
     }
 
     public void testEquals_whenOnlyNamedOnlyQueriesDiffer_thenNotEqual() {

@@ -117,19 +117,16 @@ final class HybridFusionOrchestrator {
             return new MatchNoneQueryBuilder();
         }
         boolean tailNeeded = needsTail(source, ranked.ids().length);
-        // A leg's _name only reaches matched_queries if its builder is converted on the shard, and the Tail is the only
-        // thing that converts legs. When the Tail is not built, carry the same leg forms for registration alone: the fetch
-        // phase re-evaluates every named query from its own weights, so nothing has to execute for one to be reported.
-        boolean namesOnly = tailNeeded == false && anyLegNamed(legs);
-        List<QueryBuilder> legsInTailForm = tailNeeded || namesOnly ? legQueriesForTail(legs, legHits) : List.of();
+        // The two leg lists are alternatives, never both populated: an executed Tail converts every leg on the shard and so
+        // registers the names itself, and only when it is absent does anything have to be carried for registration alone.
         // inner_hits are registered from the legs themselves, independent of whether the Tail executes them.
         return new HybridFusionQueryBuilder(
             ranked.ids(),
             ranked.indices(),
             ranked.scores(),
-            tailNeeded ? legsInTailForm : List.of(),
+            tailNeeded ? legQueriesForTail(legs, legHits) : List.of(),
             innerHitsLegs(legs),
-            namesOnly ? legsInTailForm : List.of()
+            tailNeeded ? List.of() : namedLegsForRegistration(legs, legHits)
         );
     }
 
@@ -369,42 +366,61 @@ final class HybridFusionOrchestrator {
     private static List<QueryBuilder> legQueriesForTail(List<QueryBuilder> legs, SearchHit[][] legHits) {
         List<QueryBuilder> tail = new ArrayList<>(legs.size());
         for (int legIndex = 0; legIndex < legs.size(); legIndex++) {
-            QueryBuilder leg = legs.get(legIndex);
-            if (isMaterializableLeg(leg) == false) {
-                tail.add(leg);
-                continue;
-            }
-            // A materialized leg answers to its own _name: matched_queries is reported from the names registered while
-            // this query is converted, and the substitute is a fresh builder that would otherwise carry none — so a named
-            // kNN/neural leg would silently lose the field even with the Tail present. What it then reports is the
-            // documents the leg returned, which is the same bound materialization already accepts for the match set.
-            // Under include_named_queries_score the reported value is the substitute's score rather than the ANN
-            // similarity: the shard never sees the vector query, and re-running it for a reporting field is exactly the
-            // graph walk materialization exists to avoid. For the same reason only the leg's own name is inherited — a
-            // _name nested inside the leg (on a knn filter, say) has no clause left here to be registered against.
-            tail.add(materializedLeg(legHits[legIndex]).queryName(leg.queryName()));
+            tail.add(legInTailForm(legs.get(legIndex), legHits[legIndex]));
         }
         return tail;
     }
 
+    /** One leg in its Tail form: itself, or — for a kNN/neural leg — a direct address of the hits it already returned. */
+    private static QueryBuilder legInTailForm(QueryBuilder leg, SearchHit[] hits) {
+        if (isMaterializableLeg(leg) == false) {
+            return leg;
+        }
+        // A materialized leg answers to its own _name: matched_queries is reported from the names registered while
+        // this query is converted, and the substitute is a fresh builder that would otherwise carry none — so a named
+        // kNN/neural leg would silently lose the field even with the Tail present. What it then reports is the
+        // documents the leg returned, which is the same bound materialization already accepts for the match set.
+        // Under include_named_queries_score the reported value is the substitute's score rather than the ANN
+        // similarity: the shard never sees the vector query, and re-running it for a reporting field is exactly the
+        // graph walk materialization exists to avoid. For the same reason only the leg's own name is inherited — a
+        // _name nested inside the leg (on a knn filter, say) has no clause left here to be registered against.
+        return materializedLeg(hits).queryName(leg.queryName());
+    }
+
     /**
-     * Whether any leg carries a query name, at any depth. Used only to decide whether a Top-only query has to carry the
-     * leg forms for name registration at all — the registration itself is unconditional once they are carried.
+     * The legs a Top-only query carries so their {@code _name}s are registered on the shard. A leg's {@code _name} only
+     * reaches {@code matched_queries} if its builder is converted there, and the Tail is the only thing that converts legs
+     * — so when the Tail is absent the named legs are carried in their Tail form for registration alone. The fetch phase
+     * re-evaluates every named query from its own weight, so nothing has to execute for one to be reported.
+     *
+     * <p>Only legs that carry a name are carried. An unnamed leg has nothing to register, and carrying it would cost a
+     * shard-side {@code toQuery} conversion — compiling a query a Top-only request would otherwise never compile — for no
+     * reporting benefit.
+     */
+    private static List<QueryBuilder> namedLegsForRegistration(List<QueryBuilder> legs, SearchHit[][] legHits) {
+        List<QueryBuilder> namedLegs = new ArrayList<>();
+        for (int legIndex = 0; legIndex < legs.size(); legIndex++) {
+            QueryBuilder leg = legs.get(legIndex);
+            if (carriesQueryName(leg)) {
+                namedLegs.add(legInTailForm(leg, legHits[legIndex]));
+            }
+        }
+        return namedLegs;
+    }
+
+    /**
+     * Whether a leg carries a query name, at any depth.
      *
      * <p><b>Deliberately over-inclusive.</b> There is no exact generic descent available: of all the core query builders
      * only {@code bool} overrides {@code visit(QueryBuilderVisitor)}, so a visitor walk (like a shallow
      * {@code queryName() != null} check) is blind to a {@code _name} under {@code nested}, {@code function_score},
      * {@code dis_max}, {@code constant_score} or a {@code knn} filter. The rendered form is checked instead, where
-     * {@link AbstractQueryBuilder#printBoostAndQueryName} puts {@code _name} whenever one is set. A false positive costs
-     * one registration nobody reads; a false negative would silently drop the field, which is the defect being fixed.
+     * {@link AbstractQueryBuilder#printBoostAndQueryName} puts {@code _name} whenever one is set. A false positive — a leg
+     * querying a field literally called {@code _name} — costs one carried leg whose registration nobody reads; a false
+     * negative would silently drop the field, which is the defect being fixed.
      */
-    private static boolean anyLegNamed(List<QueryBuilder> legs) {
-        for (QueryBuilder leg : legs) {
-            if (Objects.nonNull(leg.queryName()) || rendersQueryName(leg)) {
-                return true;
-            }
-        }
-        return false;
+    private static boolean carriesQueryName(QueryBuilder leg) {
+        return Objects.nonNull(leg.queryName()) || rendersQueryName(leg);
     }
 
     private static boolean rendersQueryName(QueryBuilder leg) {

@@ -740,7 +740,7 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
      * Tail was the only thing that converted legs — so a Top-only request silently dropped a field classic hybrid always
      * returns. The leg forms are now carried for registration alone, which leaves the executed query Top-only.
      */
-    public void testBuildFusedQuery_whenTopOnlyAndLegIsNamed_thenLegFormsCarriedWithoutTail() {
+    public void testBuildFusedQuery_whenTopOnlyAndLegIsNamed_thenOnlyTheNamedLegIsCarriedWithoutTail() {
         List<QueryBuilder> legs = List.of(
             new MatchQueryBuilder("text", "hello").queryName("lexical"),
             new TermQueryBuilder("text", "place")
@@ -750,10 +750,10 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(topOnlySource(), ms, legs, minMaxArithmetic(), 10);
 
         assertEquals("registration must not turn a Top-only query into Top+Tail", 0, tailFilterCount(fused));
-        // Every leg is carried once any of them is named: registering an unnamed leg is a no-op, and singling out the named
-        // ones would mean re-deciding at conversion time what the rendered check already decided here.
+        // Only the named leg is carried. Carrying the unnamed one registers nothing, and it is not free: every carried leg
+        // is converted on the shard, so an unnamed leg costs a toQuery a Top-only request would otherwise never pay.
         List<QueryBuilder> carried = namedOnlyLegsOf(fused);
-        assertEquals(2, carried.size());
+        assertEquals("the unnamed leg has nothing to register", 1, carried.size());
         assertEquals("lexical", carried.get(0).queryName());
     }
 
@@ -808,6 +808,26 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         QueryBuilder carried = namedOnlyLegsOf(fused).get(0);
         assertEquals("vector", carried.queryName());
         assertAddressedTo(carried, INDEX, "2");
+    }
+
+    /**
+     * Skipping the unnamed legs makes a carried leg's position in the list stop matching its position among the legs, so a
+     * materialized substitute has to be built from <i>its own</i> leg's hits and not from the hits of whatever landed at the
+     * same output index. Only a named leg behind an unnamed one can catch that.
+     */
+    public void testBuildFusedQuery_whenOnlyALaterLegIsNamed_thenTheSubstituteAddressesThatLegsOwnHits() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), legNamed("knn").queryName("vector"));
+        MultiSearchResponse ms = multiSearch(
+            legItemFromIndex(INDEX, Map.of("1", 0.9f)),
+            legItemFromIndex(INDEX, Map.of("2", 0.8f, "3", 0.7f))
+        );
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(topOnlySource(), ms, legs, minMaxArithmetic(), 10);
+
+        List<QueryBuilder> carried = namedOnlyLegsOf(fused);
+        assertEquals("only the second leg is named", 1, carried.size());
+        assertEquals("vector", carried.get(0).queryName());
+        assertAddressedTo(carried.get(0), INDEX, "2", "3");
     }
 
     /**
