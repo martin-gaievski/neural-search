@@ -724,4 +724,181 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
 
         assertAddressedTo(tailOf(fused).should().get(1), INDEX, "2");
     }
+
+    // ---- a leg's _name reaches matched_queries without the Tail: carried for registration, not for execution ----
+
+    private List<QueryBuilder> namedOnlyLegsOf(QueryBuilder fused) {
+        return ((HybridFusionQueryBuilder) fused).namedOnlyQueries();
+    }
+
+    private SearchSourceBuilder topOnlySource() {
+        return new SearchSourceBuilder().trackTotalHits(false);
+    }
+
+    /**
+     * The measured defect. {@code matched_queries} is reported from the names registered while a query is converted, and the
+     * Tail was the only thing that converted legs — so a Top-only request silently dropped a field classic hybrid always
+     * returns. The leg forms are now carried for registration alone, which leaves the executed query Top-only.
+     */
+    public void testBuildFusedQuery_whenTopOnlyAndLegIsNamed_thenOnlyTheNamedLegIsCarriedWithoutTail() {
+        List<QueryBuilder> legs = List.of(
+            new MatchQueryBuilder("text", "hello").queryName("lexical"),
+            new TermQueryBuilder("text", "place")
+        );
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)), legItem(Map.of("2", 0.8f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(topOnlySource(), ms, legs, minMaxArithmetic(), 10);
+
+        assertEquals("registration must not turn a Top-only query into Top+Tail", 0, tailFilterCount(fused));
+        // Only the named leg is carried. Carrying the unnamed one registers nothing, and it is not free: every carried leg
+        // is converted on the shard, so an unnamed leg costs a toQuery a Top-only request would otherwise never pay.
+        List<QueryBuilder> carried = namedOnlyLegsOf(fused);
+        assertEquals("the unnamed leg has nothing to register", 1, carried.size());
+        assertEquals("lexical", carried.get(0).queryName());
+    }
+
+    public void testBuildFusedQuery_whenTopOnlyAndNoLegIsNamed_thenNothingIsCarried() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)), legItem(Map.of("2", 0.8f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(topOnlySource(), ms, legs, minMaxArithmetic(), 10);
+
+        assertEquals("the common case pays nothing", 0, namedOnlyLegsOf(fused).size());
+        assertEquals(0, tailFilterCount(fused));
+    }
+
+    /**
+     * With the Tail present the legs are converted as a side effect of being executed, so a second copy on the wire would
+     * register names the shard already has. The two lists are never both populated.
+     */
+    public void testBuildFusedQuery_whenTailIsBuiltAndLegIsNamed_thenTheTailCarriesTheName() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello").queryName("lexical"));
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(sourceWithAggregation(), ms, legs, minMaxArithmetic(), 10);
+
+        assertEquals("the executed Tail registers its own names", 0, namedOnlyLegsOf(fused).size());
+        assertEquals("lexical", tailOf(fused).should().get(0).queryName());
+    }
+
+    /**
+     * A materialized leg answers to its own {@code _name}. The substitute is a fresh builder, so before this a named
+     * kNN/neural leg lost {@code matched_queries} in <i>every</i> configuration — Tail or not. What it reports is the
+     * documents the leg returned, the same bound materialization the match set already accepts.
+     */
+    public void testBuildFusedQuery_whenMaterializedLegIsNamed_thenTheSubstituteKeepsTheName() {
+        List<QueryBuilder> legs = List.of(legNamed("knn").queryName("vector"));
+        MultiSearchResponse ms = multiSearch(legItemFromIndex(INDEX, Map.of("2", 0.8f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(sourceWithAggregation(), ms, legs, minMaxArithmetic(), 10);
+
+        QueryBuilder materialized = tailOf(fused).should().get(0);
+        assertEquals("vector", materialized.queryName());
+        assertAddressedTo(materialized, INDEX, "2");
+    }
+
+    /** Both halves of the fix at once: a Top-only request whose only leg is a named ANN leg. */
+    public void testBuildFusedQuery_whenTopOnlyAndMaterializedLegIsNamed_thenTheCarriedFormKeepsTheName() {
+        List<QueryBuilder> legs = List.of(legNamed("knn").queryName("vector"));
+        MultiSearchResponse ms = multiSearch(legItemFromIndex(INDEX, Map.of("2", 0.8f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(topOnlySource(), ms, legs, minMaxArithmetic(), 10);
+
+        assertEquals(0, tailFilterCount(fused));
+        QueryBuilder carried = namedOnlyLegsOf(fused).get(0);
+        assertEquals("vector", carried.queryName());
+        assertAddressedTo(carried, INDEX, "2");
+    }
+
+    /**
+     * Skipping the unnamed legs makes a carried leg's position in the list stop matching its position among the legs, so a
+     * materialized substitute has to be built from <i>its own</i> leg's hits and not from the hits of whatever landed at the
+     * same output index. Only a named leg behind an unnamed one can catch that.
+     */
+    public void testBuildFusedQuery_whenOnlyALaterLegIsNamed_thenTheSubstituteAddressesThatLegsOwnHits() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), legNamed("knn").queryName("vector"));
+        MultiSearchResponse ms = multiSearch(
+            legItemFromIndex(INDEX, Map.of("1", 0.9f)),
+            legItemFromIndex(INDEX, Map.of("2", 0.8f, "3", 0.7f))
+        );
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(topOnlySource(), ms, legs, minMaxArithmetic(), 10);
+
+        List<QueryBuilder> carried = namedOnlyLegsOf(fused);
+        assertEquals("only the second leg is named", 1, carried.size());
+        assertEquals("vector", carried.get(0).queryName());
+        assertAddressedTo(carried.get(0), INDEX, "2", "3");
+    }
+
+    /**
+     * A {@code _name} nested inside a leg counts. Only {@code bool} overrides {@code visit(QueryBuilderVisitor)} in core, so
+     * a visitor walk — like a shallow {@code queryName()} check — is blind to these shapes; the rendered form is what is
+     * inspected instead.
+     */
+    public void testBuildFusedQuery_whenNameIsNestedInsideALeg_thenStillCarried() {
+        QueryBuilder underConstantScore = new ConstantScoreQueryBuilder(new MatchQueryBuilder("text", "hello").queryName("inner"));
+        QueryBuilder underNested = new org.opensearch.index.query.NestedQueryBuilder(
+            "user",
+            new MatchQueryBuilder("user.name", "alice").queryName("deep"),
+            org.apache.lucene.search.join.ScoreMode.None
+        );
+        // bool is the one container core teaches to visit(), so it is the only shape a visitor walk would have found.
+        QueryBuilder underBool = new BoolQueryBuilder().must(new MatchQueryBuilder("text", "hello").queryName("in_bool"));
+        QueryBuilder underFunctionScore = new org.opensearch.index.query.functionscore.FunctionScoreQueryBuilder(
+            new MatchQueryBuilder("text", "hello").queryName("scored")
+        );
+        for (QueryBuilder leg : List.of(underConstantScore, underNested, underBool, underFunctionScore)) {
+            List<QueryBuilder> legs = List.of(leg);
+            MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)));
+
+            QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(topOnlySource(), ms, legs, minMaxArithmetic(), 10);
+
+            assertEquals("a name below the leg's own level must still be registered: " + leg, 1, namedOnlyLegsOf(fused).size());
+            assertEquals("and the query stays Top-only", 0, tailFilterCount(fused));
+        }
+    }
+
+    public void testBuildFusedQuery_whenALegIsWrappedButUnnamed_thenNotCarried() {
+        // The counterpart of the test above: a wrapped leg carrying no name anywhere is not carried, so the rendered check
+        // is not simply always-true.
+        List<QueryBuilder> legs = List.of(new ConstantScoreQueryBuilder(new MatchQueryBuilder("text", "hello")));
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 0.9f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(topOnlySource(), ms, legs, minMaxArithmetic(), 10);
+
+        assertEquals(0, namedOnlyLegsOf(fused).size());
+    }
+
+    /**
+     * The documented gap. A {@code _name} nested inside a <i>materializable</i> leg — on a {@code knn} filter, say — is
+     * detected, so the leg is carried, but the substitute is an address of the returned hits and inherits only the leg's
+     * own name: the shard never sees the leg's structure, so an inner name has nothing to be registered against. Registering
+     * the original leg instead is what materialization exists to avoid (a second graph walk and, for {@code neural}, a second
+     * inference call) for a reporting field. Pinned so the asymmetry is a decision on record rather than a surprise.
+     */
+    public void testBuildFusedQuery_whenNameIsNestedInsideAMaterializableLeg_thenTheSubstituteCarriesNoName() {
+        QueryBuilder annLegWithNamedFilter = new ConstantScoreQueryBuilder(new MatchQueryBuilder("f", "v").queryName("filter_name")) {
+            @Override
+            public String getWriteableName() {
+                return "knn";
+            }
+        };
+        MultiSearchResponse ms = multiSearch(legItemFromIndex(INDEX, Map.of("2", 0.8f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(
+            topOnlySource(),
+            ms,
+            List.of(annLegWithNamedFilter),
+            minMaxArithmetic(),
+            10
+        );
+
+        QueryBuilder carried = namedOnlyLegsOf(fused).get(0);
+        assertAddressedTo(carried, INDEX, "2");
+        assertNull("materialization cannot carry a name from inside the leg it replaced", carried.queryName());
+    }
+
+    private int tailFilterCount(QueryBuilder fused) {
+        return ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().filter().size();
+    }
 }
