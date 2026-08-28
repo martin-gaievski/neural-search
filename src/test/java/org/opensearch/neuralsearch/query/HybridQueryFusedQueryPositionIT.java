@@ -46,7 +46,9 @@ import lombok.SneakyThrows;
  * </ol>
  *
  * <p>One refusal in {@code HybridQueryBuilder.doRewriteFused} closes both: the fan-out is cut at level 0, before any leg
- * is dispatched, and the surviving count over {@code source().query()} becomes exact rather than a lower bound.
+ * is dispatched, and the surviving count over {@code source().query()} becomes exact rather than a lower bound. Exact needs
+ * a walk that descends for itself, since core's own {@code visit} implementations do not agree on descending — pinned here
+ * by the {@code boosting} bodies, which are served at any depth and counted at every one.
  *
  * <p>Run 2-node: {@code ./gradlew integTest -PnumNodes=2 --tests "*HybridQueryFusedQueryPositionIT*"}.
  */
@@ -56,6 +58,8 @@ public class HybridQueryFusedQueryPositionIT extends BaseNeuralSearchIT {
     private static final String NORM_PIPELINE = "fused-query-position-pipeline";
     private static final String GRP_FIELD = "grp";
     private static final String SCORE_FIELD = "s";
+    /** Mapped but never populated: the only way to put a query in a sort is a nested filter, so a sort needs a path. */
+    private static final String NESTED_FIELD = "kids";
     private static final int WINDOW_SIZE = 5;
     private static final int WINDOW_LAST_ID = 5;
     private static final int TOTAL_DOCS = 30;
@@ -83,6 +87,16 @@ public class HybridQueryFusedQueryPositionIT extends BaseNeuralSearchIT {
         bodies.put(
             "highlight_query",
             "{\"query\":{\"match_all\":{}},\"highlight\":{\"fields\":{\"" + GRP_FIELD + "\":{\"highlight_query\":" + chain + "}}}}"
+        );
+        bodies.put(
+            "sort",
+            "{\"query\":{\"match_all\":{}},\"sort\":[{\""
+                + NESTED_FIELD
+                + ".k\":{\"nested\":{\"path\":\""
+                + NESTED_FIELD
+                + "\",\"filter\":"
+                + chain
+                + "}}}]}"
         );
 
         for (Map.Entry<String, String> position : bodies.entrySet()) {
@@ -140,8 +154,59 @@ public class HybridQueryFusedQueryPositionIT extends BaseNeuralSearchIT {
 
             assertEquals(shape.getKey(), RestStatus.BAD_REQUEST.getStatus(), e.getResponse().getStatusLine().getStatusCode());
             assertTrue(shape.getKey() + ": " + body(e), body(e).contains(REFUSAL));
-            assertTrue("the message says a wrapper cannot be inspected: " + body(e), body(e).contains("[wrapper]"));
+            assertTrue("the message names the carriers that can hide it: " + body(e), body(e).contains("[wrapper]"));
         }
+    }
+
+    /**
+     * A {@code template} query hides a fused {@code hybrid} for a different reason and is refused the same way: it carries
+     * an unparsed map and only turns it into a query builder in a later rewrite round, and by then this request's
+     * {@code source()} still holds the {@code template} — core installs the rewritten source only after the whole rewrite
+     * loop has finished. Only a live cluster shows that, since it takes core's own multi-round rewrite.
+     */
+    @SneakyThrows
+    public void testFusedHybridInsideATemplateQuery_isRefused() {
+        ensureDataset();
+        String body = "{\"query\":{\"template\":" + fusedHybrid(leg(), WINDOW_SIZE) + "}}";
+
+        ResponseException e = expectThrows(ResponseException.class, () -> search(body));
+
+        assertEquals(RestStatus.BAD_REQUEST.getStatus(), e.getResponse().getStatusLine().getStatusCode());
+        assertTrue("refused on its position: " + body(e), body(e).contains(REFUSAL));
+        assertTrue("the message names the carriers that can hide it: " + body(e), body(e).contains("[template]"));
+    }
+
+    /**
+     * A {@code boosting} query hands its inner query to the visitor without recursing into it, so the reachability walk and
+     * the leg count both descend for themselves rather than trusting it. What that buys, end to end: a fused hybrid is
+     * served at any depth under such a query, and every one of them is still counted, so the ceiling refuses a body that
+     * declares more than it allows even when each hybrid sits under a {@code boosting}. A walk that trusted core's traversal
+     * saw one level under it and nothing below, so a hybrid nested there was admitted uncounted and bounded only against
+     * its own leg request — the ceiling held per nesting level rather than per request, which is the evasion this whole
+     * guard exists to stop.
+     */
+    @SneakyThrows
+    public void testFusedHybridUnderAQueryThatDoesNotRecurse_isServedAndStillCounted() {
+        ensureDataset();
+        String fused = fusedHybrid(leg(), WINDOW_SIZE);
+
+        assertEquals("one level under a boosting", RestStatus.OK.getStatus(), search("{\"query\":" + boosted(fused) + "}"));
+        assertEquals("two levels under it", RestStatus.OK.getStatus(), search("{\"query\":" + boosted(boosted(fused)) + "}"));
+
+        // The same count of two-leg fused hybrids as the nested chain, side by side instead, each hidden under a boosting.
+        int hybrids = overBudgetLevels();
+        List<String> branches = new ArrayList<>();
+        for (int branch = 0; branch < hybrids; branch++) {
+            branches.add(boosted(fused));
+        }
+        String body = "{\"query\":{\"bool\":{\"should\":[" + String.join(",", branches) + "]}}}";
+
+        ResponseException e = expectThrows(ResponseException.class, () -> search(body));
+        String message = body(e);
+
+        assertEquals(RestStatus.BAD_REQUEST.getStatus(), e.getResponse().getStatusLine().getStatusCode());
+        assertTrue("every hidden hybrid was counted: " + message, message.contains("declares " + (2 * hybrids) + " leg"));
+        assertTrue("and it names the setting: " + message, message.contains(MAX_FUSION_LEG_SEARCHES.getKey()));
     }
 
     /**
@@ -236,6 +301,14 @@ public class HybridQueryFusedQueryPositionIT extends BaseNeuralSearchIT {
         return "{\"hybrid\":{\"queries\":[" + leg() + "," + leg() + "]}}";
     }
 
+    /**
+     * {@code boosting} hands its inner query to a query-tree visitor without recursing into it, so a walk that trusts core's
+     * traversal stops one level below it. The negative clause never matches, so scores are the positive clause's.
+     */
+    private String boosted(String inner) {
+        return "{\"boosting\":{\"positive\":" + inner + ",\"negative\":{\"match_none\":{}},\"negative_boost\":0.5}}";
+    }
+
     /** {@code wrapper} carries its inner query as base64 bytes, so {@code visit} cannot see through it. */
     private String wrapped(String inner) {
         return "{\"wrapper\":{\"query\":\"" + Base64.getEncoder().encodeToString(inner.getBytes(StandardCharsets.UTF_8)) + "\"}}";
@@ -298,7 +371,9 @@ public class HybridQueryFusedQueryPositionIT extends BaseNeuralSearchIT {
             + GRP_FIELD
             + "\":{\"type\":\"keyword\"},\""
             + SCORE_FIELD
-            + "\":{\"type\":\"integer\"}}}}";
+            + "\":{\"type\":\"integer\"},\""
+            + NESTED_FIELD
+            + "\":{\"type\":\"nested\",\"properties\":{\"k\":{\"type\":\"keyword\"}}}}}}";
     }
 
     @SneakyThrows

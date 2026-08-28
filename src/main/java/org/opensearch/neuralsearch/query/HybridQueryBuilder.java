@@ -7,7 +7,9 @@ package org.opensearch.neuralsearch.query;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Locale;
@@ -669,7 +671,8 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     }
 
     /**
-     * Reject a fused {@code hybrid} that is not part of the request's own {@code query}.
+     * Reject a fused {@code hybrid} that is not part of the request's own {@code query}, or that is written inside it but
+     * cannot be found in it.
      *
      * <p>Core rewrites six independent positions of a search body against the same coordinator context — {@code query},
      * {@code post_filter}, aggregations, sorts, {@code rescore} and {@code highlight} — so this method is reached for a
@@ -687,13 +690,26 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      *
      * <p>Reachability is established by walking the request's query with {@link QueryBuilder#visit}, matching this exact
      * builder, which keeps every legitimate shape: a fused hybrid nested in a {@code bool}, and a fused leg of an enclosing
-     * fused hybrid (its leg sub-search carries it as that request's query). A {@code wrapper} query holds its inner query
-     * as bytes and exposes no children, so a fused hybrid inside one is not reachable and is refused: the alternative —
-     * treating "not found" as "assume it is in the query" — would readmit the unbounded case through
-     * {@code {"query": {"wrapper": ...}, "post_filter": {"hybrid": ...}}}.
+     * fused hybrid (its leg sub-search carries it as that request's query). Treating "not found" as "assume it is in the
+     * query" is what cannot be done — that readmits the unbounded case through
+     * {@code {"query": {"wrapper": ...}, "post_filter": {"hybrid": ...}}}, whose {@code post_filter} hybrid is equally
+     * invisible.
      *
-     * <p>No shape that fusion can answer is lost. Inside the request's {@code query} this is looser than what classic mode
-     * enforces shard-side ({@code hybrid query must be a top level query and cannot be wrapped into other queries} —
+     * <p>So a fused hybrid the walk cannot see is refused even when it is written inside the {@code query}, and what hides
+     * one is a builder that carries a whole query without ever exposing it as a child: a {@code wrapper} query carries its
+     * inner query as bytes, and a {@code template} query carries it as an unparsed map that it turns into a builder in a
+     * later rewrite round — at which point this request's {@code source()} still holds the {@code template}, because core
+     * installs the rewritten source only after the whole rewrite loop has finished. Neither overrides
+     * {@link QueryBuilder#visit}, which is the general form of the cause. Container depth is not one of the causes:
+     * {@link IdentityFinder} descends the tree itself, so a builder that hands its inner query to {@code accept} without
+     * recursing into it — {@code boosting}, {@code script_score} — hides nothing below itself. That set is exactly the set
+     * this refusal has to cover, because {@link #countFusedLegSearches} is the same traversal: what is invisible here is
+     * counted as zero legs there, which is the condition being guarded against. Refusing is therefore consistent rather
+     * than conservative — the shapes given up are the ones whose fan-out cannot be bounded, and each has the same body
+     * written without that carrier as its remedy.
+     *
+     * <p>Inside the request's {@code query} this stays looser than what classic mode enforces shard-side
+     * ({@code hybrid query must be a top level query and cannot be wrapped into other queries} —
      * {@code org.opensearch.neuralsearch.util.HybridQueryUtil}, which admits only the top level and the first clause of a
      * {@code bool} the engine itself added). In the other positions classic mode does not run its own query phase either:
      * a {@code hybrid} used to filter or to highlight is matched as the disjunction of its clauses, which is the
@@ -706,18 +722,26 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         throw new IllegalArgumentException(
             String.format(
                 Locale.ROOT,
-                "[%s] query [%s] must be part of the request's [query], not [post_filter], an aggregation filter, a sort, "
-                    + "[rescore], a highlight query, or a [wrapper] whose contents cannot be inspected. "
-                    + "Use a [bool] query with the same clauses as [should] instead",
+                "[%s] query [%s] must be part of the request's [query] and reachable within it, so that the leg "
+                    + "sub-searches it fans out can be counted. It is not: either it is in another position of the body "
+                    + "— [post_filter], an aggregation filter, a sort, [rescore] or a highlight query, none of which is "
+                    + "counted — in which case use a [bool] query with the same clauses as [should] there instead, which "
+                    + "matches what this [%s] matches but scores that disjunction rather than a fused combination; or it "
+                    + "is inside a query that carries its inner query without exposing it ([wrapper] carries it as bytes, "
+                    + "[template] as a map it parses in a later rewrite round), in which case write the [%s] directly "
+                    + "rather than through that query",
                 NAME,
-                FUSION_FIELD.getPreferredName()
+                FUSION_FIELD.getPreferredName(),
+                NAME,
+                NAME
             )
         );
     }
 
     /**
      * Whether this builder is the given query or one of its descendants, by identity — the tree is walked with
-     * {@link QueryBuilder#visit}, and the visitor hands itself back as the child visitor so every depth is searched.
+     * {@link QueryBuilder#visit}, and the visitor hands itself back as the child visitor and descends into every builder it
+     * is handed, so every depth is searched whether or not the builder above it recurses.
      */
     private boolean isReachableFrom(final QueryBuilder query) {
         if (Objects.isNull(query)) {
@@ -730,9 +754,28 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
 
     /**
      * Looks for one exact query builder instance in a query tree.
+     *
+     * <p>The descent is this visitor's own: {@code accept} calls {@link QueryBuilder#visit} on whatever it is handed,
+     * keyed by identity so a builder is entered once however many ways the walk arrives at it. Core's implementations do
+     * not agree on descending. Five recurse — {@code bool}, {@code dis_max}, {@code constant_score}, {@code nested} and
+     * {@code function_score} call {@code child.visit(subVisitor)} — while {@code boosting}, {@code script_score} and the
+     * {@code span_*} builders hand their inner query to {@code accept} and stop there, and the builders that do not
+     * override {@code visit} expose nothing at all. Trusting them truncates the walk one level below the second group,
+     * which {@link #validateFusedLegSearchBudget} reads as an absence of legs rather than as an unknown: a chain of fused
+     * hybrids each written one level under a {@code boosting} counted {@code 2 x width} leg sub-searches at every depth,
+     * was admitted on that number, and then served {@code width} per level — because each leg sub-search re-roots
+     * this same walk at its own leg, where the next level is the root and trivially reachable. The ceiling held per
+     * nesting level instead of per request, which is the evasion it exists to prevent.
+     *
+     * <p>The walk is not cut short once the target is found, deliberately: {@link QueryBuilderVisitor} has no
+     * early-termination signal, and every implementation that descends at all does so unconditionally, so even handing
+     * back {@link QueryBuilderVisitor#NO_OP_VISITOR} would keep descending — only the comparison would stop, and that
+     * already short-circuits. Stopping the traversal itself would mean throwing out of {@code accept} for control flow, for
+     * a walk that is linear in a request body the user had to spell out and runs once per fused hybrid at rewrite round 1.
      */
     private static final class IdentityFinder implements QueryBuilderVisitor {
         private final QueryBuilder target;
+        private final Set<QueryBuilder> entered = Collections.newSetFromMap(new IdentityHashMap<>());
         private boolean found;
 
         private IdentityFinder(final QueryBuilder target) {
@@ -741,7 +784,11 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
 
         @Override
         public void accept(final QueryBuilder queryBuilder) {
+            if (entered.add(queryBuilder) == false) {
+                return;
+            }
             found = found || queryBuilder == target;
+            queryBuilder.visit(this);
         }
 
         @Override
@@ -767,11 +814,13 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      *
      * <p>Counted from the request's own query, not from this builder, so every fused hybrid in a request agrees on one
      * number: sibling hybrids in a {@code bool} each pay for the others, which is the point — the request is what fans
-     * out. Nesting is walked through {@link QueryBuilder#visit}. That one number can be read off the request's query alone
-     * is what {@link #requireFusedQueryIsPartOfRequestQuery} makes true: a fused hybrid this walk cannot see — in another
-     * rewritten position of the body, or hidden inside a {@code wrapper} query, which carries its inner query as bytes —
-     * has already been refused, so the count is exact rather than a lower bound. That leaves total cost linear in the size
-     * of the body the user had to spell out, which is the property this guard exists to keep.
+     * out. Nesting is walked through {@link QueryBuilder#visit}, descended by {@link LegSearchCounter} itself so that a
+     * builder which exposes a child without recursing into it cannot truncate the count one level below itself. That one
+     * number can be read off the request's query alone is what {@link #requireFusedQueryIsPartOfRequestQuery} makes true:
+     * it refuses every fused hybrid this same walk cannot see — in another rewritten position of the body, or inside a
+     * query that carries its inner query without exposing it — so the count is exact rather than a lower bound, and each
+     * leg sub-search's own count of its own leg is a part of it rather than a fresh budget. That leaves total cost linear
+     * in the size of the body the user had to spell out, which is the property this guard exists to keep.
      */
     private static void validateFusedLegSearchBudget(final SearchRequest searchRequest) {
         if (Objects.isNull(searchRequest.source())) {
@@ -827,17 +876,24 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
 
     /**
      * Counts the legs of every fused hybrid it is shown. One instance walks the whole tree — it hands itself back as the
-     * child visitor, and {@link #visit} recurses into the legs — so a nested fused hybrid is counted at every depth the
-     * builders expose.
+     * child visitor and descends into each builder it is handed, so a nested fused hybrid is counted at every depth,
+     * including under a builder that exposes a child without recursing into it. Keyed by identity, so a builder is counted
+     * once however many ways the walk reaches it; a body parsed from a request has a distinct builder per clause, which is
+     * what makes that the same thing as counting what the user wrote.
      */
     private static final class LegSearchCounter implements QueryBuilderVisitor {
+        private final Set<QueryBuilder> entered = Collections.newSetFromMap(new IdentityHashMap<>());
         private int legSearches;
 
         @Override
         public void accept(final QueryBuilder queryBuilder) {
+            if (entered.add(queryBuilder) == false) {
+                return;
+            }
             if (queryBuilder instanceof HybridQueryBuilder && Objects.nonNull(((HybridQueryBuilder) queryBuilder).fusion())) {
                 legSearches += ((HybridQueryBuilder) queryBuilder).queries().size();
             }
+            queryBuilder.visit(this);
         }
 
         @Override

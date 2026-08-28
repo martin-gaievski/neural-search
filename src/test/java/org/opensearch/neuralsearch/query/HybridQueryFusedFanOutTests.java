@@ -24,6 +24,7 @@ import java.util.function.BiConsumer;
 import java.util.function.Function;
 
 import org.apache.lucene.search.TotalHits;
+import org.apache.lucene.search.join.ScoreMode;
 import org.opensearch.Version;
 import org.opensearch.action.OriginalIndices;
 import org.opensearch.action.search.MultiSearchRequest;
@@ -50,13 +51,17 @@ import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.QueryCoordinatorContext;
 import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.query.Rewriteable;
+import org.opensearch.index.query.TemplateQueryBuilder;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.SearchShardTarget;
 import org.opensearch.search.aggregations.AggregationBuilders;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.fetch.subphase.highlight.HighlightBuilder;
+import org.opensearch.script.Script;
 import org.opensearch.search.rescore.QueryRescorerBuilder;
+import org.opensearch.search.sort.NestedSortBuilder;
+import org.opensearch.search.sort.SortBuilders;
 import org.opensearch.search.pipeline.SearchPipelineMetadata;
 import org.opensearch.transport.client.Client;
 import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
@@ -87,6 +92,8 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
 
     private static final String TEXT_FIELD_NAME = "field";
     private static final String INDEX_NAME = "test-index";
+    /** A nested path, for the two shapes that need one: a sort's nested filter, and a [nested] query. */
+    private static final String NESTED_PATH = "nested";
 
     /** The cluster service the current {@link #initClusterUtil} call installed, so a test can swap only the resolver. */
     private ClusterService clusterService;
@@ -331,6 +338,12 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
                 new HighlightBuilder().field(new HighlightBuilder.Field(TEXT_FIELD_NAME).highlightQuery(hybrid))
             )
         );
+        positions.put(
+            "sort",
+            hybrid -> requestQuery().sort(
+                SortBuilders.fieldSort(TEXT_FIELD_NAME).setNestedSort(new NestedSortBuilder(NESTED_PATH).setFilter(hybrid))
+            )
+        );
 
         for (Map.Entry<String, Function<HybridQueryBuilder, SearchSourceBuilder>> position : positions.entrySet()) {
             SearchSourceBuilder source = position.getValue().apply(nestedChain(1));
@@ -344,6 +357,27 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
             assertThat(position.getKey() + ": the message names the way out", error.getMessage(), containsString("[bool]"));
             assertTrue(position.getKey() + ": refused before the fan-out it would have created", registered.isEmpty());
         }
+    }
+
+    /**
+     * The one shape where "nothing was dispatched" does not follow from the refusal alone: a legitimate fused hybrid in the
+     * {@code query} and another in {@code post_filter}. Core rewrites the {@code query} first
+     * ({@code SearchSourceBuilder#rewrite}), so the legitimate one registers its fan-out before the refusal fires — which is
+     * safe only because registering is not dispatching: {@link org.opensearch.index.query.Rewriteable#rewriteAndFetch} runs a
+     * round's registered actions after that round's {@code rewrite} returns, so a throw inside the round discards them. That
+     * round is what this pins. A refusal deferred to a later round would let the first round complete and dispatch.
+     */
+    @SneakyThrows
+    public void testFusedHybridInTheQueryAndInPostFilter_isRefusedInTheSameRoundThatRegistered() {
+        SearchSourceBuilder source = new SearchSourceBuilder().query(nestedChain(1)).postFilter(nestedChain(1));
+        SearchRequest searchRequest = new SearchRequest(INDEX_NAME).source(source);
+        List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+        QueryCoordinatorContext coordinatorContext = coordinatorContext(searchRequest, registered);
+
+        IllegalArgumentException error = expectThrows(IllegalArgumentException.class, () -> source.rewrite(coordinatorContext));
+
+        assertThat(error.getMessage(), containsString("must be part of the request's [query]"));
+        assertEquals("the query's own fan-out was registered in the round that then threw", 1, registered.size());
     }
 
     /**
@@ -400,6 +434,165 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
 
         assertEquals("a fused hybrid nested in a bool still fans out", 1, fanOut.multiSearches());
         assertEquals(List.of(2), fanOut.legCountPerMultiSearch());
+    }
+
+    /**
+     * "At any depth a query builder exposes" would be the whole qualification if the walk trusted the builders, and core's
+     * do not agree: {@code boosting} and {@code script_score} hand their inner query to {@code accept} without recursing
+     * into it, so a walk that only followed {@code visit} would see one level under either and nothing below. Both of this
+     * guard's walks descend on their own instead, so those levels are counted and admitted like any other — and they have
+     * to be, because the same walk is the budget counter: a level it cannot see is a level whose legs are free.
+     * {@code nested}, which does recurse, is the contrast that the descent does not double-count what a builder already
+     * walked.
+     */
+    @SneakyThrows
+    public void testFusedHybridUnderAQueryThatDoesNotRecurse_isCountedAndAdmittedAtEveryDepth() {
+        Map<String, Function<QueryBuilder, QueryBuilder>> containers = new LinkedHashMap<>();
+        containers.put("boosting", inner -> QueryBuilders.boostingQuery(inner, QueryBuilders.matchAllQuery()).negativeBoost(0.5f));
+        containers.put("script_score", inner -> QueryBuilders.scriptScoreQuery(inner, new Script("_score")));
+
+        for (Map.Entry<String, Function<QueryBuilder, QueryBuilder>> container : containers.entrySet()) {
+            assertEquals(
+                container.getKey() + " exposes its immediate inner query",
+                2,
+                HybridQueryBuilder.countFusedLegSearches(container.getValue().apply(nestedChain(1)))
+            );
+            assertEquals(
+                container.getKey() + " exposes nothing under that, and the walk descends for it",
+                2,
+                HybridQueryBuilder.countFusedLegSearches(container.getValue().apply(QueryBuilders.boolQuery().should(nestedChain(1))))
+            );
+            assertEquals(
+                container.getKey() + ": and keeps descending, however deep the body nests below it",
+                6,
+                HybridQueryBuilder.countFusedLegSearches(container.getValue().apply(QueryBuilders.boolQuery().should(nestedChain(3))))
+            );
+
+            for (int depth = 1; depth <= 2; depth++) {
+                QueryBuilder body = depth == 1
+                    ? container.getValue().apply(nestedChain(1))
+                    : container.getValue().apply(QueryBuilders.boolQuery().should(nestedChain(1)));
+
+                FanOut fanOut = drive(request(body));
+
+                assertEquals(container.getKey() + " at depth " + depth + ": admitted, and fans out once", 1, fanOut.multiSearches());
+                assertEquals(container.getKey() + " at depth " + depth, List.of(2), fanOut.legCountPerMultiSearch());
+                assertEquals(
+                    container.getKey() + " at depth " + depth + ": and survives the rewrite as the enclosing query",
+                    container.getKey(),
+                    fanOut.finalQuery().getName()
+                );
+            }
+        }
+
+        assertEquals(
+            "boosting exposes its negative clause too, so a fused hybrid written there is counted as well",
+            4,
+            HybridQueryBuilder.countFusedLegSearches(QueryBuilders.boostingQuery(nestedChain(1), nestedChain(1)).negativeBoost(0.5f))
+        );
+
+        assertEquals(
+            "nested recurses on its own, and the descent does not count what it already walked twice",
+            2,
+            HybridQueryBuilder.countFusedLegSearches(
+                QueryBuilders.nestedQuery(NESTED_PATH, QueryBuilders.boolQuery().should(nestedChain(1)), ScoreMode.Avg)
+            )
+        );
+    }
+
+    /**
+     * The ceiling counts the request, so it has to see the whole request. A builder that exposes a child without recursing
+     * into it truncates a {@code visit} walk one level below itself, and the budget reads that as an absence of legs rather
+     * than as an unknown — while every leg sub-search re-roots the same walk at its own leg, where the next level is the
+     * root and trivially reachable. So a chain of fused hybrids each written one level under a {@code boosting} was
+     * admitted at a count of {@code 2 x width} whatever its depth and then served {@code width} leg sub-searches per level:
+     * the ceiling held per nesting level instead of per request, which is the evasion this guard exists to prevent.
+     * Pinned against the same chain written without the wrappers, which must count and be refused identically.
+     */
+    @SneakyThrows
+    public void testFusedHybridChainUnderQueriesThatDoNotRecurse_isCappedLikeThePlainChain() {
+        int width = HybridQueryBuilder.MAX_NUMBER_OF_SUB_QUERIES;
+        for (int depth = 1; depth <= 6; depth++) {
+            int declared = depth * width;
+            assertEquals(
+                "the plain chain declares one level's legs per level",
+                declared,
+                HybridQueryBuilder.countFusedLegSearches(nestedChain(depth, width))
+            );
+            assertEquals(
+                "and wrapping every level in a query that does not recurse cannot change that number",
+                declared,
+                HybridQueryBuilder.countFusedLegSearches(boostingChain(depth, width))
+            );
+        }
+
+        HybridQueryBuilder overBudget = boostingChain(DEFAULT_MAX_FUSION_LEG_SEARCHES / width + 1, width);
+        List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+        IllegalArgumentException error = expectThrows(
+            IllegalArgumentException.class,
+            () -> overBudget.rewrite(coordinatorContext(request(overBudget), registered))
+        );
+        assertThat(error.getMessage(), containsString("declares " + (DEFAULT_MAX_FUSION_LEG_SEARCHES + width) + " leg sub-searches"));
+        assertTrue("refused before the first level was dispatched", registered.isEmpty());
+
+        FanOut atTheCeiling = drive(request(boostingChain(DEFAULT_MAX_FUSION_LEG_SEARCHES / width, width)));
+        assertEquals("the deepest chain the ceiling admits still fans out once from this coordinator", 1, atTheCeiling.multiSearches());
+        assertEquals(List.of(width), atTheCeiling.legCountPerMultiSearch());
+    }
+
+    /**
+     * The same evasion in the shape that made it worth a guard rather than a note: every leg of every level wrapped, so the
+     * body's fan-out grows as {@code width + width² + … + width^depth} while a truncated count stayed at
+     * {@code width + width²} — four levels of four legs read 20 and served 340. Counted in full now, so the ceiling refuses
+     * it at the depth it stops being affordable.
+     */
+    @SneakyThrows
+    public void testBranchingFusedHybridsUnderQueriesThatDoNotRecurse_areCountedInFull() {
+        assertEquals(4, HybridQueryBuilder.countFusedLegSearches(branchingChain(1, 4)));
+        assertEquals(20, HybridQueryBuilder.countFusedLegSearches(branchingChain(2, 4)));
+        assertEquals("the depth that read 20 and served 84", 84, HybridQueryBuilder.countFusedLegSearches(branchingChain(3, 4)));
+        assertEquals("and the one that read 20 and served 340", 340, HybridQueryBuilder.countFusedLegSearches(branchingChain(4, 4)));
+
+        HybridQueryBuilder branching = branchingChain(3, 4);
+        List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+        IllegalArgumentException error = expectThrows(
+            IllegalArgumentException.class,
+            () -> branching.rewrite(coordinatorContext(request(branching), registered))
+        );
+        assertThat(error.getMessage(), containsString("declares 84 leg sub-searches"));
+        assertTrue("refused before any of it was dispatched", registered.isEmpty());
+    }
+
+    /**
+     * A {@code template} query is the other builder that carries a whole query without exposing it: it holds an unparsed
+     * map, and unlike {@code wrapper} it returns the builder it parses <i>without</i> rewriting it, so a fused hybrid
+     * inside one reaches this guard a rewrite round later. The request's {@code source()} still holds the {@code template}
+     * then — core installs the rewritten source only once the whole loop has finished — so the hybrid is unreachable, and
+     * uncounted for the same reason, which is what makes refusing it the fail-closed answer rather than a lost shape.
+     */
+    @SneakyThrows
+    public void testFusedHybridInsideATemplateQuery_isRefusedAndWasNeverCounted() {
+        TemplateQueryBuilder template = new TemplateQueryBuilder(
+            Map.of("hybrid", Map.of("queries", List.of(Map.of("match_all", Map.of())), "fusion", fusionConfig()))
+        );
+        assertEquals(
+            "a template carries its inner query as a map, which no walk can count",
+            0,
+            HybridQueryBuilder.countFusedLegSearches(template)
+        );
+
+        HybridQueryBuilder parsedOutOfTheTemplate = nestedChain(1);
+        List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+        QueryCoordinatorContext coordinatorContext = coordinatorContext(request(template), registered);
+
+        IllegalArgumentException error = expectThrows(
+            IllegalArgumentException.class,
+            () -> parsedOutOfTheTemplate.rewrite(coordinatorContext)
+        );
+
+        assertThat(error.getMessage(), containsString("must be part of the request's [query]"));
+        assertThat("the message names the carriers that can hide it", error.getMessage(), containsString("[template]"));
+        assertTrue("refused before any fan-out", registered.isEmpty());
     }
 
     /**
@@ -558,6 +751,42 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
             query = fused(legs.toArray(new QueryBuilder[0]));
         }
         return query;
+    }
+
+    /**
+     * The same chain as {@link #nestedChain(int, int)}, with every level but the outermost written one level under a
+     * {@code boosting} query: a builder that hands its inner query to {@code accept} without recursing into it. The body
+     * declares exactly what the plain chain declares — {@code depth × width} leg sub-searches.
+     */
+    private HybridQueryBuilder boostingChain(final int depth, final int width) {
+        HybridQueryBuilder query = null;
+        for (int level = 0; level < depth; level++) {
+            List<QueryBuilder> legs = new ArrayList<>();
+            legs.add(
+                query == null
+                    ? new MatchQueryBuilder(TEXT_FIELD_NAME, "hello")
+                    : QueryBuilders.boostingQuery(query, QueryBuilders.matchAllQuery()).negativeBoost(0.5f)
+            );
+            for (int leg = 1; leg < width; leg++) {
+                legs.add(QueryBuilders.termQuery(TEXT_FIELD_NAME, "kw" + leg));
+            }
+            query = fused(legs.toArray(new QueryBuilder[0]));
+        }
+        return query;
+    }
+
+    /** The branching form of {@link #boostingChain}: every leg of every level carries the level below, so the body
+     * declares {@code width + width² + … + width^depth} leg sub-searches. */
+    private HybridQueryBuilder branchingChain(final int depth, final int width) {
+        List<QueryBuilder> legs = new ArrayList<>();
+        for (int leg = 0; leg < width; leg++) {
+            legs.add(
+                depth <= 1
+                    ? QueryBuilders.termQuery(TEXT_FIELD_NAME, "kw" + leg)
+                    : QueryBuilders.boostingQuery(branchingChain(depth - 1, width), QueryBuilders.matchAllQuery()).negativeBoost(0.5f)
+            );
+        }
+        return fused(legs.toArray(new QueryBuilder[0]));
     }
 
     private HybridQueryBuilder fused(final QueryBuilder... legs) {
