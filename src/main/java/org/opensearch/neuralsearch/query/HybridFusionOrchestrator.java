@@ -4,6 +4,7 @@
  */
 package org.opensearch.neuralsearch.query;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -20,6 +21,10 @@ import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.common.logging.HeaderWarning;
+import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.core.xcontent.ToXContent;
+import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.query.AbstractQueryBuilder;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.InnerHitContextBuilder;
@@ -54,6 +59,8 @@ final class HybridFusionOrchestrator {
     private static final ScoreCombinationFactory SCORE_COMBINATION_FACTORY = new ScoreCombinationFactory();
     /** Separator for the composite _index+_id fusion key. Never parsed back — see computeRankedDocs. */
     private static final String KEY_SEPARATOR = "#";
+    /** The {@code _name} key as it appears in a rendered query — see {@link #anyLegNamed}. */
+    private static final String QUERY_NAME_KEY = String.format(Locale.ROOT, "\"%s\":", AbstractQueryBuilder.NAME_FIELD.getPreferredName());
 
     /**
      * Build the leg MultiSearch: one standalone search per sub-query, each reduced to the global top-{@code windowSize}.
@@ -109,9 +116,18 @@ final class HybridFusionOrchestrator {
         if (ranked.ids().length == 0) {
             return new MatchNoneQueryBuilder();
         }
-        List<QueryBuilder> tail = needsTail(source, ranked.ids().length) ? legQueriesForTail(legs, legHits) : List.of();
+        boolean tailNeeded = needsTail(source, ranked.ids().length);
+        // The two leg lists are alternatives, never both populated: an executed Tail converts every leg on the shard and so
+        // registers the names itself, and only when it is absent does anything have to be carried for registration alone.
         // inner_hits are registered from the legs themselves, independent of whether the Tail executes them.
-        return new HybridFusionQueryBuilder(ranked.ids(), ranked.indices(), ranked.scores(), tail, innerHitsLegs(legs));
+        return new HybridFusionQueryBuilder(
+            ranked.ids(),
+            ranked.indices(),
+            ranked.scores(),
+            tailNeeded ? legQueriesForTail(legs, legHits) : List.of(),
+            innerHitsLegs(legs),
+            tailNeeded ? List.of() : namedLegsForRegistration(legs, legHits)
+        );
     }
 
     /**
@@ -350,10 +366,74 @@ final class HybridFusionOrchestrator {
     private static List<QueryBuilder> legQueriesForTail(List<QueryBuilder> legs, SearchHit[][] legHits) {
         List<QueryBuilder> tail = new ArrayList<>(legs.size());
         for (int legIndex = 0; legIndex < legs.size(); legIndex++) {
-            QueryBuilder leg = legs.get(legIndex);
-            tail.add(isMaterializableLeg(leg) ? materializedLeg(legHits[legIndex]) : leg);
+            tail.add(legInTailForm(legs.get(legIndex), legHits[legIndex]));
         }
         return tail;
+    }
+
+    /** One leg in its Tail form: itself, or — for a kNN/neural leg — a direct address of the hits it already returned. */
+    private static QueryBuilder legInTailForm(QueryBuilder leg, SearchHit[] hits) {
+        if (isMaterializableLeg(leg) == false) {
+            return leg;
+        }
+        // A materialized leg answers to its own _name: matched_queries is reported from the names registered while
+        // this query is converted, and the substitute is a fresh builder that would otherwise carry none — so a named
+        // kNN/neural leg would silently lose the field even with the Tail present. What it then reports is the
+        // documents the leg returned, which is the same bound materialization already accepts for the match set.
+        // Under include_named_queries_score the reported value is the substitute's score rather than the ANN
+        // similarity: the shard never sees the vector query, and re-running it for a reporting field is exactly the
+        // graph walk materialization exists to avoid. For the same reason only the leg's own name is inherited — a
+        // _name nested inside the leg (on a knn filter, say) has no clause left here to be registered against.
+        return materializedLeg(hits).queryName(leg.queryName());
+    }
+
+    /**
+     * The legs a Top-only query carries so their {@code _name}s are registered on the shard. A leg's {@code _name} only
+     * reaches {@code matched_queries} if its builder is converted there, and the Tail is the only thing that converts legs
+     * — so when the Tail is absent the named legs are carried in their Tail form for registration alone. The fetch phase
+     * re-evaluates every named query from its own weight, so nothing has to execute for one to be reported.
+     *
+     * <p>Only legs that carry a name are carried. An unnamed leg has nothing to register, and carrying it would cost a
+     * shard-side {@code toQuery} conversion — compiling a query a Top-only request would otherwise never compile — for no
+     * reporting benefit.
+     */
+    private static List<QueryBuilder> namedLegsForRegistration(List<QueryBuilder> legs, SearchHit[][] legHits) {
+        List<QueryBuilder> namedLegs = new ArrayList<>();
+        for (int legIndex = 0; legIndex < legs.size(); legIndex++) {
+            QueryBuilder leg = legs.get(legIndex);
+            if (carriesQueryName(leg)) {
+                namedLegs.add(legInTailForm(leg, legHits[legIndex]));
+            }
+        }
+        return namedLegs;
+    }
+
+    /**
+     * Whether a leg carries a query name, at any depth.
+     *
+     * <p><b>Deliberately over-inclusive.</b> There is no exact generic descent available: of all the core query builders
+     * only {@code bool} overrides {@code visit(QueryBuilderVisitor)}, so a visitor walk (like a shallow
+     * {@code queryName() != null} check) is blind to a {@code _name} under {@code nested}, {@code function_score},
+     * {@code dis_max}, {@code constant_score} or a {@code knn} filter. The rendered form is checked instead, where
+     * {@link AbstractQueryBuilder#printBoostAndQueryName} puts {@code _name} whenever one is set. A false positive — a leg
+     * querying a field literally called {@code _name} — costs one carried leg whose registration nobody reads; a false
+     * negative would silently drop the field, which is the defect being fixed.
+     */
+    private static boolean carriesQueryName(QueryBuilder leg) {
+        return Objects.nonNull(leg.queryName()) || rendersQueryName(leg);
+    }
+
+    private static boolean rendersQueryName(QueryBuilder leg) {
+        // toXContent opens and closes the query's own object, so the builder is used at its root position: wrapping it in
+        // another object makes every render fail, and this method's fail-open would then carry every leg unconditionally.
+        try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
+            leg.toXContent(builder, ToXContent.EMPTY_PARAMS);
+            return builder.toString().contains(QUERY_NAME_KEY);
+        } catch (IOException e) {
+            // A leg that cannot be rendered is one whose names cannot be ruled out. Carry it: an extra registration is
+            // cheap, and the alternative is exactly the silent loss this method exists to prevent.
+            return true;
+        }
     }
 
     /**
@@ -446,6 +526,11 @@ final class HybridFusionOrchestrator {
      *       carried separately (see {@link #innerHitsLegs}), which keeps a Top-only query cheap without losing them.
      *       This is unlike {@code collapse.inner_hits} above, which is not a fetch-phase expansion of the returned
      *       document at all but a whole extra search per group, and so does depend on what round 2 matches.</li>
+     *   <li>a leg carrying {@code _name} — {@code matched_queries} is built in the fetch phase from weights the phase
+     *       creates itself for each <i>registered</i> named query, so a named leg has to be converted, never executed.
+     *       Forcing the Tail would buy a reporting field with a full match-set execution across every shard. The leg
+     *       forms are carried for registration alone instead (see {@link #buildFusedQuery} and
+     *       {@code HybridFusionQueryBuilder#registerNamedOnlyQueries}), which keeps a Top-only query Top-only.</li>
      * </ul>
      */
     private static boolean needsTail(SearchSourceBuilder source, int numRankedDocs) {
