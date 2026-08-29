@@ -1003,4 +1003,137 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         assertEquals(HybridFusionOrchestrator.MIN_RANKED_SCORE, topClause(fused, 2).boost(), 0.0f);
         assertEquals(HybridFusionOrchestrator.MIN_RANKED_SCORE, topClause(fused, 3).boost(), 0.0f);
     }
+
+    /**
+     * Both branches of {@code scoreAboveTail}, called directly. Directly because neither is reachable through
+     * {@link HybridFusionOrchestrator#buildFusedQuery} in fused mode's current scope — which the control below measures
+     * rather than assumes. The guard stands over an invariant only a widened technique allowlist could break, and these two
+     * tests together are what would notice if one were widened.
+     *
+     * <p>Refused rather than floored, deliberately: flooring a {@code NaN} would collapse it onto {@code MIN_RANKED_SCORE}
+     * and hand the shard a window whose order the coordinator invented, where an {@code IllegalStateException} says plainly
+     * that fusion computed something it cannot rank. An ISE and not an IAE because no change to the request fixes it — see
+     * {@code HybridFusionQueryBuilder#requireUsableAsBoosts} for where that boundary is drawn.
+     *
+     * <p>{@code -0.0f} sits on the flooring side, not the refusing side, and that is the one place this deliberately
+     * disagrees with {@code requireUsableAsBoosts}, which rejects it. Asserted here so the two stay differently by
+     * intention rather than by accident.
+     */
+    public void testScoreAboveTail_refusesWhatItCannotRankAndFloorsTheRest() {
+        for (float unrankable : new float[] { Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY, -1.0f, -Float.MIN_VALUE }) {
+            IllegalStateException e = expectThrows(
+                IllegalStateException.class,
+                "expected a fused score of [" + unrankable + "] to be refused",
+                () -> HybridFusionOrchestrator.scoreAboveTail(unrankable)
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("a fused score must be finite and non-negative"));
+        }
+
+        assertEquals(
+            "exactly 0.0 is floored, which is what the method exists for",
+            HybridFusionOrchestrator.MIN_RANKED_SCORE,
+            HybridFusionOrchestrator.scoreAboveTail(0.0f),
+            0.0f
+        );
+        assertEquals(
+            "and so is -0.0f, because [-0.0f < 0.0f] is false — a negative zero is a zero here",
+            HybridFusionOrchestrator.MIN_RANKED_SCORE,
+            HybridFusionOrchestrator.scoreAboveTail(-0.0f),
+            0.0f
+        );
+        assertEquals(
+            "anything already above the floor passes through untouched",
+            0.25f,
+            HybridFusionOrchestrator.scoreAboveTail(0.25f),
+            0.0f
+        );
+    }
+
+    /**
+     * The control for the test above, and the reason it has to call the guard directly: a raw leg hit score of {@code NaN}
+     * or {@code +Infinity} — the only inputs that could carry a non-finite value into fusion at all — does not reach
+     * {@code scoreAboveTail}'s refusal. Measured here rather than assumed, because "the guard is unreachable" is a claim
+     * about two pieces of shared arithmetic and would rot silently.
+     *
+     * <p>The two are laundered differently, which is why each is asserted rather than looped over. {@code NaN} never
+     * reaches the combiner: {@code Floats.compare(NaN, NaN) == 0}, so a single-hit leg whose min, max and score are all
+     * {@code NaN} matches min_max's single-score edge case and normalizes to {@code 1.0} — the top of its own leg.
+     * {@code +Infinity} does make the normalizer emit {@code NaN}, since {@code (Inf - min) / (Inf - min)} is
+     * {@code Inf/Inf}, but arithmetic_mean's {@code score >= 0.0} participation rule is false for {@code NaN}, so that
+     * leg's slot leaves both numerator and denominator and the document fuses to exactly {@code 0.0} — floored, not
+     * refused. Fused mode admits no other combination technique, so there is no in-scope path from a non-finite leg score
+     * to a non-finite fused score.
+     *
+     * <p>That laundering is not something this path could fix — it is in the scalar math classic hybrid shares, and
+     * changing it would change classic's scores too. It is recorded here only because it is what makes the guard
+     * unreachable.
+     */
+    public void testBuildFusedQuery_whenALegHitScoreIsNonFinite_thenLaunderedByFusionRatherThanRefused() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+
+        MultiSearchResponse withNaN = multiSearch(legItem(Map.of("1", Float.NaN)), legItem(Map.of("2", 3.0f)));
+        QueryBuilder fusedNaN = HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), withNaN, legs, minMaxArithmetic(), 10);
+        assertEquals("both documents are ranked", 2, ((HybridFusionQueryBuilder) fusedNaN).buildSelfErasedQuery().should().size());
+        // Each doc matched one leg at a normalized 1.0 and contributed 0.0 to the other, so both fuse to 0.5 and tie —
+        // the NaN hit is ranked exactly as a legitimate best hit of its leg would be.
+        assertEquals("the NaN hit ranks as its leg's best", 0.5f, topClause(fusedNaN, 0).boost(), 0.0f);
+        assertEquals(0.5f, topClause(fusedNaN, 1).boost(), 0.0f);
+
+        MultiSearchResponse withInfinity = multiSearch(legItem(Map.of("1", Float.POSITIVE_INFINITY)), legItem(Map.of("2", 3.0f)));
+        QueryBuilder fusedInfinity = HybridFusionOrchestrator.buildFusedQuery(
+            new SearchSourceBuilder(),
+            withInfinity,
+            legs,
+            minMaxArithmetic(),
+            10
+        );
+        assertEquals(2, ((HybridFusionQueryBuilder) fusedInfinity).buildSelfErasedQuery().should().size());
+        assertAddressedTo(topClause(fusedInfinity, 0).innerQuery(), INDEX, "2");
+        assertEquals("the leg that scored finitely is unaffected", 0.5f, topClause(fusedInfinity, 0).boost(), 0.0f);
+        assertAddressedTo(topClause(fusedInfinity, 1).innerQuery(), INDEX, "1");
+        assertEquals(
+            "and the +Infinity hit fused to exactly 0.0, so it was floored above the Tail rather than refused",
+            HybridFusionOrchestrator.MIN_RANKED_SCORE,
+            topClause(fusedInfinity, 1).boost(),
+            0.0f
+        );
+    }
+
+    /**
+     * The one property of {@code MIN_RANKED_SCORE} that reads like a guarantee and is not: its lower bound is per
+     * multiplication and does not compose. Attenuation is applied a factor at a time — Lucene for an enclosing clause's
+     * {@code boost}, core's {@code QueryRescorer} once per rescorer in the chain — and each step rounds to float32, so the
+     * factors multiply. Every factor used below is individually far inside the bound that
+     * {@link #testMinRankedScore_survivesTheAttenuationAFusedScoreMeetsDownstream} asserts; chained, they annihilate the
+     * floor and restore the Tail tie it exists to break.
+     *
+     * <p>Pinned rather than fixed, and the constant's javadoc carries the reasoning: no float32 value survives arbitrary
+     * multiplication, raising this one only trades tolerance below for headroom above, and the attenuating values are legal
+     * core parameters. What this test protects is the honesty of the bound — change the constant and it reports the new one.
+     */
+    public void testMinRankedScore_attenuationBoundIsPerFactorAndDoesNotCompose() {
+        assertTrue("a single factor at the documented bound survives", HybridFusionOrchestrator.MIN_RANKED_SCORE * 7.0065e-16f > 0.0f);
+        assertEquals(
+            "and just below it the product rounds to zero rather than to the smallest subnormal",
+            0.0f,
+            HybridFusionOrchestrator.MIN_RANKED_SCORE * 7.006e-16f,
+            0.0f
+        );
+
+        // Three rescorers at query_weight 1e-6 — a factor twelve orders of magnitude inside the per-factor bound.
+        float chained = HybridFusionOrchestrator.MIN_RANKED_SCORE;
+        for (int rescorer = 0; rescorer < 3; rescorer++) {
+            assertTrue("each factor on its own leaves the floor positive", HybridFusionOrchestrator.MIN_RANKED_SCORE * 1e-6f > 0.0f);
+            chained = chained * 1e-6f;
+        }
+        assertEquals("but three of them in sequence annihilate it", 0.0f, chained, 0.0f);
+
+        // And the boundary for the mildest factor that still composes to zero, which is where the count matters.
+        float compounded = HybridFusionOrchestrator.MIN_RANKED_SCORE;
+        for (int rescorer = 0; rescorer < 5; rescorer++) {
+            compounded = compounded * 0.001f;
+        }
+        assertTrue("five rescorers at query_weight 0.001 still hold", compounded > 0.0f);
+        assertEquals("six do not", 0.0f, compounded * 0.001f, 0.0f);
+    }
 }

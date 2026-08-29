@@ -449,14 +449,65 @@ public class HybridFusionQueryBuilderTests extends OpenSearchTestCase {
         }
     }
 
+    // ---- the three per-document arrays must stay parallel ----
+
+    public void testArraysMustBeParallel() {
+        // One _index and one score per _id. Every consumer walks all three by a single index bounded by ids.length, so a
+        // short array is an ArrayIndexOutOfBoundsException raised inside query construction and reported per shard, with
+        // nothing in it naming the coordinator that built the mismatch.
+        IllegalArgumentException shortIndices = expectThrows(
+            IllegalArgumentException.class,
+            () -> new HybridFusionQueryBuilder(new String[] { "d1", "d2" }, new String[] { "idx" }, new float[] { 1.0f, 0.5f }, List.of())
+        );
+        assertTrue(shortIndices.getMessage(), shortIndices.getMessage().contains("arrays must be parallel"));
+        assertTrue(
+            "the message has to name the three lengths it saw, or it says nothing about which array is wrong",
+            shortIndices.getMessage().contains("[2] ids, [1] indices and [2] scores")
+        );
+
+        // The case the assert this replaced did not cover: scores was never length-checked, and a short scores array is
+        // the one whose truncation drops documents from the window rather than failing outright.
+        IllegalArgumentException shortScores = expectThrows(
+            IllegalArgumentException.class,
+            () -> new HybridFusionQueryBuilder(new String[] { "d1", "d2" }, new String[] { "idx", "idx" }, new float[] { 1.0f }, List.of())
+        );
+        assertTrue(shortScores.getMessage(), shortScores.getMessage().contains("[2] ids, [2] indices and [1] scores"));
+
+        expectThrows(
+            NullPointerException.class,
+            () -> new HybridFusionQueryBuilder(new String[] { "d1" }, new String[] { "idx" }, null, List.of())
+        );
+    }
+
+    public void testArraysAreRevalidatedOffTheWire() throws Exception {
+        // The wire constructor is the reason this is a real check rather than an assert, exactly as for the scores: the
+        // length relation is not something a peer can be trusted to have preserved, and asserts are absent on a production
+        // JVM. Reachability needs a peer running a modified build of this plugin — the query is never parsed from a
+        // request — which is why it is hardening rather than a fix.
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> readBackWithArrays(new String[] { "d1", "d2" }, new String[] { "idx", "idx" }, new float[] { 0.5f })
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("arrays must be parallel"));
+        assertNotNull(
+            "baseline: the same byte layout deserializes when the three arrays do agree",
+            readBackWithArrays(new String[] { "d1", "d2" }, new String[] { "idx", "idx" }, new float[] { 0.5f, 0.25f })
+        );
+    }
+
     /** Hand-writes this query's wire form with one chosen fused score — the only way to present a value the ctor refuses. */
     private HybridFusionQueryBuilder readBackWithScore(float score) throws Exception {
+        return readBackWithArrays(new String[] { "d1" }, new String[] { "idx" }, new float[] { score });
+    }
+
+    /** As {@link #readBackWithScore}, with all three arrays chosen — the only way to present lengths that disagree. */
+    private HybridFusionQueryBuilder readBackWithArrays(String[] ids, String[] indices, float[] scores) throws Exception {
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             out.writeFloat(AbstractQueryBuilder.DEFAULT_BOOST); // AbstractQueryBuilder#writeTo: boost, then queryName
             out.writeOptionalString(null);
-            out.writeStringArray(new String[] { "d1" });
-            out.writeStringArray(new String[] { "idx" });
-            out.writeFloatArray(new float[] { score });
+            out.writeStringArray(ids);
+            out.writeStringArray(indices);
+            out.writeFloatArray(scores);
             // tailQueries, innerHitsQueries, namedOnlyQueries — one per list in doWriteTo, in that order
             out.writeNamedWriteableList(List.of());
             out.writeNamedWriteableList(List.of());

@@ -39,6 +39,8 @@ import org.opensearch.neuralsearch.processor.combination.ScoreCombinationUtil;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.SearchSourceBuilder;
 
+import com.google.common.annotations.VisibleForTesting;
+
 import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
 
@@ -76,8 +78,9 @@ final class HybridFusionOrchestrator {
      * multiplies every window document's first-pass score by it, including the ones its query does not match), a
      * {@code score_mode: multiply} rescore. Float32 makes that a real constraint rather than a theoretical one —
      * {@link Float#MIN_VALUE} is subnormal, so <i>any</i> factor at or below {@code 0.5} rounds it to exactly {@code 0.0}
-     * and restores the very tie the floor exists to break. {@code 1e-30f} is normal and survives every factor down to
-     * roughly {@code 1.5e-15}. <b>From above</b>, it has to stay far below any fused score a real config produces, since
+     * and restores the very tie the floor exists to break. {@code 1e-30f} is normal, and measured, it survives every
+     * single factor down to {@code 7.0065e-16} — below that the product rounds to zero rather than to the smallest
+     * subnormal. <b>From above</b>, it has to stay far below any fused score a real config produces, since
      * scores at or below it are collapsed onto it: min_max and z_score floor a normalized score at {@code 0.001} and
      * arithmetic_mean divides by a weight sum of {@code 1.0}, so even a leg weighted {@code 1e-9} contributes about
      * {@code 1e-12} — twelve orders of magnitude above this. Reaching the collapse needs {@code l2} over a leg whose raw
@@ -87,6 +90,24 @@ final class HybridFusionOrchestrator {
      * of which it ranked at effectively no score, and all of which still outrank the Tail. That is the deliberate trade
      * against the alternative: leaving sub-floor scores alone would sort a document fusion scored {@code 1e-40} <i>below</i>
      * one it scored {@code 0.0}, which is an inversion rather than a tie.
+     *
+     * <p><b>The lower bound is per multiplication and does not compose</b> — worth stating plainly, because the shape of
+     * the guarantee is easy to over-read. Attenuation is applied by Lucene and by core's {@code QueryRescorer}, one factor
+     * at a time and each rounding to float32, so the factors <i>multiply</i>: measured, three rescorers at
+     * {@code query_weight: 1e-6} each, or six at {@code 0.001}, annihilate this floor even though every one of those
+     * factors is individually far inside the bound above. An enclosing clause's {@code boost} composes with them the same
+     * way. No value fixes this — a float32 floor can always be driven to zero by enough multiplication, and raising the
+     * constant only trades tolerance below for headroom above (at {@code 1e-20} the per-factor bound would improve to
+     * about {@code 7e-26}, but the collapse described above would start catching legal weights ten orders of magnitude
+     * less extreme). So this is a bound, not a promise, and it is deliberately not enforced: the attenuating values are
+     * legal core parameters, and refusing them to protect an internal floor would cost more than it buys.
+     *
+     * <p>What the residual exposure actually is, stated narrowly: only a document fusion scored <i>at or below</i> this
+     * floor can be annihilated, because everything else is orders of magnitude larger and attenuates to a value that is
+     * still positive. Reaching the floor at all takes a {@code weights} entry of {@code 0.0} or {@code l2} over a
+     * zero-norm leg (see {@link #scoreAboveTail}), so the exposure is the original Tail tie, confined to documents fusion
+     * ranked at effectively no score, and only under attenuation this extreme. Pinned by
+     * {@code HybridFusionOrchestratorTests#testMinRankedScore_attenuationBoundIsPerFactorAndDoesNotCompose}.
      */
     static final float MIN_RANKED_SCORE = 1e-30f;
 
@@ -414,13 +435,30 @@ final class HybridFusionOrchestrator {
      * combined score is a non-negative sum over a denominator of {@code 1.0}, never negative and never a division by zero.
      * They are refused rather than floored, and refused <i>before</i> the floor is applied, because flooring would be the
      * wrong response to them: it would quietly collapse every negative or {@code NaN} score onto one value and destroy
-     * whatever order they had, which is the opposite of what this method is for. {@code -0.0f} is not one of them — it is
-     * zero, and is floored like any other zero.
+     * whatever order they had, which is the opposite of what this method is for.
+     *
+     * <p>{@code -0.0f} is deliberately not one of them, and the {@code <} rather than a {@code Float.compare} is what makes
+     * that so: {@code -0.0f < 0.0f} is {@code false}, so a negative zero is a zero here and is floored like any other. That
+     * differs from {@link HybridFusionQueryBuilder#requireUsableAsBoosts}, which does use {@code Float.compare} and so
+     * <i>rejects</i> {@code -0.0f} — correctly, because a {@code -0.0f} boost is what core's own {@code checkNegativeBoost}
+     * refuses, and by the time the builder sees a score this method has already floored it, so the two can never disagree
+     * about a value that actually flows. Reachability makes the point moot in any case: all four combination techniques
+     * accumulate from {@code +0.0f} and {@code (+0.0f) + (-0.0f)} is {@code +0.0f}.
      *
      * <p>This floor is applied here, at fusion time, rather than when the Top clauses are built, so the builder's own
      * state, its {@code toXContent}/profile form and the {@code _score} the user is shown all agree on one number.
+     *
+     * <p>Package-private only so its refusal branch can be tested, because that branch is not reachable through
+     * {@link #buildFusedQuery} in fused mode's current scope — measured, not assumed. Feeding a leg hit a raw
+     * {@code NaN} does not get there: {@code min_max} launders it, since {@code Floats.compare(NaN, NaN) == 0} makes a
+     * single-hit leg look like the single-score edge case and return {@code 1.0}; and where a normalizer does emit
+     * {@code NaN} (a raw {@code +Infinity} against a finite min, whose ratio is {@code Inf/Inf}), arithmetic_mean's
+     * {@code score >= 0.0} participation rule drops that leg's slot rather than propagating it — and arithmetic_mean is
+     * the only combination fused mode admits. The guard therefore stands over an invariant nothing in scope can violate,
+     * which is what it is for; widening either allowlist could change that, and this test is what would notice.
      */
-    private static float scoreAboveTail(final float fusedScore) {
+    @VisibleForTesting
+    static float scoreAboveTail(final float fusedScore) {
         if (Float.isFinite(fusedScore) == false || fusedScore < 0.0f) {
             throw new IllegalStateException(
                 String.format(Locale.ROOT, "[hybrid] a fused score must be finite and non-negative but was %s", fusedScore)

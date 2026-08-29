@@ -131,8 +131,7 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         List<QueryBuilder> innerHitsQueries,
         List<QueryBuilder> namedOnlyQueries
     ) {
-        Objects.requireNonNull(indices, "indices is required: a fused document is addressed by its _index and _id together");
-        assert indices.length == ids.length : "indices must be parallel to ids";
+        requireParallel(ids, indices, scores);
         assert Arrays.stream(indices).noneMatch(Objects::isNull)
             : "indices must be fully populated — a null element NPEs in writeStringArray";
         this.ids = ids;
@@ -152,6 +151,42 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         List<QueryBuilder> innerHitsQueries
     ) {
         this(ids, indices, scores, tailQueries, innerHitsQueries, List.of());
+    }
+
+    /**
+     * The three per-document arrays describe one window between them — an {@code _id}, the {@code _index} that
+     * disambiguates it, and the score fusion gave it — so they have to stay parallel. Every consumer walks them by a
+     * single index bounded by {@code ids.length}: {@link #buildSelfErasedQuery} reads {@code scores[i]} and
+     * {@code indices[i]} per Top clause, and {@link #fusedWindowFilter} groups the same ids by the same indices. A short
+     * array is therefore an {@code ArrayIndexOutOfBoundsException} raised inside query construction and reported per
+     * shard, with nothing in it naming the coordinator that built the mismatch.
+     *
+     * <p>A real check in both constructors for the same reason {@link #requireUsableAsBoosts} is one: the wire
+     * constructor reads all three from a peer, and an {@code assert} is absent on a production JVM. It replaces an assert
+     * that compared {@code indices} against {@code ids} only — {@code scores} was never length-checked at all, and it is
+     * the array whose truncation silently drops documents from the window rather than failing.
+     *
+     * <p>{@code IllegalArgumentException} rather than an {@code IllegalStateException}: for the object constructor this
+     * is a caller contract, and for the wire one it is a peer's payload, which is the same class of fault the score check
+     * next door reports. Neither is a broken invariant of this object's own.
+     */
+    private static void requireParallel(final String[] ids, final String[] indices, final float[] scores) {
+        Objects.requireNonNull(ids, "ids is required: a fused window is a list of documents, empty at the least");
+        Objects.requireNonNull(indices, "indices is required: a fused document is addressed by its _index and _id together");
+        Objects.requireNonNull(scores, "scores is required: every ranked document carries the score fusion gave it");
+        if (ids.length != indices.length || ids.length != scores.length) {
+            throw new IllegalArgumentException(
+                String.format(
+                    Locale.ROOT,
+                    "[%s] the fused window's arrays must be parallel — one _index and one score per _id — but got [%d] "
+                        + "ids, [%d] indices and [%d] scores",
+                    NAME,
+                    ids.length,
+                    indices.length,
+                    scores.length
+                )
+            );
+        }
     }
 
     /**
@@ -196,9 +231,16 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
 
     public HybridFusionQueryBuilder(StreamInput in) throws IOException {
         super(in);
-        this.ids = in.readStringArray();
-        this.indices = in.readStringArray();
-        this.scores = requireUsableAsBoosts(in.readFloatArray());
+        // All three are read before either check runs: the lengths cannot be compared until every array is off the stream,
+        // and the read order is the wire format. A refusal here leaves the remaining lists unread, exactly as the score
+        // check below already does — the request fails either way, and no caller reuses the stream.
+        String[] wireIds = in.readStringArray();
+        String[] wireIndices = in.readStringArray();
+        float[] wireScores = in.readFloatArray();
+        requireParallel(wireIds, wireIndices, wireScores);
+        this.ids = wireIds;
+        this.indices = wireIndices;
+        this.scores = requireUsableAsBoosts(wireScores);
         this.tailQueries = in.readNamedWriteableList(QueryBuilder.class);
         this.innerHitsQueries = in.readNamedWriteableList(QueryBuilder.class);
         // No wire-version gate: this query is built only for a cluster whose every node supports fused mode (see

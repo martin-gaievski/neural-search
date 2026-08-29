@@ -52,15 +52,15 @@ import org.opensearch.search.rescore.RescorerBuilder;
  * <p><b>Why the window arrives late, and why that dictates this shape.</b> The window is not known until the leg
  * {@code MultiSearch} comes back, which is an async action — so the obvious implementation (fuse, then edit
  * {@code source.rescores()} from the callback) writes to the rescore list <i>after</i> core has already snapshotted it.
- * {@code SearchSourceBuilder#rewrite} rewrites the query at {@code :1187} and the rescorers at {@code :1199} in the same
- * pass, and {@code Rewriteable#rewrite(List, ...)} returns a <i>new</i> {@code ArrayList} the moment any element changed
+ * {@code SearchSourceBuilder#rewrite} rewrites the query <i>before</i> the rescorer list, both within its one pass, and
+ * {@code Rewriteable#rewrite(List, ...)} returns a <i>new</i> {@code ArrayList} the moment any element changed
  * identity — which {@code QueryRescorerBuilder#rewrite} does whenever the user's own rescore query rewrote
  * ({@code wrapper}, {@code neural}, {@code neural_sparse}, a {@code terms} lookup, ...). A callback-time edit then lands
  * on a list no longer connected to the request being dispatched, and confines nothing at all, silently.
  *
- * <p>So the wrapping happens in <b>round 1</b> of {@code HybridQueryBuilder#doRewriteFused} — inside that same
- * {@code :1187} query rewrite, therefore strictly before {@code :1199} snapshots the list — and what is installed as the
- * filter is a {@link WindowPlaceholder}, a query builder that resolves to the real window on a later rewrite pass. Since
+ * <p>So the wrapping happens in <b>round 1</b> of {@code HybridQueryBuilder#doRewriteFused} — inside that same query
+ * rewrite, therefore strictly before the rescorer list is snapshotted — and what is installed as the filter is a
+ * {@link WindowPlaceholder}, a query builder that resolves to the real window on a later rewrite pass. Since
  * the placeholder <i>object</i> travels inside whatever list core builds, list identity stops mattering: core carries it
  * into every {@code shallowCopy}, and the pass after the async action rewrites it into the window filter, in place, in
  * core's own copy.
@@ -94,7 +94,7 @@ final class FusedRescoreScope {
      * is known. Call this from round 1, before the leg fan-out is registered — see the class javadoc for why the timing is
      * the whole design.
      *
-     * @param source the request's source, mutated in place
+     * @param source the request's source, mutated in place — but only once the whole chain has been accepted
      * @return the scope to {@link #resolve} from the async callback, or {@code null} when the request has no rescore and
      *         there is nothing to confine
      */
@@ -104,9 +104,15 @@ final class FusedRescoreScope {
         }
         FusedRescoreScope scope = new FusedRescoreScope();
         List<RescorerBuilder> rescores = source.rescores();
-        for (int i = 0; i < rescores.size(); i++) {
-            // Every rescorer in the chain, not just the first: core applies them in sequence and each one can lift.
-            rescores.set(i, scope.confined(requireQueryRescorer(rescores.get(i))));
+        // Every rescorer in the chain, not just the first: core applies them in sequence and each one can lift.
+        List<QueryRescorerBuilder> confined = new ArrayList<>(rescores.size());
+        for (RescorerBuilder<?> declared : rescores) {
+            confined.add(scope.confined(requireQueryRescorer(declared)));
+        }
+        // Written back only once the whole chain has been accepted, so a refusal leaves the request's own rescore list as
+        // the user wrote it rather than half-replaced with placeholders that can never resolve.
+        for (int i = 0; i < confined.size(); i++) {
+            rescores.set(i, confined.get(i));
         }
         return scope;
     }
@@ -130,7 +136,7 @@ final class FusedRescoreScope {
      * Verify that the placeholders installed at round 1 are the ones core is rewriting — the check that makes an
      * unconfined rescore impossible rather than merely unlikely.
      *
-     * <p>Sound because of the order core works in: the rescore list is rewritten at {@code SearchSourceBuilder:1199} of
+     * <p>Sound because of the order core works in: {@code SearchSourceBuilder#rewrite} rewrites the rescore list during
      * the pass that started this hybrid's fan-out, which is <i>before</i> that pass tests
      * {@code QueryRewriteContext#hasAsyncActions}, and this runs on the pass after the async action. So by the time it is
      * called, core has already had its one chance to visit every placeholder on the path it is actually dispatching. One
