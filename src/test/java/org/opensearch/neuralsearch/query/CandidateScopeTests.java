@@ -231,6 +231,26 @@ public class CandidateScopeTests extends OpenSearchTestCase {
         assertEquals("processors run once for the user request, not once per leg", SearchPipelineService.NOOP_PIPELINE_ID, leg.pipeline());
     }
 
+    /**
+     * {@code profile} is the one OVERRIDDEN field whose value fused mode decides <i>after</i> the scope is captured: the
+     * request's own flag never reaches a leg, and a leg runs profiled only because the rewrite has a merger to publish its
+     * tree to. Both directions matter — the first is what keeps an unprofiled-by-inheritance leg cheap, the second is what
+     * makes per-leg profiling report anything at all.
+     */
+    public void testProfileReachesALegOnlyWhenFusedModeAsksForIt() {
+        CandidateScope inherited = CandidateScope.from(new SearchRequest(INDEX).source(new SearchSourceBuilder().profile(true)));
+
+        assertFalse("the outer profile flag is not inherited", inherited.newLegRequest(LEG, 50).source().profile());
+
+        CandidateScope enabled = CandidateScope.from(new SearchRequest(INDEX));
+        enabled.enableLegProfiling();
+
+        assertTrue(
+            "fused mode profiles the legs itself, so each one reports its own tree",
+            enabled.newLegRequest(LEG, 50).source().profile()
+        );
+    }
+
     // ---- REJECTED: shapes fused mode cannot answer correctly, refused before the fan-out ----
 
     public void testRejectsTerminateAfter() {

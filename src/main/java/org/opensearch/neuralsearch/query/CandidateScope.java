@@ -44,9 +44,10 @@ import org.opensearch.search.sort.SortBuilder;
  * <p><b>Cost.</b> {@link Disposition#REJECTED} fields fail the request at rewrite, before the leg fan-out, so a refusal
  * costs strictly less than the search it replaces. Every {@link Disposition#PROPAGATED} field either narrows a leg's
  * work (routing, preference, pre-filter, shard concurrency, timeout, slice) or is free at the leg (post_filter, PIT), so
- * honoring them does not make a leg more expensive than it is today. The one exception is
- * {@code search_type=dfs_query_then_fetch}, which adds a term-statistics round trip per leg — that cost is the user's
- * explicit choice, and the alternative is picking candidates with statistics they asked us not to use.
+ * honoring them does not make a leg more expensive than it is today. There are two exceptions, both of them the user's
+ * explicit choice: {@code search_type=dfs_query_then_fetch} adds a term-statistics round trip per leg, and the
+ * alternative is picking candidates with statistics they asked us not to use; and {@code profile} runs each leg profiled
+ * (see {@link #enableLegProfiling}), which is what the request asked to measure.
  */
 final class CandidateScope {
 
@@ -319,10 +320,12 @@ final class CandidateScope {
             table,
             SEARCH_SOURCE,
             "profile",
-            Disposition.NOT_PROPAGATED,
-            "only a leg's hits are read from its response, so a leg profile tree has nowhere to go: cost with no output, "
-                + "and profiling perturbs the execution that picks the window. The request profiles round 2 instead, "
-                + "where the legs do appear, timed as the non-scoring Tail filters they are there"
+            Disposition.OVERRIDDEN,
+            "a leg runs profiled when the fused rewrite has somewhere to publish its tree, and unprofiled otherwise — "
+                + "never by inheriting the outer flag. FusedLegProfileMerger is that somewhere: it is attached before the "
+                + "rewrite, only for a profiled request, and it merges each leg's tree into the response's profile section "
+                + "under the leg's own shard entry (see enableLegProfiling). Profiling a leg costs the leg the usual "
+                + "profiling overhead and reports it there, which is the point"
         );
         put(table, SEARCH_SOURCE, "verbosePipeline", Disposition.NOT_PROPAGATED, "pipeline debug output, and a leg runs no pipeline");
 
@@ -358,6 +361,13 @@ final class CandidateScope {
     private final QueryBuilder postFilter;
     private final SliceBuilder slice;
     private final String pointInTimeId;
+
+    /**
+     * When set, every leg sub-search runs with {@code profile: true} so its tree can be merged into the user's response.
+     * Not part of the captured scope — it is the fused rewrite's own decision, made from the outer request's
+     * {@code profile} flag, not a field inherited from it.
+     */
+    private boolean legProfiling;
 
     private CandidateScope(final SearchRequest request) {
         SearchSourceBuilder source = request.source();
@@ -470,6 +480,21 @@ final class CandidateScope {
     }
 
     /**
+     * Ask every leg built from here on to report its profile tree, because the request asked to be profiled and the
+     * rewrite has a {@code FusedLegProfileMerger} to publish the trees to.
+     *
+     * <p>A profiled leg pays profiling's own overhead, so a profiled fused request spends measurably longer inside the
+     * fan-out than the same request unprofiled — the ordinary observer effect of {@code profile}, and the reason the
+     * numbers a profiled run reports describe a profiled run. It lands inside the user's {@code timeout} like any other
+     * leg work: a leg that exceeds a soft timeout returns the candidates it had, so the window can be narrower than an
+     * unprofiled run's. That is not specific to profiling — a fused request under a soft timeout already reports no sign
+     * of a truncated leg, which is tracked as a fused-mode follow-up.
+     */
+    void enableLegProfiling() {
+        this.legProfiling = true;
+    }
+
+    /**
      * The single place a leg sub-search is constructed: the captured candidate scope, plus this leg's own query and the
      * candidate window. Every {@link Disposition#OVERRIDDEN} value is set here explicitly rather than inherited, so no
      * field of the outer request can reach a leg by accident. Legs are id-only (no {@code _source}) with totals disabled,
@@ -504,6 +529,9 @@ final class CandidateScope {
             .from(0)
             .fetchSource(false)
             .trackTotalHits(false);
+        if (legProfiling) {
+            legSource.profile(true);
+        }
         if (Objects.nonNull(timeout)) {
             legSource.timeout(timeout);
         }

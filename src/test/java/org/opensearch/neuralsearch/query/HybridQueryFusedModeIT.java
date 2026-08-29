@@ -34,8 +34,9 @@ import lombok.SneakyThrows;
  * self-erase into a standard query that returns fused results.
  *
  * <p>Happy path plus the classic-vs-fused differential in
- * {@link #testFusedMode_forEveryNormalizationTechnique_thenMatchesClassicPipeline}; broader coverage (nested, RRF,
- * aggregations, explain/profiler, min_score, geometric/harmonic mean) is scoped to later PRs.
+ * {@link #testFusedMode_forEveryNormalizationTechnique_thenMatchesClassicPipeline}; the profiler is covered by
+ * {@link HybridQueryFusedModeProfileIT}, and broader coverage (nested, RRF, aggregations, explain, min_score,
+ * geometric/harmonic mean) is scoped to later PRs.
  */
 public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
 
