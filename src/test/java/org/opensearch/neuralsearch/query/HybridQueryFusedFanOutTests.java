@@ -381,6 +381,54 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
     }
 
     /**
+     * A rescore is confined to the fused window, which is the request's ranking only when the hybrid is the request's own
+     * {@code query}. Composed into another query the window is a different set from what the request ranks, so the
+     * confinement would silently misapply the rescore — inert over a {@code must_not}'s survivors, partial over a
+     * {@code should}'s siblings, the intersection of two windows for two fused hybrids. Each such shape is refused, and
+     * before any fan-out: the guard runs ahead of the leg registration, so nothing is dispatched. A top-level fused hybrid
+     * with a rescore — the supported case — is admitted and fans out as usual (asserted separately below).
+     */
+    @SneakyThrows
+    public void testFusedHybridComposedWithOtherClausesAndARescore_isRefusedBeforeAnyFanOut() {
+        QueryRescorerBuilder rescorer = new QueryRescorerBuilder(new MatchQueryBuilder(TEXT_FIELD_NAME, "hello"));
+        Map<String, QueryBuilder> composedPositions = new LinkedHashMap<>();
+        composedPositions.put("must_not", QueryBuilders.boolQuery().mustNot(nestedChain(1)));
+        composedPositions.put(
+            "should sibling",
+            QueryBuilders.boolQuery().should(nestedChain(1)).should(new MatchQueryBuilder(TEXT_FIELD_NAME, "phone"))
+        );
+        composedPositions.put("two fused hybrids", QueryBuilders.boolQuery().should(nestedChain(1)).should(nestedChain(1)));
+
+        for (Map.Entry<String, QueryBuilder> position : composedPositions.entrySet()) {
+            SearchSourceBuilder source = new SearchSourceBuilder().query(position.getValue()).addRescorer(rescorer);
+            List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+            QueryCoordinatorContext coordinatorContext = coordinatorContext(new SearchRequest(INDEX_NAME).source(source), registered);
+
+            IllegalArgumentException error = expectThrows(IllegalArgumentException.class, () -> source.rewrite(coordinatorContext));
+
+            assertThat(
+                position.getKey(),
+                error.getMessage(),
+                containsString("only supported when the [hybrid] is the request's own [query]")
+            );
+            assertTrue(position.getKey() + ": refused before the fan-out it would have created", registered.isEmpty());
+        }
+    }
+
+    /**
+     * The supported shape the refusal above carves out: the fused hybrid is the request's own {@code query}, with a
+     * rescore over it. It is admitted and fans out once — the confinement's window is exactly the request's ranking here, so
+     * there is nothing to refuse.
+     */
+    @SneakyThrows
+    public void testTopLevelFusedHybridWithARescore_isAdmittedAndFansOut() {
+        SearchSourceBuilder source = new SearchSourceBuilder().query(nestedChain(1))
+            .addRescorer(new QueryRescorerBuilder(new MatchQueryBuilder(TEXT_FIELD_NAME, "hello")));
+        List<Integer> legCounts = driveWholeSource(new SearchRequest(INDEX_NAME).source(source));
+        assertEquals("the top-level fused hybrid with a rescore fans out once", List.of(2), legCounts);
+    }
+
+    /**
      * The same refusal when there is no {@code query} for the hybrid to be part of. A body may carry only a
      * {@code post_filter}, or only aggregations, and core rewrites those against this context all the same — so what an
      * absent query means has to be decided rather than assumed. It means refused: admitting a hybrid because nothing
@@ -713,6 +761,48 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
         expectThrows(IndexNotFoundException.class, () -> localOnly.rewrite(coordinatorContext(localRequest, new ArrayList<>())));
     }
 
+    /**
+     * A rescore over a fused hybrid settles normally, and a fused hybrid <i>inside</i> the rescore query never reaches
+     * confinement at all.
+     *
+     * <p>Confinement is installed while core rewrites the request's <i>query</i>, strictly before it snapshots the rescorer
+     * list ({@link FusedRescoreScope}). A fused hybrid living in the rescore query rewrites during that snapshot instead, so
+     * its own installation would write into a list core has already read past: its placeholders could never be visited, and
+     * {@link FusedRescoreScope#requireReachedTheExecutedRequest} would turn that into a server error <i>after</i> the legs
+     * had run. It does not get that far — the position guard refuses the shape from the body, before any fan-out, which is
+     * what keeps that fail-closed path out of reach through this entry point. Pinned here because it is the one placement
+     * whose refusal this class depends on rather than merely shares.
+     */
+    @SneakyThrows
+    public void testFusedHybridInsideARescoreQuery_neverReachesConfinement() {
+        HybridQueryBuilder hybrid = fused(new MatchQueryBuilder(TEXT_FIELD_NAME, "hello"), QueryBuilders.termQuery(TEXT_FIELD_NAME, "kw"));
+        SearchSourceBuilder source = new SearchSourceBuilder().query(new MatchQueryBuilder(TEXT_FIELD_NAME, "hello"))
+            .addRescorer(new QueryRescorerBuilder(hybrid));
+        SearchRequest searchRequest = new SearchRequest(INDEX_NAME).source(source);
+        List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+        QueryCoordinatorContext coordinatorContext = coordinatorContext(searchRequest, registered);
+
+        IllegalArgumentException error = expectThrows(IllegalArgumentException.class, () -> source.rewrite(coordinatorContext));
+
+        assertThat(error.getMessage(), containsString("must be part of the request's [query]"));
+        assertTrue("refused before the fan-out whose window could never be applied", registered.isEmpty());
+
+        // The placement that is supported, and what this class is about: the same hybrid as the request's query, with a
+        // rescore over it, fans out and settles — so what the refusal above rules out is where the hybrid sits, nothing else
+        // about a body that carries both a fused hybrid and a rescore.
+        HybridQueryBuilder asTheQuery = fused(
+            new MatchQueryBuilder(TEXT_FIELD_NAME, "hello"),
+            QueryBuilders.termQuery(TEXT_FIELD_NAME, "kw")
+        );
+        List<Integer> legCounts = driveWholeSource(
+            new SearchRequest(INDEX_NAME).source(
+                new SearchSourceBuilder().query(asTheQuery)
+                    .addRescorer(new QueryRescorerBuilder(new MatchQueryBuilder(TEXT_FIELD_NAME, "hello")))
+            )
+        );
+        assertEquals(List.of(2), legCounts);
+    }
+
     /** Scoped to fused mode: classic hybrid is answered by every version that can parse it, and stays version-free. */
     @SneakyThrows
     public void testClassicHybrid_onTheSameLaggingCluster_isUnaffected() {
@@ -832,9 +922,40 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
      */
     @SneakyThrows
     private FanOut drive(final SearchRequest searchRequest) {
+        List<Integer> legCountPerMultiSearch = new ArrayList<>();
+        QueryCoordinatorContext coordinatorContext = fanningOutContext(searchRequest, legCountPerMultiSearch);
+
+        AtomicReference<QueryBuilder> settled = new AtomicReference<>();
+        Rewriteable.rewriteAndFetch(searchRequest.source().query(), coordinatorContext, ActionListener.wrap(settled::set, e -> {
+            throw new AssertionError("rewrite failed: " + e.getMessage(), e);
+        }));
+        assertNotNull("the rewrite never completed", settled.get());
+        return new FanOut(legCountPerMultiSearch, settled.get());
+    }
+
+    /**
+     * As {@link #drive}, but driving the whole {@code source}, which is what a request carrying a rescore needs: fused mode's
+     * confinement is resolved by the pass core takes over the <i>rescorer list</i>, so driving the query alone leaves the
+     * placeholders unvisited and the request fails closed. Reports the fan-out only — what the dispatched source contains is
+     * pinned in {@link FusedRescoreScopeTests}, against core's own rewrite rather than this harness.
+     */
+    @SneakyThrows
+    private List<Integer> driveWholeSource(final SearchRequest searchRequest) {
+        List<Integer> legCountPerMultiSearch = new ArrayList<>();
+        QueryCoordinatorContext coordinatorContext = fanningOutContext(searchRequest, legCountPerMultiSearch);
+
+        AtomicReference<SearchSourceBuilder> settled = new AtomicReference<>();
+        Rewriteable.rewriteAndFetch(searchRequest.source(), coordinatorContext, ActionListener.wrap(settled::set, e -> {
+            throw new AssertionError("rewrite failed: " + e.getMessage(), e);
+        }));
+        assertNotNull("the rewrite never completed", settled.get());
+        return legCountPerMultiSearch;
+    }
+
+    /** A coordinator context that answers every fan-out registered on it from {@link #multiSearchingClient}, round by round. */
+    private QueryCoordinatorContext fanningOutContext(final SearchRequest searchRequest, final List<Integer> legCountPerMultiSearch) {
         List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
         QueryCoordinatorContext coordinatorContext = coordinatorContext(searchRequest, registered);
-        List<Integer> legCountPerMultiSearch = new ArrayList<>();
         Client client = multiSearchingClient(legCountPerMultiSearch);
         when(coordinatorContext.hasAsyncActions()).thenAnswer(invocation -> registered.isEmpty() == false);
         doAnswer(invocation -> {
@@ -847,13 +968,7 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
             roundListener.onResponse(null);
             return null;
         }).when(coordinatorContext).executeAsyncActions(any());
-
-        AtomicReference<QueryBuilder> settled = new AtomicReference<>();
-        Rewriteable.rewriteAndFetch(searchRequest.source().query(), coordinatorContext, ActionListener.wrap(settled::set, e -> {
-            throw new AssertionError("rewrite failed: " + e.getMessage(), e);
-        }));
-        assertNotNull("the rewrite never completed", settled.get());
-        return new FanOut(legCountPerMultiSearch, settled.get());
+        return coordinatorContext;
     }
 
     /** Answers every leg with the same two hits, and records how many legs each MultiSearch carried. */

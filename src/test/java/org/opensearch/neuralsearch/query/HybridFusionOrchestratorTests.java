@@ -901,4 +901,303 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
     private int tailFilterCount(QueryBuilder fused) {
         return ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().filter().size();
     }
+
+    // ---- fused scores are floored above the non-scoring Tail ----
+
+    private FusionSpec l2Arithmetic() {
+        return new FusionSpec(FusionSpec.TECHNIQUE_ARITHMETIC_MEAN, "l2", FusionSpec.DEFAULT_RANK_CONSTANT, new float[0]);
+    }
+
+    private FusionSpec zScoreArithmetic() {
+        return new FusionSpec(FusionSpec.TECHNIQUE_ARITHMETIC_MEAN, "z_score", FusionSpec.DEFAULT_RANK_CONSTANT, new float[0]);
+    }
+
+    private FusionSpec minMaxWeighted(float... weights) {
+        return new FusionSpec(
+            FusionSpec.TECHNIQUE_ARITHMETIC_MEAN,
+            FusionSpec.NORMALIZATION_MIN_MAX,
+            FusionSpec.DEFAULT_RANK_CONSTANT,
+            weights
+        );
+    }
+
+    private ConstantScoreQueryBuilder topClause(QueryBuilder fused, int position) {
+        return (ConstantScoreQueryBuilder) ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().should().get(position);
+    }
+
+    /**
+     * The tie this closes. The Top scores and the Tail does not, which is the whole mechanism separating the fused window
+     * from everything else; a ranked document at exactly {@code 0.0} ties with the Tail-only documents it is meant to
+     * outrank, and Lucene then breaks that tie by ascending doc id — so a document fusion did not rank can be returned
+     * ahead of one it did, and with {@code size == window_size} the ranked one is dropped outright.
+     *
+     * <p>{@code l2} is one of the two ways to reach exactly {@code 0.0}: a leg whose raw scores are all {@code 0.0} has a
+     * zero norm, and {@code L2ScoreNormalizer.MIN_SCORE} is {@code 0.0f} — unlike min_max's and z_score's {@code 0.001f}.
+     * A document appearing only in such a leg therefore fuses to {@code 0.0} under default weights.
+     */
+    public void testBuildFusedQuery_whenL2LegHasZeroNorm_thenRankedScoreIsFlooredAboveTheTail() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        // Leg 0's only hit scores 0.0 → zero norm → normalizes to L2's MIN_SCORE of 0.0f. Doc 3 is in no other leg.
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("3", 0.0f)), legItem(Map.of("1", 5.0f, "2", 3.0f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, l2Arithmetic(), 10);
+
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
+        assertEquals("union of {1,2,3} ranked", 3, self.should().size());
+        assertAddressedTo(((ConstantScoreQueryBuilder) self.should().get(2)).innerQuery(), INDEX, "3");
+        assertEquals(
+            "a fused score of exactly 0.0 is floored, so it still outranks the Tail",
+            HybridFusionOrchestrator.MIN_RANKED_SCORE,
+            topClause(fused, 2).boost(),
+            0.0f
+        );
+        assertTrue("every ranked document outscores a Tail-only document", topClause(fused, 0).boost() > 0.0f);
+    }
+
+    /**
+     * What the floor's <i>value</i> has to satisfy, and the reason it is not {@link Float#MIN_VALUE}: the score does not
+     * reach Lucene's comparison untouched. An enclosing clause's {@code boost}, a rescore's {@code query_weight} (core's
+     * {@code QueryRescorer} multiplies every window document's first-pass score by it, matched or not) and a
+     * {@code score_mode: multiply} rescore all attenuate it first, and {@code Float.MIN_VALUE} is subnormal — any factor at
+     * or below {@code 0.5} rounds it back to exactly {@code 0.0} and restores the tie the floor exists to break.
+     *
+     * <p>Asserted on the constant rather than through a query because that is where the requirement lives: the arithmetic
+     * below is core's and Lucene's, and this is the only place the plugin gets to choose a value that survives it.
+     */
+    public void testMinRankedScore_survivesTheAttenuationAFusedScoreMeetsDownstream() {
+        assertEquals(
+            "subnormal, so a factor of 0.5 annihilates it — the trap this constant exists to avoid",
+            0.0f,
+            Float.MIN_VALUE * 0.5f,
+            0.0f
+        );
+
+        for (float factor : new float[] { 0.5f, 0.1f, 0.001f, 1e-6f, 1e-12f }) {
+            assertTrue(
+                "the floor must stay above the Tail's 0.0 after being multiplied by " + factor,
+                HybridFusionOrchestrator.MIN_RANKED_SCORE * factor > 0.0f
+            );
+        }
+        assertTrue(
+            "and it must stay far below the smallest score a real config produces — min_max floors a normalized score at "
+                + "0.001 and arithmetic_mean divides by a weight sum of 1.0",
+            HybridFusionOrchestrator.MIN_RANKED_SCORE < 0.001f * 1e-9f
+        );
+    }
+
+    /**
+     * The second route to exactly {@code 0.0}, and the one that works with any normalization technique: a {@code weights}
+     * entry of {@code 0.0} zeroes its leg's contribution, so a document that matched only that leg fuses to {@code 0.0}.
+     * Two such documents also pin down what the floor must NOT do: they were tied at {@code 0.0} before it and stay tied
+     * after, in the same key order — flooring is not allowed to invent an order fusion did not produce, only to lift the
+     * whole tie above the Tail.
+     */
+    public void testBuildFusedQuery_whenLegWeightIsZero_thenAllZeroScoresAreFlooredAndKeepTheirOrder() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", 5.0f, "2", 3.0f)), legItem(Map.of("3", 7.0f, "4", 2.0f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, minMaxWeighted(1.0f, 0.0f), 10);
+
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
+        assertEquals(4, self.should().size());
+        assertEquals("leg 0 at weight 1.0 still ranks normally", 1.0f, topClause(fused, 0).boost(), 0.001f);
+        // Docs 3 and 4 matched only the zero-weighted leg, so both fused to exactly 0.0 and were tied on the composite key.
+        assertAddressedTo(((ConstantScoreQueryBuilder) self.should().get(2)).innerQuery(), INDEX, "3");
+        assertAddressedTo(((ConstantScoreQueryBuilder) self.should().get(3)).innerQuery(), INDEX, "4");
+        assertEquals(HybridFusionOrchestrator.MIN_RANKED_SCORE, topClause(fused, 2).boost(), 0.0f);
+        assertEquals(HybridFusionOrchestrator.MIN_RANKED_SCORE, topClause(fused, 3).boost(), 0.0f);
+    }
+
+    /**
+     * Both branches of {@code scoreAboveTail}, called directly, because fused mode reaches only one of them through
+     * {@link HybridFusionOrchestrator#buildFusedQuery}. A <i>non-finite</i> score is floored, not refused: z_score returns
+     * a raw {@code +Infinity} leg score unchanged through its equal-to-mean edge case (the integration control below
+     * measures it end to end), so a fused {@code +Infinity} is reachable and is floored to {@code MIN_RANKED_SCORE} exactly
+     * as {@code 0.0} is — a degenerate score ranks a document last rather than failing an otherwise legal request. A
+     * {@code NaN} is floored the same way, defensively; nothing in scope produces a fused {@code NaN}, since min_max's and
+     * l2's {@code Inf/Inf} is dropped by arithmetic_mean before it can combine.
+     *
+     * <p>Only a <i>negative</i> score is refused, and with an {@code IllegalStateException} rather than an
+     * {@code IllegalArgumentException} because no change to the request fixes it: a negative fused score would mean the
+     * non-negativity invariant broke, and answering with a coordinator-invented order is worse than failing. {@code -0.0f}
+     * sits on the flooring side, not the refusing side — {@code [-0.0f < 0.0f]} is {@code false} — which is the one place
+     * this deliberately disagrees with {@code HybridFusionQueryBuilder#requireUsableAsBoosts}, which rejects it. Asserted so
+     * the two stay differently by intention rather than by accident.
+     */
+    public void testScoreAboveTail_floorsNonFiniteAndRefusesOnlyNegative() {
+        for (float floored : new float[] { Float.POSITIVE_INFINITY, Float.NaN, 0.0f, -0.0f }) {
+            assertEquals(
+                "a non-finite or zero fused score of [" + floored + "] is floored to the window bottom, not refused",
+                HybridFusionOrchestrator.MIN_RANKED_SCORE,
+                HybridFusionOrchestrator.scoreAboveTail(floored),
+                0.0f
+            );
+        }
+
+        for (float refused : new float[] { Float.NEGATIVE_INFINITY, -1.0f, -Float.MIN_VALUE }) {
+            IllegalStateException e = expectThrows(
+                IllegalStateException.class,
+                "expected a negative fused score of [" + refused + "] to be refused",
+                () -> HybridFusionOrchestrator.scoreAboveTail(refused)
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("a fused score must be non-negative"));
+        }
+
+        assertEquals(
+            "anything already above the floor passes through untouched",
+            0.25f,
+            HybridFusionOrchestrator.scoreAboveTail(0.25f),
+            0.0f
+        );
+    }
+
+    /**
+     * min_max's leg of the non-finite story, and the reason the floor no longer refuses. The same raw {@code +Infinity}
+     * that z_score carries through to a fused {@code +Infinity} (the test above), min_max launders to {@code 0.0}. So the
+     * three in-scope normalizers do not agree on the intermediate value — they agree only on the floored result, which is
+     * what the fix restored. Measured rather than assumed, because the laundering is a claim about shared scalar arithmetic
+     * and would rot silently.
+     *
+     * <p>The two non-finite inputs are laundered differently under min_max, which is why each is asserted rather than looped
+     * over. {@code NaN} never reaches the combiner: {@code Floats.compare(NaN, NaN) == 0}, so a single-hit leg whose min,
+     * max and score are all {@code NaN} matches min_max's single-score edge case and normalizes to {@code 1.0} — the top of
+     * its own leg. {@code +Infinity} does make min_max emit {@code NaN}, since {@code (Inf - min) / (Inf - min)} is
+     * {@code Inf/Inf}, but arithmetic_mean's {@code score >= 0.0} participation rule is false for {@code NaN}, so that leg's
+     * slot leaves both numerator and denominator and the document fuses to exactly {@code 0.0} — floored, not refused.
+     * z_score is the one normalizer that does not launder: its equal-to-mean edge case returns the leg {@code maxScore}, so
+     * a {@code +Infinity} hit stays {@code +Infinity} and reaches the floor as such.
+     *
+     * <p>That laundering is not something this path could fix — it is in the scalar math classic hybrid shares, and
+     * changing it would change classic's scores too. It is recorded here because it is what made the refusal look
+     * unreachable when only min_max was measured.
+     */
+    public void testBuildFusedQuery_whenALegHitScoreIsNonFinite_thenLaunderedByFusionRatherThanRefused() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+
+        MultiSearchResponse withNaN = multiSearch(legItem(Map.of("1", Float.NaN)), legItem(Map.of("2", 3.0f)));
+        QueryBuilder fusedNaN = HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), withNaN, legs, minMaxArithmetic(), 10);
+        assertEquals("both documents are ranked", 2, ((HybridFusionQueryBuilder) fusedNaN).buildSelfErasedQuery().should().size());
+        // Each doc matched one leg at a normalized 1.0 and contributed 0.0 to the other, so both fuse to 0.5 and tie —
+        // the NaN hit is ranked exactly as a legitimate best hit of its leg would be.
+        assertEquals("the NaN hit ranks as its leg's best", 0.5f, topClause(fusedNaN, 0).boost(), 0.0f);
+        assertEquals(0.5f, topClause(fusedNaN, 1).boost(), 0.0f);
+
+        MultiSearchResponse withInfinity = multiSearch(legItem(Map.of("1", Float.POSITIVE_INFINITY)), legItem(Map.of("2", 3.0f)));
+        QueryBuilder fusedInfinity = HybridFusionOrchestrator.buildFusedQuery(
+            new SearchSourceBuilder(),
+            withInfinity,
+            legs,
+            minMaxArithmetic(),
+            10
+        );
+        assertEquals(2, ((HybridFusionQueryBuilder) fusedInfinity).buildSelfErasedQuery().should().size());
+        assertAddressedTo(topClause(fusedInfinity, 0).innerQuery(), INDEX, "2");
+        assertEquals("the leg that scored finitely is unaffected", 0.5f, topClause(fusedInfinity, 0).boost(), 0.0f);
+        assertAddressedTo(topClause(fusedInfinity, 1).innerQuery(), INDEX, "1");
+        assertEquals(
+            "and the +Infinity hit fused to exactly 0.0, so it was floored above the Tail rather than refused",
+            HybridFusionOrchestrator.MIN_RANKED_SCORE,
+            topClause(fusedInfinity, 1).boost(),
+            0.0f
+        );
+    }
+
+    /**
+     * The z_score twin of the min_max non-finite case above, and the reason the floor no longer refuses a non-finite
+     * score. min_max launders a raw {@code +Infinity} leg hit to {@code 0.0} (Inf/Inf → NaN, dropped by arithmetic_mean),
+     * but z_score's equal-to-mean edge case returns the leg {@code maxScore} unchanged, so the same hit normalizes to
+     * {@code +Infinity} and arithmetic_mean keeps it — a fused {@code +Infinity}. Before the floor was widened this reached
+     * {@link HybridFusionOrchestrator#scoreAboveTail} as {@code +Infinity} and failed the request with an
+     * {@link IllegalStateException} (a server error) for an in-scope config; now the document is floored above the Tail and
+     * the request succeeds, matching min_max for the identical input.
+     */
+    public void testBuildFusedQuery_whenALegHitScoreIsNonFiniteUnderZScore_thenFlooredRatherThanRefused() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", Float.POSITIVE_INFINITY)), legItem(Map.of("2", 3.0f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, zScoreArithmetic(), 10);
+
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
+        assertEquals("both documents are ranked, neither refused", 2, self.should().size());
+        // Doc 1's +Infinity sorted it to the top of the window before the floor ran, so it is should()-clause 0 — but its
+        // score is floored to the window bottom, so at query time doc 2's finite 1.5 outscores it. The floor lifts the
+        // score above the Tail's 0.0 without inventing an order: the effective ranking (doc 2 over doc 1) is what min_max
+        // produces for the same input, only reached from a +Infinity fused score rather than a laundered 0.0.
+        assertAddressedTo(topClause(fused, 0).innerQuery(), INDEX, "1");
+        assertAddressedTo(topClause(fused, 1).innerQuery(), INDEX, "2");
+        assertEquals(
+            "the +Infinity hit fused to +Infinity under z_score and was floored above the Tail rather than refused",
+            HybridFusionOrchestrator.MIN_RANKED_SCORE,
+            topClause(fused, 0).boost(),
+            0.0f
+        );
+        assertEquals("the finitely-scored document keeps its real fused score", 1.5f, topClause(fused, 1).boost(), 0.001f);
+        assertTrue(
+            "so at query time the finite document outscores the floored +Infinity one",
+            topClause(fused, 1).boost() > topClause(fused, 0).boost()
+        );
+    }
+
+    /**
+     * The l2 control for the same input, and the correction to a natural but wrong assumption: l2 does <i>not</i> reach the
+     * non-finite floor. A leg holding a {@code +Infinity} hit has an {@code +Infinity} L2 norm (the sum of squares
+     * overflows), so {@code +Infinity / +Infinity} is {@code NaN} — which arithmetic_mean drops, exactly as it drops
+     * min_max's {@code NaN}. So of the three in-scope normalizers only z_score propagates a non-finite score; l2 and
+     * min_max both launder it to {@code 0.0}. Pinned so a future change to l2's norm handling that let {@code +Infinity}
+     * through would surface here rather than as a server error in production.
+     */
+    public void testBuildFusedQuery_whenALegHitScoreIsNonFiniteUnderL2_thenLaunderedLikeMinMax() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", Float.POSITIVE_INFINITY)), legItem(Map.of("2", 3.0f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, l2Arithmetic(), 10);
+
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
+        assertEquals("both documents are ranked, neither refused", 2, self.should().size());
+        assertAddressedTo(topClause(fused, 1).innerQuery(), INDEX, "1");
+        assertEquals(
+            "the +Infinity hit was laundered to 0.0 by l2 and floored above the Tail, exactly as under min_max",
+            HybridFusionOrchestrator.MIN_RANKED_SCORE,
+            topClause(fused, 1).boost(),
+            0.0f
+        );
+    }
+
+    /**
+     * The one property of {@code MIN_RANKED_SCORE} that reads like a guarantee and is not: its lower bound is per
+     * multiplication and does not compose. Attenuation is applied a factor at a time — Lucene for an enclosing clause's
+     * {@code boost}, core's {@code QueryRescorer} once per rescorer in the chain — and each step rounds to float32, so the
+     * factors multiply. Every factor used below is individually far inside the bound that
+     * {@link #testMinRankedScore_survivesTheAttenuationAFusedScoreMeetsDownstream} asserts; chained, they annihilate the
+     * floor and restore the Tail tie it exists to break.
+     *
+     * <p>Pinned rather than fixed, and the constant's javadoc carries the reasoning: no float32 value survives arbitrary
+     * multiplication, raising this one only trades tolerance below for headroom above, and the attenuating values are legal
+     * core parameters. What this test protects is the honesty of the bound — change the constant and it reports the new one.
+     */
+    public void testMinRankedScore_attenuationBoundIsPerFactorAndDoesNotCompose() {
+        assertTrue("a single factor at the documented bound survives", HybridFusionOrchestrator.MIN_RANKED_SCORE * 7.0065e-16f > 0.0f);
+        assertEquals(
+            "and just below it the product rounds to zero rather than to the smallest subnormal",
+            0.0f,
+            HybridFusionOrchestrator.MIN_RANKED_SCORE * 7.006e-16f,
+            0.0f
+        );
+
+        // Three rescorers at query_weight 1e-6 — a factor twelve orders of magnitude inside the per-factor bound.
+        float chained = HybridFusionOrchestrator.MIN_RANKED_SCORE;
+        for (int rescorer = 0; rescorer < 3; rescorer++) {
+            assertTrue("each factor on its own leaves the floor positive", HybridFusionOrchestrator.MIN_RANKED_SCORE * 1e-6f > 0.0f);
+            chained = chained * 1e-6f;
+        }
+        assertEquals("but three of them in sequence annihilate it", 0.0f, chained, 0.0f);
+
+        // And the boundary for the mildest factor that still composes to zero, which is where the count matters.
+        float compounded = HybridFusionOrchestrator.MIN_RANKED_SCORE;
+        for (int rescorer = 0; rescorer < 5; rescorer++) {
+            compounded = compounded * 0.001f;
+        }
+        assertTrue("five rescorers at query_weight 0.001 still hold", compounded > 0.0f);
+        assertEquals("six do not", 0.0f, compounded * 0.001f, 0.0f);
+    }
 }

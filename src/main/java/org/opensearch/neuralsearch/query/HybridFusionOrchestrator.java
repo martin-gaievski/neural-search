@@ -25,7 +25,6 @@ import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.query.AbstractQueryBuilder;
-import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.InnerHitContextBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
@@ -40,6 +39,8 @@ import org.opensearch.neuralsearch.processor.combination.ScoreCombinationUtil;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.SearchSourceBuilder;
 
+import com.google.common.annotations.VisibleForTesting;
+
 import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
 
@@ -50,8 +51,14 @@ import lombok.NoArgsConstructor;
  * {@link MultiSearchResponse} explicitly so the class holds no state.
  *
  * <p>Fusion arithmetic is NOT reimplemented here — it delegates to {@link CoordinatorScoreFusion}, the shared core that
- * classic hybrid also calls, so fused-mode relevance matches classic for the same hit set. Current scope: {@code min_max}
- * normalization + {@code arithmetic_mean} combination (the caller rejects other techniques at rewrite for now).
+ * classic hybrid also calls, so fused-mode relevance matches classic for the same hit set. Current scope: the whole
+ * score-normalization family ({@code min_max}, {@code z_score}, {@code l2}, resolved by name through
+ * {@link ScalarNormalizers}) combined by {@code arithmetic_mean}; the caller rejects every other combination technique at
+ * rewrite.
+ *
+ * <p>The request's {@code rescore} is deliberately <b>not</b> handled here — see {@link FusedRescoreScope}. Confining a
+ * rescore has to be set up before the legs are even fired, which is the one thing this class cannot do from a callback that
+ * runs after them.
  */
 @NoArgsConstructor(access = AccessLevel.PRIVATE)
 final class HybridFusionOrchestrator {
@@ -61,6 +68,48 @@ final class HybridFusionOrchestrator {
     private static final String KEY_SEPARATOR = "#";
     /** The {@code _name} key as it appears in a rendered query — see {@link #anyLegNamed}. */
     private static final String QUERY_NAME_KEY = String.format(Locale.ROOT, "\"%s\":", AbstractQueryBuilder.NAME_FIELD.getPreferredName());
+
+    /**
+     * The score floor every ranked document is lifted to, so that no fused score can tie the non-scoring Tail — see
+     * {@link #scoreAboveTail} for the tie and why it matters.
+     *
+     * <p>The value is pinned from both sides. <b>From below</b>, it has to stay positive after everything downstream
+     * multiplies it: an enclosing clause's {@code boost}, a rescore's {@code query_weight} (core's {@code QueryRescorer}
+     * multiplies every window document's first-pass score by it, including the ones its query does not match), a
+     * {@code score_mode: multiply} rescore. Float32 makes that a real constraint rather than a theoretical one —
+     * {@link Float#MIN_VALUE} is subnormal, so <i>any</i> factor at or below {@code 0.5} rounds it to exactly {@code 0.0}
+     * and restores the very tie the floor exists to break. {@code 1e-30f} is normal, and measured, it survives every
+     * single factor down to {@code 7.0065e-16} — below that the product rounds to zero rather than to the smallest
+     * subnormal. <b>From above</b>, it has to stay far below any fused score a real config produces, since
+     * scores at or below it are collapsed onto it: min_max and z_score floor a normalized score at {@code 0.001} and
+     * arithmetic_mean divides by a weight sum of {@code 1.0}, so even a leg weighted {@code 1e-9} contributes about
+     * {@code 1e-12} — twelve orders of magnitude above this. Reaching the collapse needs {@code l2} over a leg whose raw
+     * scores are themselves near the bottom of the float range.
+     *
+     * <p>What the collapse costs, when reached, is the relative order of documents fusion scored below {@code 1e-30} — all
+     * of which it ranked at effectively no score, and all of which still outrank the Tail. That is the deliberate trade
+     * against the alternative: leaving sub-floor scores alone would sort a document fusion scored {@code 1e-40} <i>below</i>
+     * one it scored {@code 0.0}, which is an inversion rather than a tie.
+     *
+     * <p><b>The lower bound is per multiplication and does not compose</b> — worth stating plainly, because the shape of
+     * the guarantee is easy to over-read. Attenuation is applied by Lucene and by core's {@code QueryRescorer}, one factor
+     * at a time and each rounding to float32, so the factors <i>multiply</i>: measured, three rescorers at
+     * {@code query_weight: 1e-6} each, or six at {@code 0.001}, annihilate this floor even though every one of those
+     * factors is individually far inside the bound above. An enclosing clause's {@code boost} composes with them the same
+     * way. No value fixes this — a float32 floor can always be driven to zero by enough multiplication, and raising the
+     * constant only trades tolerance below for headroom above (at {@code 1e-20} the per-factor bound would improve to
+     * about {@code 7e-26}, but the collapse described above would start catching legal weights ten orders of magnitude
+     * less extreme). So this is a bound, not a promise, and it is deliberately not enforced: the attenuating values are
+     * legal core parameters, and refusing them to protect an internal floor would cost more than it buys.
+     *
+     * <p>What the residual exposure actually is, stated narrowly: only a document fusion scored <i>at or below</i> this
+     * floor can be annihilated, because everything else is orders of magnitude larger and attenuates to a value that is
+     * still positive. Reaching the floor at all takes a {@code weights} entry of {@code 0.0} or {@code l2} over a
+     * zero-norm leg (see {@link #scoreAboveTail}), so the exposure is the original Tail tie, confined to documents fusion
+     * ranked at effectively no score, and only under attenuation this extreme. Pinned by
+     * {@code HybridFusionOrchestratorTests#testMinRankedScore_attenuationBoundIsPerFactorAndDoesNotCompose}.
+     */
+    static final float MIN_RANKED_SCORE = 1e-30f;
 
     /**
      * Build the leg MultiSearch: one standalone search per sub-query, each reduced to the global top-{@code windowSize}.
@@ -353,9 +402,77 @@ final class HybridFusionOrchestrator {
             SearchHit hit = identityByKey.get(key);
             ids[i] = hit.getId();
             indices[i] = hit.getIndex();
-            scores[i] = ranked.get(i).getValue();
+            scores[i] = scoreAboveTail(ranked.get(i).getValue());
         }
         return new RankedDocs(ids, indices, scores);
+    }
+
+    /**
+     * Floor a fused score so a ranked document can never score {@code 0.0} in round 2.
+     *
+     * <p>What separates the window from everything else is that the Top's clauses score and the Tail's do not — a document
+     * outside the window matches only the non-scoring {@code filter}, so it scores {@code 0.0} and sorts below the window.
+     * A ranked document whose fused score is exactly {@code 0.0} collapses that distinction: it ties with the Tail-only
+     * documents it is supposed to outrank, and the tie is then broken by Lucene doc id, so a document fusion deliberately
+     * did not rank can come back ahead of one it did. {@code rescore} does not cause this but sharpens it — core rescores
+     * the shard's top {@code window_size} documents <i>by score</i>, so a tied ranked document can be left out of a rescore
+     * window that a Tail-only document is admitted to, and then lifted past it.
+     *
+     * <p>Exactly {@code 0.0} is reachable, not hypothetical, and two independent paths produce it:
+     * <ul>
+     *   <li>a {@code weights} entry of {@code 0.0} for a document that matched only that leg — the numerator is its
+     *       normalized score times zero and every other leg contributes zero, for any normalization technique;</li>
+     *   <li>{@code l2} over a leg whose raw scores are all {@code 0.0}, whose norm is then zero, so
+     *       {@link org.opensearch.neuralsearch.processor.normalization.L2ScoreNormalizer#normalizeSingleScore} returns
+     *       {@link org.opensearch.neuralsearch.processor.normalization.L2ScoreNormalizer#MIN_SCORE} — which, unlike
+     *       min_max's and z_score's {@code 0.001f}, is {@code 0.0f}.</li>
+     * </ul>
+     *
+     * <p>A <i>negative</i> fused score is not reachable: Lucene scores are non-negative, every normalizer's output is
+     * non-negative (min_max maps a zero-range leg to {@code 1.0} and a zero result to {@code 0.001}, z_score clamps a
+     * non-positive result to {@code 0.001}, l2 divides a non-negative score by a non-negative norm),
+     * {@link ScoreCombinationUtil} confines every weight to {@code [0.0, 1.0]} and their sum to {@code 1.0} — so the
+     * combined score is a non-negative sum over a denominator of {@code 1.0}, never negative and never a division by zero.
+     * A negative here would mean that invariant broke, so it is refused rather than floored: flooring it would quietly
+     * hide an internal-invariant break, which is the opposite of what this method is for.
+     *
+     * <p>A <i>non-finite</i> fused score, by contrast, <b>is</b> reachable, and only under z_score. A raw {@code +Infinity}
+     * leg score is laundered to {@code 0.0} by min_max (its {@code Inf/Inf} ratio is {@code NaN}, which arithmetic_mean's
+     * {@code score >= 0.0} rule drops) and by l2 (the leg's norm is {@code +Infinity} too, so the ratio is again
+     * {@code NaN}); but z_score's equal-to-mean edge case returns the leg {@code maxScore} unchanged
+     * ({@link org.opensearch.neuralsearch.processor.normalization.ZScoreNormalizer#normalizeSingleScore}), so a
+     * {@code +Infinity} hit normalizes to {@code +Infinity}, which arithmetic_mean keeps. It is floored to
+     * {@link #MIN_RANKED_SCORE}, exactly as min_max already floors the same input — a degenerate score ranks a document
+     * last rather than failing an otherwise legal request with a server error.
+     *
+     * <p>{@code -0.0f} is deliberately not one of them, and the {@code <} rather than a {@code Float.compare} is what makes
+     * that so: {@code -0.0f < 0.0f} is {@code false}, so a negative zero is a zero here and is floored like any other. That
+     * differs from {@link HybridFusionQueryBuilder#requireUsableAsBoosts}, which does use {@code Float.compare} and so
+     * <i>rejects</i> {@code -0.0f} — correctly, because a {@code -0.0f} boost is what core's own {@code checkNegativeBoost}
+     * refuses, and by the time the builder sees a score this method has already floored it, so the two can never disagree
+     * about a value that actually flows. Reachability makes the point moot in any case: all four combination techniques
+     * accumulate from {@code +0.0f} and {@code (+0.0f) + (-0.0f)} is {@code +0.0f}.
+     *
+     * <p>This floor is applied here, at fusion time, rather than when the Top clauses are built, so the builder's own
+     * state, its {@code toXContent}/profile form and the {@code _score} the user is shown all agree on one number.
+     *
+     * <p>Package-private so both branches can be tested: the non-finite floor, which z_score reaches, and the negative
+     * refusal, which nothing in scope reaches. The refusal is the fail-closed guard — a negative fused score would mean
+     * the non-negativity invariant above broke, so failing the request beats answering it with a corrupt ranking.
+     */
+    @VisibleForTesting
+    static float scoreAboveTail(final float fusedScore) {
+        if (fusedScore < 0.0f) {
+            throw new IllegalStateException(
+                String.format(Locale.ROOT, "[hybrid] a fused score must be non-negative but was %s", fusedScore)
+            );
+        }
+        // A non-finite fused score is degenerate rather than illegal (z_score can return a +Infinity leg score unchanged);
+        // floor it to the window bottom, the same outcome min_max already produces for the same input.
+        if (Float.isFinite(fusedScore) == false) {
+            return MIN_RANKED_SCORE;
+        }
+        return Math.max(fusedScore, MIN_RANKED_SCORE);
     }
 
     /** The sub-query legs in their Tail form. groupLegHits fails fast on any leg failure, so every leg is present here
@@ -446,9 +563,10 @@ final class HybridFusionOrchestrator {
      * exists to make correct. This is not the same defect as the Top's, and qualifying the Top did not fix it: the Tail was
      * built from the raw leg hits without reference to the ranked window's resolved indices at all.
      *
-     * <p>Hits are grouped by index — one qualified clause per index, OR-ed — rather than one clause per hit, so a
-     * single-index search still presents a single clause and, since {@code _index} is a constant field whose filter
-     * rewrites to MatchAll on its own shard and MatchNoDocs elsewhere, the post-rewrite leaf count per leg is unchanged.
+     * <p>Hits are grouped by index — one qualified clause per index, OR-ed by
+     * {@link HybridFusionQueryBuilder#addressDocumentGroups} — rather than one clause per hit, so a single-index search
+     * still presents a single clause and, since {@code _index} is a constant field whose filter rewrites to MatchAll on its
+     * own shard and MatchNoDocs elsewhere, the post-rewrite leaf count per leg is unchanged.
      *
      * <p>An empty leg is returned as an explicit {@code match_none}. {@code bool{should: []}} compiles to
      * {@code MatchAllDocsQuery}, so an ANN leg that matched nothing would otherwise flip to matching <i>every</i> document
@@ -466,16 +584,7 @@ final class HybridFusionOrchestrator {
         for (SearchHit hit : hits) {
             idsByIndex.computeIfAbsent(hit.getIndex(), index -> new ArrayList<>()).add(hit.getId());
         }
-        List<QueryBuilder> perIndex = new ArrayList<>(idsByIndex.size());
-        for (Map.Entry<String, List<String>> group : idsByIndex.entrySet()) {
-            perIndex.add(HybridFusionQueryBuilder.addressDocuments(group.getKey(), group.getValue().toArray(new String[0])));
-        }
-        if (perIndex.size() == 1) {
-            return perIndex.get(0);
-        }
-        BoolQueryBuilder inAnyIndex = new BoolQueryBuilder();
-        perIndex.forEach(inAnyIndex::should);
-        return inAnyIndex;
+        return HybridFusionQueryBuilder.addressDocumentGroups(idsByIndex);
     }
 
     /**
