@@ -428,14 +428,22 @@ final class HybridFusionOrchestrator {
      *       min_max's and z_score's {@code 0.001f}, is {@code 0.0f}.</li>
      * </ul>
      *
-     * <p>Negative and non-finite fused scores are <i>not</i> reachable: Lucene scores are non-negative, every normalizer's
-     * output is non-negative (min_max maps a zero-range leg to {@code 1.0} and a zero result to {@code 0.001}, z_score
-     * clamps a non-positive result to {@code 0.001}, l2 divides a non-negative score by a non-negative norm),
+     * <p>A <i>negative</i> fused score is not reachable: Lucene scores are non-negative, every normalizer's output is
+     * non-negative (min_max maps a zero-range leg to {@code 1.0} and a zero result to {@code 0.001}, z_score clamps a
+     * non-positive result to {@code 0.001}, l2 divides a non-negative score by a non-negative norm),
      * {@link ScoreCombinationUtil} confines every weight to {@code [0.0, 1.0]} and their sum to {@code 1.0} — so the
      * combined score is a non-negative sum over a denominator of {@code 1.0}, never negative and never a division by zero.
-     * They are refused rather than floored, and refused <i>before</i> the floor is applied, because flooring would be the
-     * wrong response to them: it would quietly collapse every negative or {@code NaN} score onto one value and destroy
-     * whatever order they had, which is the opposite of what this method is for.
+     * A negative here would mean that invariant broke, so it is refused rather than floored: flooring it would quietly
+     * hide an internal-invariant break, which is the opposite of what this method is for.
+     *
+     * <p>A <i>non-finite</i> fused score, by contrast, <b>is</b> reachable, and only under z_score. A raw {@code +Infinity}
+     * leg score is laundered to {@code 0.0} by min_max (its {@code Inf/Inf} ratio is {@code NaN}, which arithmetic_mean's
+     * {@code score >= 0.0} rule drops) and by l2 (the leg's norm is {@code +Infinity} too, so the ratio is again
+     * {@code NaN}); but z_score's equal-to-mean edge case returns the leg {@code maxScore} unchanged
+     * ({@link org.opensearch.neuralsearch.processor.normalization.ZScoreNormalizer#normalizeSingleScore}), so a
+     * {@code +Infinity} hit normalizes to {@code +Infinity}, which arithmetic_mean keeps. It is floored to
+     * {@link #MIN_RANKED_SCORE}, exactly as min_max already floors the same input — a degenerate score ranks a document
+     * last rather than failing an otherwise legal request with a server error.
      *
      * <p>{@code -0.0f} is deliberately not one of them, and the {@code <} rather than a {@code Float.compare} is what makes
      * that so: {@code -0.0f < 0.0f} is {@code false}, so a negative zero is a zero here and is floored like any other. That
@@ -448,21 +456,21 @@ final class HybridFusionOrchestrator {
      * <p>This floor is applied here, at fusion time, rather than when the Top clauses are built, so the builder's own
      * state, its {@code toXContent}/profile form and the {@code _score} the user is shown all agree on one number.
      *
-     * <p>Package-private only so its refusal branch can be tested, because that branch is not reachable through
-     * {@link #buildFusedQuery} in fused mode's current scope — measured, not assumed. Feeding a leg hit a raw
-     * {@code NaN} does not get there: {@code min_max} launders it, since {@code Floats.compare(NaN, NaN) == 0} makes a
-     * single-hit leg look like the single-score edge case and return {@code 1.0}; and where a normalizer does emit
-     * {@code NaN} (a raw {@code +Infinity} against a finite min, whose ratio is {@code Inf/Inf}), arithmetic_mean's
-     * {@code score >= 0.0} participation rule drops that leg's slot rather than propagating it — and arithmetic_mean is
-     * the only combination fused mode admits. The guard therefore stands over an invariant nothing in scope can violate,
-     * which is what it is for; widening either allowlist could change that, and this test is what would notice.
+     * <p>Package-private so both branches can be tested: the non-finite floor, which z_score reaches, and the negative
+     * refusal, which nothing in scope reaches. The refusal is the fail-closed guard — a negative fused score would mean
+     * the non-negativity invariant above broke, so failing the request beats answering it with a corrupt ranking.
      */
     @VisibleForTesting
     static float scoreAboveTail(final float fusedScore) {
-        if (Float.isFinite(fusedScore) == false || fusedScore < 0.0f) {
+        if (fusedScore < 0.0f) {
             throw new IllegalStateException(
-                String.format(Locale.ROOT, "[hybrid] a fused score must be finite and non-negative but was %s", fusedScore)
+                String.format(Locale.ROOT, "[hybrid] a fused score must be non-negative but was %s", fusedScore)
             );
+        }
+        // A non-finite fused score is degenerate rather than illegal (z_score can return a +Infinity leg score unchanged);
+        // floor it to the window bottom, the same outcome min_max already produces for the same input.
+        if (Float.isFinite(fusedScore) == false) {
+            return MIN_RANKED_SCORE;
         }
         return Math.max(fusedScore, MIN_RANKED_SCORE);
     }

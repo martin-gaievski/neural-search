@@ -908,6 +908,10 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         return new FusionSpec(FusionSpec.TECHNIQUE_ARITHMETIC_MEAN, "l2", FusionSpec.DEFAULT_RANK_CONSTANT, new float[0]);
     }
 
+    private FusionSpec zScoreArithmetic() {
+        return new FusionSpec(FusionSpec.TECHNIQUE_ARITHMETIC_MEAN, "z_score", FusionSpec.DEFAULT_RANK_CONSTANT, new float[0]);
+    }
+
     private FusionSpec minMaxWeighted(float... weights) {
         return new FusionSpec(
             FusionSpec.TECHNIQUE_ARITHMETIC_MEAN,
@@ -1005,42 +1009,40 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
     }
 
     /**
-     * Both branches of {@code scoreAboveTail}, called directly. Directly because neither is reachable through
-     * {@link HybridFusionOrchestrator#buildFusedQuery} in fused mode's current scope — which the control below measures
-     * rather than assumes. The guard stands over an invariant only a widened technique allowlist could break, and these two
-     * tests together are what would notice if one were widened.
+     * Both branches of {@code scoreAboveTail}, called directly, because fused mode reaches only one of them through
+     * {@link HybridFusionOrchestrator#buildFusedQuery}. A <i>non-finite</i> score is floored, not refused: z_score returns
+     * a raw {@code +Infinity} leg score unchanged through its equal-to-mean edge case (the integration control below
+     * measures it end to end), so a fused {@code +Infinity} is reachable and is floored to {@code MIN_RANKED_SCORE} exactly
+     * as {@code 0.0} is — a degenerate score ranks a document last rather than failing an otherwise legal request. A
+     * {@code NaN} is floored the same way, defensively; nothing in scope produces a fused {@code NaN}, since min_max's and
+     * l2's {@code Inf/Inf} is dropped by arithmetic_mean before it can combine.
      *
-     * <p>Refused rather than floored, deliberately: flooring a {@code NaN} would collapse it onto {@code MIN_RANKED_SCORE}
-     * and hand the shard a window whose order the coordinator invented, where an {@code IllegalStateException} says plainly
-     * that fusion computed something it cannot rank. An ISE and not an IAE because no change to the request fixes it — see
-     * {@code HybridFusionQueryBuilder#requireUsableAsBoosts} for where that boundary is drawn.
-     *
-     * <p>{@code -0.0f} sits on the flooring side, not the refusing side, and that is the one place this deliberately
-     * disagrees with {@code requireUsableAsBoosts}, which rejects it. Asserted here so the two stay differently by
-     * intention rather than by accident.
+     * <p>Only a <i>negative</i> score is refused, and with an {@code IllegalStateException} rather than an
+     * {@code IllegalArgumentException} because no change to the request fixes it: a negative fused score would mean the
+     * non-negativity invariant broke, and answering with a coordinator-invented order is worse than failing. {@code -0.0f}
+     * sits on the flooring side, not the refusing side — {@code [-0.0f < 0.0f]} is {@code false} — which is the one place
+     * this deliberately disagrees with {@code HybridFusionQueryBuilder#requireUsableAsBoosts}, which rejects it. Asserted so
+     * the two stay differently by intention rather than by accident.
      */
-    public void testScoreAboveTail_refusesWhatItCannotRankAndFloorsTheRest() {
-        for (float unrankable : new float[] { Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY, -1.0f, -Float.MIN_VALUE }) {
-            IllegalStateException e = expectThrows(
-                IllegalStateException.class,
-                "expected a fused score of [" + unrankable + "] to be refused",
-                () -> HybridFusionOrchestrator.scoreAboveTail(unrankable)
+    public void testScoreAboveTail_floorsNonFiniteAndRefusesOnlyNegative() {
+        for (float floored : new float[] { Float.POSITIVE_INFINITY, Float.NaN, 0.0f, -0.0f }) {
+            assertEquals(
+                "a non-finite or zero fused score of [" + floored + "] is floored to the window bottom, not refused",
+                HybridFusionOrchestrator.MIN_RANKED_SCORE,
+                HybridFusionOrchestrator.scoreAboveTail(floored),
+                0.0f
             );
-            assertTrue(e.getMessage(), e.getMessage().contains("a fused score must be finite and non-negative"));
         }
 
-        assertEquals(
-            "exactly 0.0 is floored, which is what the method exists for",
-            HybridFusionOrchestrator.MIN_RANKED_SCORE,
-            HybridFusionOrchestrator.scoreAboveTail(0.0f),
-            0.0f
-        );
-        assertEquals(
-            "and so is -0.0f, because [-0.0f < 0.0f] is false — a negative zero is a zero here",
-            HybridFusionOrchestrator.MIN_RANKED_SCORE,
-            HybridFusionOrchestrator.scoreAboveTail(-0.0f),
-            0.0f
-        );
+        for (float refused : new float[] { Float.NEGATIVE_INFINITY, -1.0f, -Float.MIN_VALUE }) {
+            IllegalStateException e = expectThrows(
+                IllegalStateException.class,
+                "expected a negative fused score of [" + refused + "] to be refused",
+                () -> HybridFusionOrchestrator.scoreAboveTail(refused)
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("a fused score must be non-negative"));
+        }
+
         assertEquals(
             "anything already above the floor passes through untouched",
             0.25f,
@@ -1050,23 +1052,24 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
     }
 
     /**
-     * The control for the test above, and the reason it has to call the guard directly: a raw leg hit score of {@code NaN}
-     * or {@code +Infinity} — the only inputs that could carry a non-finite value into fusion at all — does not reach
-     * {@code scoreAboveTail}'s refusal. Measured here rather than assumed, because "the guard is unreachable" is a claim
-     * about two pieces of shared arithmetic and would rot silently.
+     * min_max's leg of the non-finite story, and the reason the floor no longer refuses. The same raw {@code +Infinity}
+     * that z_score carries through to a fused {@code +Infinity} (the test above), min_max launders to {@code 0.0}. So the
+     * three in-scope normalizers do not agree on the intermediate value — they agree only on the floored result, which is
+     * what the fix restored. Measured rather than assumed, because the laundering is a claim about shared scalar arithmetic
+     * and would rot silently.
      *
-     * <p>The two are laundered differently, which is why each is asserted rather than looped over. {@code NaN} never
-     * reaches the combiner: {@code Floats.compare(NaN, NaN) == 0}, so a single-hit leg whose min, max and score are all
-     * {@code NaN} matches min_max's single-score edge case and normalizes to {@code 1.0} — the top of its own leg.
-     * {@code +Infinity} does make the normalizer emit {@code NaN}, since {@code (Inf - min) / (Inf - min)} is
-     * {@code Inf/Inf}, but arithmetic_mean's {@code score >= 0.0} participation rule is false for {@code NaN}, so that
-     * leg's slot leaves both numerator and denominator and the document fuses to exactly {@code 0.0} — floored, not
-     * refused. Fused mode admits no other combination technique, so there is no in-scope path from a non-finite leg score
-     * to a non-finite fused score.
+     * <p>The two non-finite inputs are laundered differently under min_max, which is why each is asserted rather than looped
+     * over. {@code NaN} never reaches the combiner: {@code Floats.compare(NaN, NaN) == 0}, so a single-hit leg whose min,
+     * max and score are all {@code NaN} matches min_max's single-score edge case and normalizes to {@code 1.0} — the top of
+     * its own leg. {@code +Infinity} does make min_max emit {@code NaN}, since {@code (Inf - min) / (Inf - min)} is
+     * {@code Inf/Inf}, but arithmetic_mean's {@code score >= 0.0} participation rule is false for {@code NaN}, so that leg's
+     * slot leaves both numerator and denominator and the document fuses to exactly {@code 0.0} — floored, not refused.
+     * z_score is the one normalizer that does not launder: its equal-to-mean edge case returns the leg {@code maxScore}, so
+     * a {@code +Infinity} hit stays {@code +Infinity} and reaches the floor as such.
      *
      * <p>That laundering is not something this path could fix — it is in the scalar math classic hybrid shares, and
-     * changing it would change classic's scores too. It is recorded here only because it is what makes the guard
-     * unreachable.
+     * changing it would change classic's scores too. It is recorded here because it is what made the refusal look
+     * unreachable when only min_max was measured.
      */
     public void testBuildFusedQuery_whenALegHitScoreIsNonFinite_thenLaunderedByFusionRatherThanRefused() {
         List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
@@ -1095,6 +1098,67 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
             "and the +Infinity hit fused to exactly 0.0, so it was floored above the Tail rather than refused",
             HybridFusionOrchestrator.MIN_RANKED_SCORE,
             topClause(fusedInfinity, 1).boost(),
+            0.0f
+        );
+    }
+
+    /**
+     * The z_score twin of the min_max non-finite case above, and the reason the floor no longer refuses a non-finite
+     * score. min_max launders a raw {@code +Infinity} leg hit to {@code 0.0} (Inf/Inf → NaN, dropped by arithmetic_mean),
+     * but z_score's equal-to-mean edge case returns the leg {@code maxScore} unchanged, so the same hit normalizes to
+     * {@code +Infinity} and arithmetic_mean keeps it — a fused {@code +Infinity}. Before the floor was widened this reached
+     * {@link HybridFusionOrchestrator#scoreAboveTail} as {@code +Infinity} and failed the request with an
+     * {@link IllegalStateException} (a server error) for an in-scope config; now the document is floored above the Tail and
+     * the request succeeds, matching min_max for the identical input.
+     */
+    public void testBuildFusedQuery_whenALegHitScoreIsNonFiniteUnderZScore_thenFlooredRatherThanRefused() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", Float.POSITIVE_INFINITY)), legItem(Map.of("2", 3.0f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, zScoreArithmetic(), 10);
+
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
+        assertEquals("both documents are ranked, neither refused", 2, self.should().size());
+        // Doc 1's +Infinity sorted it to the top of the window before the floor ran, so it is should()-clause 0 — but its
+        // score is floored to the window bottom, so at query time doc 2's finite 1.5 outscores it. The floor lifts the
+        // score above the Tail's 0.0 without inventing an order: the effective ranking (doc 2 over doc 1) is what min_max
+        // produces for the same input, only reached from a +Infinity fused score rather than a laundered 0.0.
+        assertAddressedTo(topClause(fused, 0).innerQuery(), INDEX, "1");
+        assertAddressedTo(topClause(fused, 1).innerQuery(), INDEX, "2");
+        assertEquals(
+            "the +Infinity hit fused to +Infinity under z_score and was floored above the Tail rather than refused",
+            HybridFusionOrchestrator.MIN_RANKED_SCORE,
+            topClause(fused, 0).boost(),
+            0.0f
+        );
+        assertEquals("the finitely-scored document keeps its real fused score", 1.5f, topClause(fused, 1).boost(), 0.001f);
+        assertTrue(
+            "so at query time the finite document outscores the floored +Infinity one",
+            topClause(fused, 1).boost() > topClause(fused, 0).boost()
+        );
+    }
+
+    /**
+     * The l2 control for the same input, and the correction to a natural but wrong assumption: l2 does <i>not</i> reach the
+     * non-finite floor. A leg holding a {@code +Infinity} hit has an {@code +Infinity} L2 norm (the sum of squares
+     * overflows), so {@code +Infinity / +Infinity} is {@code NaN} — which arithmetic_mean drops, exactly as it drops
+     * min_max's {@code NaN}. So of the three in-scope normalizers only z_score propagates a non-finite score; l2 and
+     * min_max both launder it to {@code 0.0}. Pinned so a future change to l2's norm handling that let {@code +Infinity}
+     * through would surface here rather than as a server error in production.
+     */
+    public void testBuildFusedQuery_whenALegHitScoreIsNonFiniteUnderL2_thenLaunderedLikeMinMax() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(legItem(Map.of("1", Float.POSITIVE_INFINITY)), legItem(Map.of("2", 3.0f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(new SearchSourceBuilder(), ms, legs, l2Arithmetic(), 10);
+
+        BoolQueryBuilder self = ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery();
+        assertEquals("both documents are ranked, neither refused", 2, self.should().size());
+        assertAddressedTo(topClause(fused, 1).innerQuery(), INDEX, "1");
+        assertEquals(
+            "the +Infinity hit was laundered to 0.0 by l2 and floored above the Tail, exactly as under min_max",
+            HybridFusionOrchestrator.MIN_RANKED_SCORE,
+            topClause(fused, 1).boost(),
             0.0f
         );
     }
