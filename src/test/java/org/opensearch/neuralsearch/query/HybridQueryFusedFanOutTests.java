@@ -381,6 +381,54 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
     }
 
     /**
+     * A rescore is confined to the fused window, which is the request's ranking only when the hybrid is the request's own
+     * {@code query}. Composed into another query the window is a different set from what the request ranks, so the
+     * confinement would silently misapply the rescore — inert over a {@code must_not}'s survivors, partial over a
+     * {@code should}'s siblings, the intersection of two windows for two fused hybrids. Each such shape is refused, and
+     * before any fan-out: the guard runs ahead of the leg registration, so nothing is dispatched. A top-level fused hybrid
+     * with a rescore — the supported case — is admitted and fans out as usual (asserted separately below).
+     */
+    @SneakyThrows
+    public void testFusedHybridComposedWithOtherClausesAndARescore_isRefusedBeforeAnyFanOut() {
+        QueryRescorerBuilder rescorer = new QueryRescorerBuilder(new MatchQueryBuilder(TEXT_FIELD_NAME, "hello"));
+        Map<String, QueryBuilder> composedPositions = new LinkedHashMap<>();
+        composedPositions.put("must_not", QueryBuilders.boolQuery().mustNot(nestedChain(1)));
+        composedPositions.put(
+            "should sibling",
+            QueryBuilders.boolQuery().should(nestedChain(1)).should(new MatchQueryBuilder(TEXT_FIELD_NAME, "phone"))
+        );
+        composedPositions.put("two fused hybrids", QueryBuilders.boolQuery().should(nestedChain(1)).should(nestedChain(1)));
+
+        for (Map.Entry<String, QueryBuilder> position : composedPositions.entrySet()) {
+            SearchSourceBuilder source = new SearchSourceBuilder().query(position.getValue()).addRescorer(rescorer);
+            List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+            QueryCoordinatorContext coordinatorContext = coordinatorContext(new SearchRequest(INDEX_NAME).source(source), registered);
+
+            IllegalArgumentException error = expectThrows(IllegalArgumentException.class, () -> source.rewrite(coordinatorContext));
+
+            assertThat(
+                position.getKey(),
+                error.getMessage(),
+                containsString("only supported when the [hybrid] is the request's own [query]")
+            );
+            assertTrue(position.getKey() + ": refused before the fan-out it would have created", registered.isEmpty());
+        }
+    }
+
+    /**
+     * The supported shape the refusal above carves out: the fused hybrid is the request's own {@code query}, with a
+     * rescore over it. It is admitted and fans out once — the confinement's window is exactly the request's ranking here, so
+     * there is nothing to refuse.
+     */
+    @SneakyThrows
+    public void testTopLevelFusedHybridWithARescore_isAdmittedAndFansOut() {
+        SearchSourceBuilder source = new SearchSourceBuilder().query(nestedChain(1))
+            .addRescorer(new QueryRescorerBuilder(new MatchQueryBuilder(TEXT_FIELD_NAME, "hello")));
+        List<Integer> legCounts = driveWholeSource(new SearchRequest(INDEX_NAME).source(source));
+        assertEquals("the top-level fused hybrid with a rescore fans out once", List.of(2), legCounts);
+    }
+
+    /**
      * The same refusal when there is no {@code query} for the hybrid to be part of. A body may carry only a
      * {@code post_filter}, or only aggregations, and core rewrites those against this context all the same — so what an
      * absent query means has to be decided rather than assumed. It means refused: admitting a hybrid because nothing

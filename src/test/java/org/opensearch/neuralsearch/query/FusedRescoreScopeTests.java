@@ -150,43 +150,6 @@ public class FusedRescoreScopeTests extends OpenSearchTestCase {
         }
     }
 
-    /**
-     * The documented narrowing when a request holds more than one fused hybrid, pinned rather than left to prose. Nothing
-     * refuses sibling fused hybrids — the budget's own message contemplates them — so each installs its own placeholder over
-     * the one shared rescore list, and the second wraps the first's replacement. The rescore is then confined to the
-     * <i>intersection</i> of the two windows where the union would be the faithful answer.
-     *
-     * <p>Asserted as the shape of the tree, because that is what "intersection" is here: two levels of {@code must}, one
-     * window per level as a non-scoring {@code filter}, and no {@code should} at either level — a {@code should} is the only
-     * way a window could start widening what the rescore matches instead of narrowing it, so a regression to a union would
-     * show up as exactly that. Conservative by construction: the intersection can only under-apply the boost, never lift a
-     * document neither hybrid ranked.
-     */
-    public void testInstall_withTwoFusedHybrids_thenTheRescoreIsConfinedToTheIntersectionOfTheWindows() throws IOException {
-        MatchQueryBuilder declaredQuery = new MatchQueryBuilder("text", "hot");
-        SearchSourceBuilder source = sourceWithRescorer(new QueryRescorerBuilder(declaredQuery));
-
-        // Two fused hybrids in one request, each installing over the same rescore list, in the order they rewrite.
-        FusedRescoreScope first = FusedRescoreScope.install(source);
-        FusedRescoreScope second = FusedRescoreScope.install(source);
-        first.resolve(fusedOver("1", "2"));
-        second.resolve(fusedOver("2", "3"));
-
-        BoolQueryBuilder outer = confinedQueryOf(coreRewriteToFixedPoint(source));
-        assertEquals("the second hybrid's window is the outer filter", 1, outer.filter().size());
-        assertAddressedTo(outer.filter().get(0), INDEX, "2", "3");
-        assertEquals(1, outer.must().size());
-        BoolQueryBuilder inner = (BoolQueryBuilder) outer.must().get(0);
-        assertEquals("the first hybrid's window is nested one must down", 1, inner.filter().size());
-        assertAddressedTo(inner.filter().get(0), INDEX, "1", "2");
-        assertTrue("neither level may widen what the rescore matches", outer.should().isEmpty() && inner.should().isEmpty());
-        assertEquals("and the user's query is still the sole scoring clause", List.of(declaredQuery), inner.must());
-
-        // Both scopes are satisfied by the one pass, so neither hybrid fails the request it shares.
-        first.requireReachedTheExecutedRequest();
-        second.requireReachedTheExecutedRequest();
-    }
-
     /** A request without a rescore, an empty {@code "rescore": []}, and a null source are all nothing to install into. */
     public void testInstall_withoutARescoreOrSource_isANoOp() {
         assertNull(FusedRescoreScope.install(null));

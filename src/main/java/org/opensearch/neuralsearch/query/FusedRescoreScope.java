@@ -72,12 +72,14 @@ import org.opensearch.search.rescore.RescorerBuilder;
  * failed request. The one thing that must not happen — returning results with an unconfined rescore — is the one thing
  * that cannot.
  *
- * <p><b>Known narrowing with more than one fused hybrid in a request.</b> Each fused hybrid installs its own placeholder
- * over the shared rescore list, so with two of them under a {@code bool} the second wraps the first's replacement and the
- * rescore ends up confined to the <i>intersection</i> of the two windows, where the union would be the faithful answer.
- * That is deliberate: it is the conservative direction — the intersection can only under-apply the boost, never lift a
- * document neither hybrid ranked — and reaching it needs no structural inspection of the user's own rescore query, which
- * any "have I already confined this?" check would. A single fused hybrid, the case this is written for, is exact.
+ * <p><b>Only sound for a top-level fused hybrid, and enforced upstream.</b> This confines the rescore to the fused
+ * window, which is the request's ranking only when the hybrid <i>is</i> the request's {@code query}. Composed into another
+ * query — a {@code bool} {@code should}/{@code must}/{@code must_not}, or alongside a second fused hybrid — the window is a
+ * different set from what the request ranks, so the confinement would silently misapply the rescore: inert over a
+ * {@code must_not}'s survivors (the window is the excluded set, disjoint from the result), partial over a {@code should}'s
+ * siblings, or the intersection of two windows for two fused hybrids. Those shapes are refused before this is installed, in
+ * {@code HybridQueryBuilder#doRewriteFused} — so by the time this runs the fused hybrid is the request's {@code query} and
+ * its window is exactly the set the rescore may touch. The general, position-aware confinement is a separate feature.
  */
 final class FusedRescoreScope {
 

@@ -52,6 +52,7 @@ import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.QueryShardException;
 import org.opensearch.index.query.QueryBuilderVisitor;
 import org.opensearch.search.SearchService;
+import org.opensearch.search.builder.SearchSourceBuilder;
 
 import lombok.AccessLevel;
 import lombok.Getter;
@@ -525,6 +526,9 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         // Then, before any config resolution: the whole request's fan-out has to be within the cluster's budget. A body
         // whose only purpose is to multiply sub-searches should cost one tree walk, not a pipeline lookup per hybrid.
         validateFusedLegSearchBudget(searchRequest);
+        // And, when the request carries a rescore, this hybrid has to be the request's own query — a rescore is confined to
+        // the fused window, which is the request's ranking only then. Refused here, before any fan-out.
+        requireFusedHybridIsTheRequestQueryWhenRescoring(searchRequest);
         // Then the request's own shape, in one place: what each leg inherits, and a refusal for the shapes fused mode
         // cannot answer correctly. Ahead of every check that resolves index metadata — config resolution reads the
         // targeted indices' default pipelines, and the window ceiling reads their max_result_window — because a request
@@ -776,6 +780,49 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                     + "rather than through that query",
                 NAME,
                 FUSION_FIELD.getPreferredName(),
+                NAME,
+                NAME
+            )
+        );
+    }
+
+    /**
+     * When the request carries a {@code rescore}, require this fused hybrid to be the request's own {@code query} rather
+     * than composed into another query.
+     *
+     * <p>{@link FusedRescoreScope} confines every rescore to this hybrid's fused window, and that window is the request's
+     * ranking <i>only</i> when the hybrid is the query. Composed into a {@code bool}, the window is a different set from
+     * what the request actually ranks, so confining the rescore to it silently misapplies it rather than erroring:
+     * <ul>
+     *   <li>a {@code must_not} hybrid's window is the <i>excluded</i> set, disjoint from the surviving results — so the
+     *       rescore matches nothing in the result set and is silently inert, dropping the reordering the user asked for;</li>
+     *   <li>a {@code should} sibling leaves documents matched only by the other clauses in the result but outside the
+     *       window, so the rescore reaches only part of the page;</li>
+     *   <li>a second fused hybrid installs its own window over the same rescore, narrowing it to the intersection of the
+     *       two windows rather than their union.</li>
+     * </ul>
+     * Reachable-but-not-the-query is exactly what {@link #requireFusedQueryIsPartOfRequestQuery} still admits (a fused
+     * hybrid may filter, or be one clause of a compound query); this is the stricter rule the rescore confinement needs,
+     * and only when a rescore is present. The position-aware confinement that would make the composed cases correct is a
+     * separate feature; until then they are refused rather than answered inaccurately.
+     */
+    private void requireFusedHybridIsTheRequestQueryWhenRescoring(final SearchRequest searchRequest) {
+        SearchSourceBuilder source = searchRequest.source();
+        if (Objects.isNull(source) || Objects.isNull(source.rescores()) || source.rescores().isEmpty() || this == source.query()) {
+            return;
+        }
+        throw new IllegalArgumentException(
+            String.format(
+                Locale.ROOT,
+                "[%s] a [rescore] with a fused [%s] is only supported when the [%s] is the request's own [query], not "
+                    + "composed with other clauses (for example inside a [bool] as a [should], [must] or [must_not], or "
+                    + "alongside another fused [%s]): the [rescore] is confined to the fused window, which matches the "
+                    + "request's ranking only when the [%s] is the query. Make the [%s] the request's [query], or remove "
+                    + "the [rescore]",
+                NAME,
+                FUSION_FIELD.getPreferredName(),
+                NAME,
+                NAME,
                 NAME,
                 NAME
             )
