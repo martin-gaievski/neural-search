@@ -36,6 +36,7 @@ import org.opensearch.neuralsearch.fusion.ScalarNormalizers;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationFactory;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationTechnique;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationUtil;
+import org.opensearch.neuralsearch.search.profile.FusedCoordinatorTimings;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.SearchSourceBuilder;
 
@@ -159,17 +160,39 @@ final class HybridFusionOrchestrator {
         FusionSpec fusion,
         int windowSize
     ) {
+        return buildFusedQuery(source, multiSearchResponse, legs, fusion, windowSize, new FusedCoordinatorTimings());
+    }
+
+    /**
+     * As above, recording each fusion phase's span into {@code timings} for the coordinator profile entry. The timings
+     * instance is always present — never null-checked here — so that instrumentation costs the same handful of
+     * {@code nanoTime} calls whether or not the request asked to be profiled, and an unprofiled request simply discards
+     * what was measured. Phase boundaries are the method boundaries below, so a span is never attributed to two phases.
+     */
+    static QueryBuilder buildFusedQuery(
+        SearchSourceBuilder source,
+        MultiSearchResponse multiSearchResponse,
+        List<QueryBuilder> legs,
+        FusionSpec fusion,
+        int windowSize,
+        FusedCoordinatorTimings timings
+    ) {
         MultiSearchResponse.Item[] items = multiSearchResponse.getResponses();
+        long windowMergeStart = System.nanoTime();
         SearchHit[][] legHits = groupLegHits(items, legs.size());
-        RankedDocs ranked = computeRankedDocs(legHits, fusion, windowSize);
+        timings.windowMergeNanos(System.nanoTime() - windowMergeStart);
+        RankedDocs ranked = computeRankedDocs(legHits, fusion, windowSize, timings);
+        timings.rankedDocs(ranked.ids().length);
         if (ranked.ids().length == 0) {
             return new MatchNoneQueryBuilder();
         }
+        long substituteBuildStart = System.nanoTime();
         boolean tailNeeded = needsTail(source, ranked.ids().length);
+        timings.tailBuilt(tailNeeded);
         // The two leg lists are alternatives, never both populated: an executed Tail converts every leg on the shard and so
         // registers the names itself, and only when it is absent does anything have to be carried for registration alone.
         // inner_hits are registered from the legs themselves, independent of whether the Tail executes them.
-        return new HybridFusionQueryBuilder(
+        QueryBuilder substitute = new HybridFusionQueryBuilder(
             ranked.ids(),
             ranked.indices(),
             ranked.scores(),
@@ -177,6 +200,8 @@ final class HybridFusionOrchestrator {
             innerHitsLegs(legs),
             tailNeeded ? List.of() : namedLegsForRegistration(legs, legHits)
         );
+        timings.substituteBuildNanos(System.nanoTime() - substituteBuildStart);
+        return substitute;
     }
 
     /**
@@ -288,7 +313,8 @@ final class HybridFusionOrchestrator {
      * may itself contain the separator, so the original identity is carried in a side map instead. To fusion and to every
      * normalizer the key stays opaque.
      */
-    private static RankedDocs computeRankedDocs(SearchHit[][] legHits, FusionSpec fusion, int windowSize) {
+    private static RankedDocs computeRankedDocs(SearchHit[][] legHits, FusionSpec fusion, int windowSize, FusedCoordinatorTimings timings) {
+        long fuseScoresStart = System.nanoTime();
         List<Map<String, Float>> legRawScores = new ArrayList<>(legHits.length);
         Map<String, SearchHit> identityByKey = new HashMap<>();
         for (SearchHit[] hits : legHits) {
@@ -308,7 +334,11 @@ final class HybridFusionOrchestrator {
         // ScalarNormalizers — no change here. The caller already rejected out-of-scope techniques at rewrite.
         ScalarNormalizer normalizer = ScalarNormalizers.forTechnique(fusion.normalizationTechnique());
         Map<String, Float> combined = CoordinatorScoreFusion.fuse(legRawScores, normalizer, combination);
-        return toRankedDocs(combined, identityByKey, windowSize);
+        timings.fuseScoresNanos(System.nanoTime() - fuseScoresStart);
+        long rankWindowStart = System.nanoTime();
+        RankedDocs ranked = toRankedDocs(combined, identityByKey, windowSize);
+        timings.rankWindowNanos(System.nanoTime() - rankWindowStart);
+        return ranked;
     }
 
     /**
@@ -626,10 +656,14 @@ final class HybridFusionOrchestrator {
      *       descend into (the Tail explains as a non-scoring filter either way). Describing the fusion belongs on the
      *       response side, where classic hybrid puts it too — tracked as a fused-mode parity follow-up, see
      *       {@link CandidateScope.Disposition#NOT_PROPAGATED}.</li>
-     *   <li>{@code profile} — the tree covers round 2, which is what executes under it, and only a leg's hits are read
-     *       from its response, so a leg tree has nowhere to go. Forcing the Tail would not add the legs' own timings: it
-     *       would time a fresh re-execution of them and change the very execution being measured. A materialized leg
-     *       appears there as the id/index filter it was reduced to, not as the ANN query it came from.</li>
+     *   <li>{@code profile} — the legs report their own trees from round 1, where they execute as the queries the user
+     *       wrote, each merged into the response under its own shard entry (see {@code FusedLegProfileMerger}); the
+     *       response's own entry covers round 2, and a synthesized {@code [coordinator]} entry covers the fan-out and the
+     *       fusion between them, from the spans this class records into {@link FusedCoordinatorTimings}. Forcing the Tail
+     *       would add nothing to that: it would time a fresh
+     *       re-execution of the legs as the non-scoring filters the Tail reduces them to — a materialized leg appearing
+     *       there as an id/index filter rather than the ANN query it came from — and change the execution being
+     *       measured.</li>
      *   <li>leg {@code inner_hits} — inner_hits are built in the fetch phase from the <i>registered</i> inner-hit
      *       contexts per returned parent doc, so the leg never has to be executed for them to be returned. They are
      *       carried separately (see {@link #innerHitsLegs}), which keeps a Top-only query cheap without losing them.

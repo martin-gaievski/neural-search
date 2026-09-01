@@ -27,7 +27,10 @@ import org.apache.lucene.search.Query;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.OpenSearchStatusException;
 import org.opensearch.Version;
+import org.opensearch.action.search.MultiSearchRequest;
+import org.opensearch.action.search.MultiSearchResponse;
 import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.SetOnce;
@@ -63,6 +66,8 @@ import lombok.extern.log4j.Log4j2;
 import org.opensearch.neuralsearch.fusion.ScalarNormalizer;
 import org.opensearch.neuralsearch.fusion.ScalarNormalizers;
 import org.opensearch.neuralsearch.processor.normalization.ScoreNormalizationFactory;
+import org.opensearch.neuralsearch.search.profile.FusedCoordinatorTimings;
+import org.opensearch.neuralsearch.search.profile.FusedLegProfileMerger;
 import org.opensearch.neuralsearch.stats.events.EventStatName;
 import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
 import org.opensearch.neuralsearch.stats.events.EventStatsManager;
@@ -135,6 +140,24 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     @Getter(AccessLevel.NONE)
     @Setter(AccessLevel.NONE)
     private FusedRescoreScope fusedRescoreScope;
+
+    /**
+     * Where to publish this fused hybrid's leg profile trees. The setter is {@code HybridQuerySearchRequestFilter}'s attach
+     * point: it runs before the coordinator rewrite and hands over a consumer when the request asks for {@code profile}, so
+     * that the leg sub-searches run profiled and their trees reach the response. {@code null} — the normal case — means the
+     * legs run unprofiled, exactly as an unprofiled request does. Never parsed, never serialized, absent from
+     * {@link #doEquals}/{@link #doHashCode}, like {@link #fusedSupplier}.
+     */
+    private FusedLegProfileMerger.LegProfileConsumer legProfileConsumer;
+
+    /**
+     * Where to publish what the coordinator itself spent on this fused hybrid. Attached by the same setter call site, under
+     * the same condition, as {@link #legProfileConsumer}: the two together are what make a profiled fused request account
+     * for its whole {@code took} rather than only its shards. {@code null} — the normal case — means the spans are still
+     * measured (a handful of {@code nanoTime} calls) and simply discarded. Never parsed, never serialized, absent from
+     * {@link #doEquals}/{@link #doHashCode}.
+     */
+    private FusedLegProfileMerger.CoordinatorTimingConsumer fusionTimingConsumer;
 
     public static final int MAX_NUMBER_OF_SUB_QUERIES = 5;
     private static final int LOWER_BOUND_OF_PAGINATION_DEPTH = 0;
@@ -584,50 +607,75 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         // every validation above, so a refused request leaves the source untouched.
         FusedRescoreScope rescoreScope = FusedRescoreScope.install(searchRequest.source());
 
+        // With a consumer attached the request asked to be profiled, so the legs run profiled too and their trees go to
+        // the merger that builds the response's profile section.
+        if (Objects.nonNull(legProfileConsumer)) {
+            candidateScope.enableLegProfiling();
+        }
+
+        // Always measured, published only when something asked for it. The spans are a handful of nanoTime calls against a
+        // fan-out that costs milliseconds, so gating the measurement would buy nothing and would make the profiled and
+        // unprofiled code paths differ in more than what they report.
+        FusedCoordinatorTimings timings = new FusedCoordinatorTimings().windowSize(window)
+            .normalizationTechnique(fusionSpec.normalizationTechnique())
+            .combinationTechnique(fusionSpec.combinationTechnique());
+
         SetOnce<QueryBuilder> fused = new SetOnce<>();
-        queryRewriteContext.registerAsyncAction(
-            (client, listener) -> client.multiSearch(
-                HybridFusionOrchestrator.buildLegMultiSearch(candidateScope, fanOutLegs, window),
-                ActionListener.wrap(multiSearchResponse -> {
-                    try {
-                        QueryBuilder fusedQuery = HybridFusionOrchestrator.buildFusedQuery(
-                            searchRequest.source(),
-                            multiSearchResponse,
-                            legs,
-                            fusionSpec,
-                            window
-                        );
-                        // Hand the now-known window to the placeholders installed above. Mutates nothing the request holds:
-                        // the placeholders are already in it, and core rewrites them into the window on its next pass.
-                        if (Objects.nonNull(rescoreScope)) {
-                            rescoreScope.resolve(fusedQuery);
-                        }
-                        fused.set(fusedQuery);
-                        listener.onResponse(null);
-                    } catch (Exception e) {
-                        listener.onFailure(e);
+        queryRewriteContext.registerAsyncAction((client, listener) -> {
+            // Built before the clock starts, and timed separately: registerAsyncAction defers this whole lambda, so a start
+            // taken outside it would fold core's own rewrite-loop scheduling into the fan-out wait.
+            long fanOutBuildStart = System.nanoTime();
+            MultiSearchRequest legSearches = HybridFusionOrchestrator.buildLegMultiSearch(candidateScope, fanOutLegs, window);
+            timings.fanOutBuildNanos(System.nanoTime() - fanOutBuildStart);
+            long fanOutStart = System.nanoTime();
+            client.multiSearch(legSearches, ActionListener.wrap(multiSearchResponse -> {
+                timings.fanOutWaitNanos(System.nanoTime() - fanOutStart);
+                try {
+                    collectLegProfiles(multiSearchResponse);
+                    collectLegTimings(multiSearchResponse, timings);
+                    QueryBuilder fusedQuery = HybridFusionOrchestrator.buildFusedQuery(
+                        searchRequest.source(),
+                        multiSearchResponse,
+                        legs,
+                        fusionSpec,
+                        window,
+                        timings
+                    );
+                    // Hand the now-known window to the placeholders installed above. Mutates nothing the request holds:
+                    // the placeholders are already in it, and core rewrites them into the window on its next pass.
+                    if (Objects.nonNull(rescoreScope)) {
+                        rescoreScope.resolve(fusedQuery);
                     }
-                    // Whole-MultiSearch transport failure (cancellation, rejection, coordinator error) — not a per-leg
-                    // Item failure. Frame it as the user's hybrid/fused query rather than surfacing a bare multiSearch
-                    // error, but keep the underlying status: a cancellation, a rejection and a coordinator bug are three
-                    // different answers, and IllegalStateException collapses all of them to 500.
-                },
-                    e -> listener.onFailure(
-                        new OpenSearchStatusException(
-                            String.format(
-                                Locale.ROOT,
-                                "[%s] query [%s] failed to execute fused-mode sub-queries: %s",
-                                NAME,
-                                FUSION_FIELD.getPreferredName(),
-                                e.getMessage()
-                            ),
-                            ExceptionsHelper.status(e),
-                            e
-                        )
+                    fused.set(fusedQuery);
+                    // After the fused query is built, so the phases it measures are all closed. A leg failure throws above
+                    // and fails the request, so a published entry always describes a completed fusion.
+                    if (Objects.nonNull(fusionTimingConsumer)) {
+                        fusionTimingConsumer.accept(timings);
+                    }
+                    listener.onResponse(null);
+                } catch (Exception e) {
+                    listener.onFailure(e);
+                }
+                // Whole-MultiSearch transport failure (cancellation, rejection, coordinator error) — not a per-leg
+                // Item failure. Frame it as the user's hybrid/fused query rather than surfacing a bare multiSearch
+                // error, but keep the underlying status: a cancellation, a rejection and a coordinator bug are three
+                // different answers, and IllegalStateException collapses all of them to 500.
+            },
+                e -> listener.onFailure(
+                    new OpenSearchStatusException(
+                        String.format(
+                            Locale.ROOT,
+                            "[%s] query [%s] failed to execute fused-mode sub-queries: %s",
+                            NAME,
+                            FUSION_FIELD.getPreferredName(),
+                            e.getMessage()
+                        ),
+                        ExceptionsHelper.status(e),
+                        e
                     )
                 )
-            )
-        );
+            ));
+        });
 
         HybridQueryBuilder marker = new HybridQueryBuilder();
         for (QueryBuilder query : queries) {
@@ -640,6 +688,43 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         marker.fusedSupplier = fused::get;
         marker.fusedRescoreScope = rescoreScope;
         return marker;
+    }
+
+    /**
+     * Hands each leg sub-search's profile trees to the merger, keyed by leg index. Does nothing unless the request asked
+     * to be profiled. A failed leg has no response and is skipped — the whole request fails on it anyway, in the
+     * {@code buildFusedQuery} call immediately below.
+     */
+    private void collectLegProfiles(final MultiSearchResponse multiSearchResponse) {
+        if (Objects.isNull(legProfileConsumer)) {
+            return;
+        }
+        MultiSearchResponse.Item[] items = multiSearchResponse.getResponses();
+        for (int legIndex = 0; legIndex < items.length; legIndex++) {
+            if (items[legIndex].isFailure()) {
+                continue;
+            }
+            legProfileConsumer.accept(legIndex, items[legIndex].getResponse().getProfileResults());
+        }
+    }
+
+    /**
+     * Records what each leg sub-search reported about itself into {@code timings}, for the {@code debug} section of the
+     * coordinator's profile entry.
+     *
+     * <p>Unconditional, unlike {@link #collectLegProfiles}: these are four values read off a response already in hand, not a
+     * profile tree the legs had to be asked to build, so there is nothing to gate. A failed leg is skipped for the same
+     * reason as above — it has no response, and the request fails on it in {@code buildFusedQuery} anyway.
+     */
+    private void collectLegTimings(final MultiSearchResponse multiSearchResponse, final FusedCoordinatorTimings timings) {
+        MultiSearchResponse.Item[] items = multiSearchResponse.getResponses();
+        for (int legIndex = 0; legIndex < items.length; legIndex++) {
+            if (items[legIndex].isFailure()) {
+                continue;
+            }
+            SearchResponse legResponse = items[legIndex].getResponse();
+            timings.addLeg(legIndex, legResponse.getTook().millis(), legResponse.getHits().getHits().length, legResponse.isTimedOut());
+        }
     }
 
     /**
@@ -1064,6 +1149,9 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         copy.paginationDepth(paginationDepth);
         copy.fusion(fusion);
         copy.resolvedFusionSpec = resolved;
+        // Neither profiling consumer is copied. This copy is a leg of an enclosing fused hybrid, and a leg sub-search
+        // re-enters the ActionFilter, which attaches consumers of its own — carrying these over would publish the same
+        // trees and the same coordinator entry twice, once under each merger.
         return copy;
     }
 

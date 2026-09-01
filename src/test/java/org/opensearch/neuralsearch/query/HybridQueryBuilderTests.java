@@ -918,6 +918,14 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
      * {@code _index} plus {@code _id} and rejects a hit that carries no index.
      */
     private org.opensearch.action.search.MultiSearchResponse.Item legItem(Map<String, Float> idToScore) {
+        return legItem(idToScore, null);
+    }
+
+    /** The same, carrying a profile section, as a leg run with {@code profile: true} does. */
+    private org.opensearch.action.search.MultiSearchResponse.Item legItem(
+        Map<String, Float> idToScore,
+        org.opensearch.search.profile.SearchProfileShardResults profile
+    ) {
         org.opensearch.search.SearchHit[] hits = new org.opensearch.search.SearchHit[idToScore.size()];
         int i = 0;
         for (Map.Entry<String, Float> e : idToScore.entrySet()) {
@@ -944,7 +952,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
             null,
             false,
             false,
-            null,
+            profile,
             0
         );
         org.opensearch.action.search.SearchResponse response = new org.opensearch.action.search.SearchResponse(
@@ -1006,6 +1014,235 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         // Round 2: rewriting the marker now yields the self-erased fused query.
         QueryBuilder fused = marker.rewrite(ctx);
         assertTrue("round 2 returns the fused HybridFusionQueryBuilder", fused instanceof HybridFusionQueryBuilder);
+    }
+
+    /**
+     * With a leg-profile consumer attached, the fan-out has to do two things the unprofiled path does not: run each leg
+     * with {@code profile: true}, and hand each leg's tree over keyed by that leg's own index.
+     */
+    @SneakyThrows
+    public void testDoRewriteFused_whenLegProfileConsumerAttached_thenLegsRunProfiledAndPublishTheirTrees() {
+        initClusterUtilWithMaxResultWindow(10000);
+        HybridQueryBuilder builder = fusedBuilder(
+            new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"), "combination", Map.of("technique", "arithmetic_mean")))
+        );
+        Map<Integer, Map<String, org.opensearch.search.profile.ProfileShardResult>> published = new HashMap<>();
+        builder.legProfileConsumer(published::put);
+        QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+
+        java.util.concurrent.atomic.AtomicReference<
+            java.util.function.BiConsumer<org.opensearch.transport.client.Client, org.opensearch.core.action.ActionListener<?>>> captured =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        doAnswer(invocation -> {
+            captured.set(invocation.getArgument(0));
+            return null;
+        }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+
+        builder.doRewrite(ctx);
+
+        org.opensearch.transport.client.Client client = mock(org.opensearch.transport.client.Client.class);
+        org.opensearch.action.search.MultiSearchResponse msResponse = new org.opensearch.action.search.MultiSearchResponse(
+            new org.opensearch.action.search.MultiSearchResponse.Item[] {
+                legItem(Map.of("1", 0.9f, "2", 0.5f), legProfile("leg-0-node")),
+                legItem(Map.of("2", 0.8f, "3", 0.4f), legProfile("leg-1-node")) },
+            10L
+        );
+        java.util.concurrent.atomic.AtomicReference<org.opensearch.action.search.MultiSearchRequest> legRequests =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        doAnswer(invocation -> {
+            legRequests.set(invocation.getArgument(0));
+            org.opensearch.core.action.ActionListener<org.opensearch.action.search.MultiSearchResponse> l = invocation.getArgument(1);
+            l.onResponse(msResponse);
+            return null;
+        }).when(client).multiSearch(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+
+        java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean();
+        captured.get().accept(client, org.opensearch.core.action.ActionListener.wrap(r -> done.set(true), e -> fail(e.getMessage())));
+        assertTrue("async action should complete", done.get());
+
+        for (SearchRequest legRequest : legRequests.get().requests()) {
+            assertTrue("a leg has to run profiled for there to be a tree to publish", legRequest.source().profile());
+        }
+        assertEquals("every leg that answered publishes, keyed by its own index", Set.of(0, 1), published.keySet());
+        assertEquals(Set.of("leg-0-node"), published.get(0).keySet());
+        assertEquals(Set.of("leg-1-node"), published.get(1).keySet());
+    }
+
+    /**
+     * A leg that failed has no response to read a tree off, so it publishes nothing. The request fails on it regardless,
+     * in the {@code buildFusedQuery} call right after — the skip is there so collecting profiles is not what fails it.
+     */
+    @SneakyThrows
+    public void testDoRewriteFused_whenALegFails_thenOnlyTheLegsThatAnsweredPublish() {
+        initClusterUtilWithMaxResultWindow(10000);
+        HybridQueryBuilder builder = fusedBuilder(new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"))));
+        Map<Integer, Map<String, org.opensearch.search.profile.ProfileShardResult>> published = new HashMap<>();
+        builder.legProfileConsumer(published::put);
+        QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+
+        java.util.concurrent.atomic.AtomicReference<
+            java.util.function.BiConsumer<org.opensearch.transport.client.Client, org.opensearch.core.action.ActionListener<?>>> captured =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        doAnswer(invocation -> {
+            captured.set(invocation.getArgument(0));
+            return null;
+        }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+
+        builder.doRewrite(ctx);
+
+        org.opensearch.transport.client.Client client = mock(org.opensearch.transport.client.Client.class);
+        org.opensearch.action.search.MultiSearchResponse msResponse = new org.opensearch.action.search.MultiSearchResponse(
+            new org.opensearch.action.search.MultiSearchResponse.Item[] {
+                legItem(Map.of("1", 0.9f), legProfile("leg-0-node")),
+                new org.opensearch.action.search.MultiSearchResponse.Item(null, new IllegalStateException("leg is down")) },
+            10L
+        );
+        doAnswer(invocation -> {
+            org.opensearch.core.action.ActionListener<org.opensearch.action.search.MultiSearchResponse> l = invocation.getArgument(1);
+            l.onResponse(msResponse);
+            return null;
+        }).when(client).multiSearch(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+
+        java.util.concurrent.atomic.AtomicReference<Exception> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        captured.get()
+            .accept(client, org.opensearch.core.action.ActionListener.wrap(r -> fail("a failed leg must fail the request"), failure::set));
+
+        assertNotNull("the request fails on the failed leg", failure.get());
+        assertEquals("the failed leg publishes nothing", Set.of(0), published.keySet());
+    }
+
+    /**
+     * The coordinator's own spans, published once the fused query is built. This is the only account of the fan-out and the
+     * fusion: core creates the request's {@code SearchTimeProvider} before the rewrite, so the work is inside {@code took}
+     * but inside no {@code phase_took} phase and on no shard.
+     */
+    @SneakyThrows
+    public void testDoRewriteFused_whenFusionTimingConsumerAttached_thenCoordinatorSpansArePublished() {
+        initClusterUtilWithMaxResultWindow(10000);
+        HybridQueryBuilder builder = fusedBuilder(
+            new HashMap<>(
+                Map.of(
+                    "normalization",
+                    Map.of("technique", "min_max"),
+                    "combination",
+                    Map.of("technique", "arithmetic_mean"),
+                    "window_size",
+                    7
+                )
+            )
+        );
+        java.util.concurrent.atomic.AtomicReference<org.opensearch.neuralsearch.search.profile.FusedCoordinatorTimings> published =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        builder.fusionTimingConsumer(published::set);
+        QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+
+        java.util.concurrent.atomic.AtomicReference<
+            java.util.function.BiConsumer<org.opensearch.transport.client.Client, org.opensearch.core.action.ActionListener<?>>> captured =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        doAnswer(invocation -> {
+            captured.set(invocation.getArgument(0));
+            return null;
+        }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+
+        builder.doRewrite(ctx);
+
+        org.opensearch.transport.client.Client client = mock(org.opensearch.transport.client.Client.class);
+        org.opensearch.action.search.MultiSearchResponse msResponse = new org.opensearch.action.search.MultiSearchResponse(
+            new org.opensearch.action.search.MultiSearchResponse.Item[] {
+                legItem(Map.of("1", 0.9f, "2", 0.5f)),
+                legItem(Map.of("2", 0.8f, "3", 0.4f)) },
+            10L
+        );
+        doAnswer(invocation -> {
+            org.opensearch.core.action.ActionListener<org.opensearch.action.search.MultiSearchResponse> l = invocation.getArgument(1);
+            l.onResponse(msResponse);
+            return null;
+        }).when(client).multiSearch(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+
+        java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean();
+        captured.get().accept(client, org.opensearch.core.action.ActionListener.wrap(r -> done.set(true), e -> fail(e.getMessage())));
+        assertTrue("async action should complete", done.get());
+
+        org.opensearch.neuralsearch.search.profile.FusedCoordinatorTimings timings = published.get();
+        assertNotNull("the coordinator's spans have to reach the merger for the entry to exist", timings);
+        assertEquals("the window the legs were asked for", 7, timings.windowSize());
+        assertEquals("three distinct ids survive fusion of {1,2} and {2,3}", 3, timings.rankedDocs());
+        assertTrue("a request that does not cap track_total_hits needs the Tail", timings.tailBuilt());
+        assertEquals("min_max", timings.normalizationTechnique());
+        assertEquals("arithmetic_mean", timings.combinationTechnique());
+        assertEquals(
+            "one debug entry per leg that answered",
+            List.of(
+                Map.of("leg", 0, "took_in_millis", 10L, "hits", 2, "timed_out", false),
+                Map.of("leg", 1, "took_in_millis", 10L, "hits", 2, "timed_out", false)
+            ),
+            timings.legs()
+        );
+        // Wall-clock spans, so only their shape is assertable: every phase is closed (measured, hence positive) and the
+        // subtotals are the sums the profile entry reports as the collector time and the node time.
+        assertTrue("the fan-out build is measured", timings.fanOutBuildNanos() > 0);
+        assertTrue("the fan-out wait is measured", timings.fanOutWaitNanos() > 0);
+        assertTrue("the substitute build is measured", timings.substituteBuildNanos() > 0);
+        assertEquals(
+            timings.windowMergeNanos() + timings.fuseScoresNanos() + timings.rankWindowNanos() + timings.substituteBuildNanos(),
+            timings.fusionNanos()
+        );
+        assertEquals(timings.fanOutBuildNanos() + timings.fanOutWaitNanos() + timings.fusionNanos(), timings.totalNanos());
+    }
+
+    /**
+     * A failed leg fails the request in {@code buildFusedQuery}, before the timings are published — so the profile never
+     * carries a coordinator entry describing a fusion that did not finish.
+     */
+    @SneakyThrows
+    public void testDoRewriteFused_whenALegFails_thenNoCoordinatorSpansArePublished() {
+        initClusterUtilWithMaxResultWindow(10000);
+        HybridQueryBuilder builder = fusedBuilder(new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"))));
+        java.util.concurrent.atomic.AtomicReference<org.opensearch.neuralsearch.search.profile.FusedCoordinatorTimings> published =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        builder.fusionTimingConsumer(published::set);
+        QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+
+        java.util.concurrent.atomic.AtomicReference<
+            java.util.function.BiConsumer<org.opensearch.transport.client.Client, org.opensearch.core.action.ActionListener<?>>> captured =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        doAnswer(invocation -> {
+            captured.set(invocation.getArgument(0));
+            return null;
+        }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+
+        builder.doRewrite(ctx);
+
+        org.opensearch.transport.client.Client client = mock(org.opensearch.transport.client.Client.class);
+        org.opensearch.action.search.MultiSearchResponse msResponse = new org.opensearch.action.search.MultiSearchResponse(
+            new org.opensearch.action.search.MultiSearchResponse.Item[] {
+                legItem(Map.of("1", 0.9f)),
+                new org.opensearch.action.search.MultiSearchResponse.Item(null, new IllegalStateException("leg is down")) },
+            10L
+        );
+        doAnswer(invocation -> {
+            org.opensearch.core.action.ActionListener<org.opensearch.action.search.MultiSearchResponse> l = invocation.getArgument(1);
+            l.onResponse(msResponse);
+            return null;
+        }).when(client).multiSearch(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+
+        java.util.concurrent.atomic.AtomicReference<Exception> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        captured.get()
+            .accept(client, org.opensearch.core.action.ActionListener.wrap(r -> fail("a failed leg must fail the request"), failure::set));
+
+        assertNotNull("the request fails on the failed leg", failure.get());
+        assertNull("and publishes no coordinator entry", published.get());
+    }
+
+    /** A one-entry profile section keyed by the given shard key, enough to tell one leg's tree from another's. */
+    private org.opensearch.search.profile.SearchProfileShardResults legProfile(final String shardKey) {
+        org.opensearch.search.profile.ProfileShardResult shardResult = new org.opensearch.search.profile.ProfileShardResult(
+            List.of(),
+            new org.opensearch.search.profile.aggregation.AggregationProfileShardResult(List.of()),
+            new org.opensearch.search.profile.fetch.FetchProfileShardResult(List.of()),
+            new org.opensearch.search.profile.NetworkTime(0, 0)
+        );
+        return new org.opensearch.search.profile.SearchProfileShardResults(Map.of(shardKey, shardResult));
     }
 
     @SneakyThrows
