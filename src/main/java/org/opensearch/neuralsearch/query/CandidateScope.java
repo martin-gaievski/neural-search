@@ -290,11 +290,12 @@ final class CandidateScope {
             table,
             SEARCH_SOURCE,
             "explain",
-            Disposition.NOT_PROPAGATED,
-            "round 2 explains the self-erased query, where a matching Top clause is a childless constant_score carrying "
-                + "the fused score — the right number with no breakdown under it. Normalization and combination run on "
-                + "the coordinator, so assembling the full tree is a response-side concern, exactly as it is for classic "
-                + "hybrid. Tracked as a fused-mode parity follow-up"
+            Disposition.OVERRIDDEN,
+            "a leg runs explained only when the fused rewrite has somewhere to keep its explanations, never by "
+                + "inheriting the outer flag. That somewhere is FusedDocExplanations, which FusedExplanationMerger "
+                + "rebuilds onto the response (see enableLegExplain). It has to be the legs that explain: round 2 "
+                + "explains the self-erased query, where a matching Top clause is a childless constant_score, and "
+                + "normalization and combination ran on the coordinator"
         );
         put(table, SEARCH_SOURCE, "version", Disposition.NOT_PROPAGATED, "fetch-phase metadata; a leg fetches nothing but ids");
         put(table, SEARCH_SOURCE, "seqNoAndPrimaryTerm", Disposition.NOT_PROPAGATED, "as version");
@@ -368,6 +369,13 @@ final class CandidateScope {
      * {@code profile} flag, not a field inherited from it.
      */
     private boolean legProfiling;
+
+    /**
+     * When set, every leg sub-search runs with {@code explain: true} so the raw score each leg contributed can be
+     * described in the user's response. As {@link #legProfiling}: not part of the captured scope, and decided by the fused
+     * rewrite from the outer request's {@code explain} flag rather than inherited from it.
+     */
+    private boolean legExplain;
 
     private CandidateScope(final SearchRequest request) {
         SearchSourceBuilder source = request.source();
@@ -496,6 +504,19 @@ final class CandidateScope {
     }
 
     /**
+     * Ask every leg built from here on to explain its hits, because the request asked to be explained and the rewrite has a
+     * {@code FusedDocExplanations} to keep the explanations in.
+     *
+     * <p>An explained leg pays explanation's own overhead — a second per-hit pass through the leg's weight — and, unlike
+     * profiling, that cost lands on the shards rather than only on the coordinator. It is bounded by the leg's window
+     * (explanations are produced during fetch, for the hits the leg returns, not for its whole match set), and it is the
+     * same cost classic hybrid pays for {@code explain} on the same sub-queries.
+     */
+    void enableLegExplain() {
+        this.legExplain = true;
+    }
+
+    /**
      * The single place a leg sub-search is constructed: the captured candidate scope, plus this leg's own query and the
      * candidate window. Every {@link Disposition#OVERRIDDEN} value is set here explicitly rather than inherited, so no
      * field of the outer request can reach a leg by accident. Legs are id-only (no {@code _source}) with totals disabled,
@@ -532,6 +553,9 @@ final class CandidateScope {
             .trackTotalHits(false);
         if (legProfiling) {
             legSource.profile(true);
+        }
+        if (legExplain) {
+            legSource.explain(true);
         }
         if (Objects.nonNull(timeout)) {
             legSource.timeout(timeout);

@@ -67,6 +67,8 @@ import org.opensearch.neuralsearch.fusion.ScalarNormalizer;
 import org.opensearch.neuralsearch.fusion.ScalarNormalizers;
 import org.opensearch.neuralsearch.processor.normalization.ScoreNormalizationFactory;
 import org.opensearch.neuralsearch.search.FusedLegTimeoutMerger;
+import org.opensearch.neuralsearch.search.explain.FusedDocExplanations;
+import org.opensearch.neuralsearch.search.explain.FusedExplanationMerger;
 import org.opensearch.neuralsearch.search.profile.FusedCoordinatorTimings;
 import org.opensearch.neuralsearch.search.profile.FusedLegProfileMerger;
 import org.opensearch.neuralsearch.stats.events.EventStatName;
@@ -169,6 +171,15 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      * absent from {@link #doEquals}/{@link #doHashCode}.
      */
     private FusedLegTimeoutMerger.LegTimeoutConsumer legTimeoutConsumer;
+
+    /**
+     * Where to publish the per-leg breakdown behind each fused score. The counterpart of {@link #legProfileConsumer} for
+     * {@code explain}: attached by {@code HybridQuerySearchRequestFilter} before the rewrite when the request asks to be
+     * explained, so the legs run explained and {@code FusedExplanationMerger} can rebuild the tree on the response.
+     * {@code null} — the normal case — means the legs run unexplained and round 2's own explanation stands. Never parsed,
+     * never serialized, absent from {@link #doEquals}/{@link #doHashCode}.
+     */
+    private FusedExplanationMerger.FusedExplanationConsumer fusedExplanationConsumer;
 
     public static final int MAX_NUMBER_OF_SUB_QUERIES = 5;
     private static final int LOWER_BOUND_OF_PAGINATION_DEPTH = 0;
@@ -625,12 +636,21 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             candidateScope.enableLegProfiling();
         }
 
+        // Same contract for explain: with a consumer attached the request asked to be explained, so the legs explain their
+        // hits and the fused breakdown replaces round 2's own explanation of the substituted query.
+        if (Objects.nonNull(fusedExplanationConsumer)) {
+            candidateScope.enableLegExplain();
+        }
+
         // Always measured, published only when something asked for it. The spans are a handful of nanoTime calls against a
         // fan-out that costs milliseconds, so gating the measurement would buy nothing and would make the profiled and
         // unprofiled code paths differ in more than what they report.
         FusedCoordinatorTimings timings = new FusedCoordinatorTimings().windowSize(window)
             .normalizationTechnique(fusionSpec.normalizationTechnique())
             .combinationTechnique(fusionSpec.combinationTechnique());
+        // Always constructed, for the same reason, but filled only when the legs actually explained — an unexplained
+        // request's legs return no explanations, so this stays empty and is discarded.
+        FusedDocExplanations explanations = new FusedDocExplanations();
 
         SetOnce<QueryBuilder> fused = new SetOnce<>();
         queryRewriteContext.registerAsyncAction((client, listener) -> {
@@ -658,7 +678,8 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                         legs,
                         fusionSpec,
                         window,
-                        timings
+                        timings,
+                        explanations
                     );
                     // Hand the now-known window to the placeholders installed above. Mutates nothing the request holds:
                     // the placeholders are already in it, and core rewrites them into the window on its next pass.
@@ -670,6 +691,10 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                     // and fails the request, so a published entry always describes a completed fusion.
                     if (Objects.nonNull(fusionTimingConsumer)) {
                         fusionTimingConsumer.accept(timings);
+                    }
+                    // Likewise published only once the window is final: what is described has to be what round 2 will rank.
+                    if (Objects.nonNull(fusedExplanationConsumer)) {
+                        fusedExplanationConsumer.accept(explanations);
                     }
                     listener.onResponse(null);
                 } catch (Exception e) {

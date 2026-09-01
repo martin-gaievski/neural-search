@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.TotalHits;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.OpenSearchStatusException;
@@ -34,6 +35,8 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.InnerHitBuilder;
 import org.opensearch.neuralsearch.processor.normalization.RRFScoreNormalizer;
+import org.opensearch.neuralsearch.search.explain.FusedDocExplanations;
+import org.opensearch.neuralsearch.search.profile.FusedCoordinatorTimings;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -105,6 +108,39 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         hit.score(score);
         hit.shard(new SearchShardTarget("node-1", new ShardId(new Index(index, index + "-uuid"), 0), null, OriginalIndices.NONE));
         return hit;
+    }
+
+    /**
+     * A leg that ran with {@code explain: true}: every hit carries the leg's own explanation of its raw score, which is
+     * what the fan-out records and the response side nests under the normalized value. Insertion-ordered so the recorded
+     * leg order is deterministic.
+     */
+    private MultiSearchResponse.Item explainedLegItem(LinkedHashMap<String, Float> idToScore) {
+        SearchHit[] hits = new SearchHit[idToScore.size()];
+        int i = 0;
+        for (Map.Entry<String, Float> e : idToScore.entrySet()) {
+            hits[i] = hitFrom(i, INDEX, e.getKey(), e.getValue());
+            hits[i].explanation(Explanation.match(e.getValue(), "leg raw score"));
+            i++;
+        }
+        return successfulItem(hits);
+    }
+
+    /**
+     * The fused score each Top clause carries, keyed by the {@code _id} it addresses — read off the query rather than
+     * assumed from the input, so an assertion about "the score round 2 ranks by" is about the query round 2 will run.
+     */
+    private Map<String, Float> fusedScoresById(QueryBuilder fused) {
+        Map<String, Float> byId = new LinkedHashMap<>();
+        for (QueryBuilder clause : ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().should()) {
+            ConstantScoreQueryBuilder top = (ConstantScoreQueryBuilder) clause;
+            for (QueryBuilder filter : ((BoolQueryBuilder) top.innerQuery()).filter()) {
+                if (filter instanceof IdsQueryBuilder ids) {
+                    byId.put(ids.ids().iterator().next(), top.boost());
+                }
+            }
+        }
+        return byId;
     }
 
     /**
@@ -694,6 +730,166 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(source, ms, legs, minMaxArithmetic(), 10);
 
         assertEquals("explain alone → no Tail", 0, ((HybridFusionQueryBuilder) fused).buildSelfErasedQuery().filter().size());
+    }
+
+    // ---- buildFusedQuery: the per-leg breakdown recorded for the request's `explain` ----
+
+    /**
+     * The contract of the recorded breakdown: one entry per document fusion ranked, one node per leg that matched it,
+     * that leg's own round-1 explanation kept under its normalized value, and a top value equal to the score round 2 will
+     * actually rank the document by. The last part is what makes the tree an account of the ranking rather than a
+     * plausible-looking set of numbers beside it.
+     */
+    public void testBuildFusedQuery_whenLegsRanExplained_thenEveryRankedDocumentIsRecorded() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(
+            explainedLegItem(new LinkedHashMap<>(Map.of("1", 0.9f))),
+            explainedLegItem(new LinkedHashMap<>(Map.of("1", 0.6f)))
+        );
+        FusedDocExplanations explanations = new FusedDocExplanations();
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(
+            new SearchSourceBuilder().trackTotalHits(false).explain(true),
+            ms,
+            legs,
+            minMaxArithmetic(),
+            10,
+            new FusedCoordinatorTimings(),
+            explanations
+        );
+
+        assertFalse("an explained fan-out records what it fused", explanations.isEmpty());
+        assertEquals(
+            "the wording is the combination technique's own",
+            "arithmetic_mean combination of:",
+            explanations.combinationDescription()
+        );
+        assertEquals("and the normalizer's own", "min_max normalization of:", explanations.normalizationDescription());
+
+        Explanation tree = explanations.explain(FusedDocExplanations.documentKey(INDEX, "1"), Float.NaN);
+        assertNotNull("the one ranked document is described", tree);
+        assertEquals("one node per leg that matched", 2, tree.getDetails().length);
+        for (int leg = 0; leg < 2; leg++) {
+            Explanation legNode = tree.getDetails()[leg];
+            assertEquals("min_max normalization of:", legNode.getDescription());
+            assertEquals("the leg's own explanation is kept under its normalized value", 1, legNode.getDetails().length);
+            assertEquals("leg raw score", legNode.getDetails()[0].getDescription());
+        }
+        assertEquals(
+            "the described score is the one round 2 ranks by",
+            fusedScoresById(fused).get("1"),
+            tree.getValue().floatValue(),
+            0.0f
+        );
+    }
+
+    /**
+     * A leg that did not match a document contributes no node rather than a zero one — the same choice classic hybrid
+     * makes. A zero node would read as "this leg scored it at zero" when the leg never saw it.
+     */
+    public void testBuildFusedQuery_whenALegDidNotMatchADocument_thenOnlyTheMatchingLegsAreRecorded() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        // Only document 2 is in both legs; 1 is leg 0's alone and 3 is leg 1's alone.
+        MultiSearchResponse ms = multiSearch(
+            explainedLegItem(new LinkedHashMap<>(Map.of("1", 0.9f, "2", 0.5f))),
+            explainedLegItem(new LinkedHashMap<>(Map.of("2", 0.8f, "3", 0.4f)))
+        );
+        FusedDocExplanations explanations = new FusedDocExplanations();
+
+        HybridFusionOrchestrator.buildFusedQuery(
+            new SearchSourceBuilder().trackTotalHits(false).explain(true),
+            ms,
+            legs,
+            minMaxArithmetic(),
+            10,
+            new FusedCoordinatorTimings(),
+            explanations
+        );
+
+        assertEquals(
+            "the document both legs matched keeps both nodes",
+            2,
+            explanations.explain(FusedDocExplanations.documentKey(INDEX, "2"), Float.NaN).getDetails().length
+        );
+        assertEquals(
+            "a document only leg 0 matched gets one node, not two with a zero",
+            1,
+            explanations.explain(FusedDocExplanations.documentKey(INDEX, "1"), Float.NaN).getDetails().length
+        );
+        assertEquals(
+            "and likewise for one only the last leg matched",
+            1,
+            explanations.explain(FusedDocExplanations.documentKey(INDEX, "3"), Float.NaN).getDetails().length
+        );
+    }
+
+    /**
+     * Recording happens after the window cut, so what is described is exactly what round 2 will rank. A document the
+     * window dropped has no Top clause to carry a fused score, so describing it would name a ranking that never happened.
+     */
+    public void testBuildFusedQuery_whenTheWindowDroppedADocument_thenOnlyTheWindowIsRecorded() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"));
+        MultiSearchResponse ms = multiSearch(explainedLegItem(new LinkedHashMap<>(Map.of("1", 0.9f, "2", 0.5f, "3", 0.1f))));
+        FusedDocExplanations explanations = new FusedDocExplanations();
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(
+            new SearchSourceBuilder().trackTotalHits(false).explain(true),
+            ms,
+            legs,
+            minMaxArithmetic(),
+            1,
+            new FusedCoordinatorTimings(),
+            explanations
+        );
+
+        Map<String, Float> ranked = fusedScoresById(fused);
+        assertEquals("window=1 ranks one document", 1, ranked.size());
+        String rankedId = ranked.keySet().iterator().next();
+        assertNotNull(
+            "the ranked document is described",
+            explanations.explain(FusedDocExplanations.documentKey(INDEX, rankedId), Float.NaN)
+        );
+        for (String dropped : List.of("1", "2", "3")) {
+            if (dropped.equals(rankedId)) {
+                continue;
+            }
+            assertNull(
+                "a document the window dropped has no fused score to describe",
+                explanations.explain(FusedDocExplanations.documentKey(INDEX, dropped), Float.NaN)
+            );
+        }
+    }
+
+    /**
+     * The cost of the always-constructed collector on the path that never asks for it. An unexplained request's legs return
+     * hits with no explanation, so nothing is recorded and nothing about the fused query changes — which is what makes the
+     * explained and unexplained runs compute the same ranking rather than two code paths that agree by inspection.
+     */
+    public void testBuildFusedQuery_whenLegsRanUnexplained_thenNothingIsRecorded() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        SearchSourceBuilder source = new SearchSourceBuilder().trackTotalHits(false);
+        FusedDocExplanations explanations = new FusedDocExplanations();
+
+        QueryBuilder recorded = HybridFusionOrchestrator.buildFusedQuery(
+            source,
+            multiSearch(legItem(Map.of("1", 0.9f, "2", 0.5f)), legItem(Map.of("2", 0.8f))),
+            legs,
+            minMaxArithmetic(),
+            10,
+            new FusedCoordinatorTimings(),
+            explanations
+        );
+        QueryBuilder plain = HybridFusionOrchestrator.buildFusedQuery(
+            source,
+            multiSearch(legItem(Map.of("1", 0.9f, "2", 0.5f)), legItem(Map.of("2", 0.8f))),
+            legs,
+            minMaxArithmetic(),
+            10
+        );
+
+        assertTrue("legs that ran unexplained have nothing to record", explanations.isEmpty());
+        assertNull("so no document gets a tree", explanations.combinationDescription());
+        assertEquals("and the fused query is the one the overload without a collector builds", plain, recorded);
     }
 
     public void testBuildFusedQuery_profileDoesNotTriggerTail() {

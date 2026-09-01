@@ -26,6 +26,7 @@ import org.opensearch.core.action.ActionResponse;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilderVisitor;
 import org.opensearch.neuralsearch.query.HybridQueryBuilder;
+import org.opensearch.neuralsearch.search.explain.FusedExplanationMerger;
 import org.opensearch.neuralsearch.search.profile.FusedLegProfileMerger;
 import org.opensearch.neuralsearch.util.HybridQueryUtil;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -54,10 +55,10 @@ import lombok.extern.log4j.Log4j2;
  *
  * This filter works transparently without any pipeline or query configuration.
  *
- * The same seam carries fused mode's coordinator-side reporting — per-leg profiling and a leg cut short by a soft
- * {@code timeout}: a fused hybrid runs its legs as sub-searches during the coordinator rewrite, and this is the one place
- * that both sees the query as the user submitted it and still owns the response listener, so it can hand the legs somewhere
- * to publish what they know and merge it into the response on the way out. See {@link #attachFusedReporting}.
+ * The same seam carries fused mode's coordinator-side reporting — per-leg profiling, {@code explain}, and a leg cut short
+ * by a soft {@code timeout}: a fused hybrid runs its legs as sub-searches during the coordinator rewrite, and this is the
+ * one place that both sees the query as the user submitted it and still owns the response listener, so it can hand the legs
+ * somewhere to publish what they know and merge it into the response on the way out. See {@link #attachFusedReporting}.
  *
  */
 @Log4j2
@@ -121,18 +122,23 @@ public class HybridQuerySearchRequestFilter implements ActionFilter {
     /**
      * The response listener to proceed with: when a request carries at least one fused {@code hybrid} and there is something
      * for it to report, hand the relevant hybrids consumers writing into request-scoped mergers — the legs' profile trees,
-     * what the coordinator itself spent fanning them out and fusing them, and whether a soft {@code timeout} truncated a leg
-     * — and wrap the listener so what those mergers collected reaches the response. Otherwise the caller's own listener,
-     * unchanged.
+     * what the coordinator itself spent fanning them out and fusing them, the per-leg breakdown behind each fused score, and
+     * whether a soft {@code timeout} truncated a leg — and wrap the listener so what those mergers collected reaches the
+     * response. Otherwise the caller's own listener, unchanged.
      *
      * <p>No side channel is needed: the {@link HybridQueryBuilder} instances reachable from {@code source().query()} here
      * are the same instances rewrite round 1 runs on, so attaching to them directly is enough. Nothing happens when there is
      * nothing to report, and nothing happens to the response when nothing was ever collected.
      *
-     * <p>The two reports attach on different conditions, because they answer to different things:
+     * <p>The three reports attach on different conditions, because they answer to different things:
      * <ul>
      *   <li>{@code profile} — every fused hybrid the request fans out, since each gets its own labelled entry in the
      *       profile section.</li>
+     *   <li>{@code explain} — only when the fused hybrid <b>is</b> the request's top-level query, because a hit's
+     *       explanation is a single tree describing that hit's score: for a fused hybrid nested inside a container (or one of
+     *       several siblings) the fused score is an input to the enclosing query's own scoring, not the hit's score, and
+     *       replacing the tree would describe the wrong thing. Those requests keep core's own explanation, which correctly
+     *       describes the query round 2 ran.</li>
      *   <li>{@code timed_out} — every fused hybrid, and <b>not</b> conditional on the request having asked for a diagnostic:
      *       a leg the timeout truncated narrows the window every client's ranking comes out of, so it is part of the answer
      *       rather than part of the instrumentation. It is instead conditional on {@link #mayHitASoftTimeout}, so that a
@@ -140,7 +146,8 @@ public class HybridQuerySearchRequestFilter implements ActionFilter {
      * </ul>
      *
      * <p>This runs before search request processors do, so it reports the hybrids the request carries <b>as submitted, with
-     * {@code profile} and {@code timeout} as submitted</b>. A pipeline that replaces the query — or changes either — is
+     * {@code profile}, {@code explain} and {@code timeout} as submitted</b>. A pipeline that replaces the query — or changes
+     * any of them — is
      * outside that boundary: the request still answers correctly, it simply carries no fused detail.
      */
     @SuppressWarnings("unchecked")
@@ -158,7 +165,9 @@ public class HybridQuerySearchRequestFilter implements ActionFilter {
         }
         boolean profiled = source.profile();
         boolean mayTimeOut = mayHitASoftTimeout(source);
-        if (profiled == false && mayTimeOut == false) {
+        // explain() is a nullable Boolean on the source — unset means "not explained", so it cannot be unboxed.
+        boolean explained = Boolean.TRUE.equals(source.explain());
+        if (profiled == false && mayTimeOut == false && explained == false) {
             return listener;
         }
         FusedHybridFinder finder = new FusedHybridFinder();
@@ -189,8 +198,16 @@ public class HybridQuerySearchRequestFilter implements ActionFilter {
                 hybrid.legTimeoutConsumer(timeoutMerger.consumer());
             }
         }
+        FusedExplanationMerger explanationMerger = null;
+        // Identity, not instanceof: the finder stops at a fused hybrid, so a top-level one is necessarily the only one found,
+        // and the check is exactly "the hit's score is this hybrid's fused score".
+        if (explained && finder.found.get(0) == source.query()) {
+            explanationMerger = new FusedExplanationMerger();
+            finder.found.get(0).fusedExplanationConsumer(explanationMerger.consumer());
+        }
         final FusedLegProfileMerger profiles = legProfileMerger;
         final FusedLegTimeoutMerger timeouts = timeoutMerger;
+        final FusedExplanationMerger explanations = explanationMerger;
         return ActionListener.wrap(response -> {
             if ((response instanceof SearchResponse) == false) {
                 listener.onResponse(response);
@@ -206,6 +223,12 @@ public class HybridQuerySearchRequestFilter implements ActionFilter {
                 Objects.nonNull(profiles) ? profiles.mergedProfileResults(merged) : null,
                 merged.isTimedOut() || (Objects.nonNull(timeouts) && timeouts.anyLegTimedOut())
             );
+            // After the rebuild, not before: the explanation merger writes onto the hits the response carries, and the
+            // rebuild above may have replaced the response around them — so the explanations have to land on the one that is
+            // actually returned. It passes the SearchHits through by reference, so this reaches the same hit instances.
+            if (Objects.nonNull(explanations)) {
+                merged = explanations.getMergedResponse(merged);
+            }
             listener.onResponse((Response) merged);
         }, listener::onFailure);
     }

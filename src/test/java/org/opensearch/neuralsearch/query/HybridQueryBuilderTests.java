@@ -1013,6 +1013,15 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         return legItem(idToScore, null);
     }
 
+    /** The same, with every hit carrying the leg's own explanation, as a leg run with {@code explain: true} returns. */
+    private org.opensearch.action.search.MultiSearchResponse.Item explainedLegItem(Map<String, Float> idToScore) {
+        org.opensearch.action.search.MultiSearchResponse.Item item = legItem(idToScore, null);
+        for (org.opensearch.search.SearchHit hit : item.getResponse().getHits().getHits()) {
+            hit.explanation(org.apache.lucene.search.Explanation.match(hit.getScore(), "leg raw score"));
+        }
+        return item;
+    }
+
     /** The same, carrying a profile section, as a leg run with {@code profile: true} does. */
     private org.opensearch.action.search.MultiSearchResponse.Item legItem(
         Map<String, Float> idToScore,
@@ -1158,6 +1167,106 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         assertEquals("every leg that answered publishes, keyed by its own index", Set.of(0, 1), published.keySet());
         assertEquals(Set.of("leg-0-node"), published.get(0).keySet());
         assertEquals(Set.of("leg-1-node"), published.get(1).keySet());
+    }
+
+    /**
+     * The {@code explain} counterpart, and the same two obligations: with a consumer attached the legs have to run
+     * explained, and what the fan-out collected has to be published — but only once the fused query is built, since what
+     * the tree describes has to be what round 2 will rank.
+     */
+    @SneakyThrows
+    public void testDoRewriteFused_whenExplanationConsumerAttached_thenLegsRunExplainedAndPublishTheirBreakdowns() {
+        initClusterUtilWithMaxResultWindow(10000);
+        HybridQueryBuilder builder = fusedBuilder(
+            new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"), "combination", Map.of("technique", "arithmetic_mean")))
+        );
+        java.util.concurrent.atomic.AtomicReference<org.opensearch.neuralsearch.search.explain.FusedDocExplanations> published =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        builder.fusedExplanationConsumer(published::set);
+        QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+
+        java.util.concurrent.atomic.AtomicReference<
+            java.util.function.BiConsumer<org.opensearch.transport.client.Client, org.opensearch.core.action.ActionListener<?>>> captured =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        doAnswer(invocation -> {
+            captured.set(invocation.getArgument(0));
+            return null;
+        }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+
+        builder.doRewrite(ctx);
+
+        org.opensearch.transport.client.Client client = mock(org.opensearch.transport.client.Client.class);
+        org.opensearch.action.search.MultiSearchResponse msResponse = new org.opensearch.action.search.MultiSearchResponse(
+            new org.opensearch.action.search.MultiSearchResponse.Item[] {
+                explainedLegItem(Map.of("1", 0.9f, "2", 0.5f)),
+                explainedLegItem(Map.of("2", 0.8f, "3", 0.4f)) },
+            10L
+        );
+        java.util.concurrent.atomic.AtomicReference<org.opensearch.action.search.MultiSearchRequest> legRequests =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        doAnswer(invocation -> {
+            legRequests.set(invocation.getArgument(0));
+            org.opensearch.core.action.ActionListener<org.opensearch.action.search.MultiSearchResponse> l = invocation.getArgument(1);
+            l.onResponse(msResponse);
+            return null;
+        }).when(client).multiSearch(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+
+        java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean();
+        captured.get().accept(client, org.opensearch.core.action.ActionListener.wrap(r -> done.set(true), e -> fail(e.getMessage())));
+        assertTrue("async action should complete", done.get());
+
+        for (SearchRequest legRequest : legRequests.get().requests()) {
+            assertEquals("a leg has to run explained for there to be a breakdown to publish", Boolean.TRUE, legRequest.source().explain());
+        }
+        assertNotNull("the collector is published once the window is final", published.get());
+        assertFalse(published.get().isEmpty());
+        assertNotNull(
+            "and it describes a document the legs actually ranked",
+            published.get()
+                .explain(org.opensearch.neuralsearch.search.explain.FusedDocExplanations.documentKey("test-index", "2"), Float.NaN)
+        );
+    }
+
+    /**
+     * With no consumer attached — every request that did not ask to be explained — the legs stay unexplained and nothing is
+     * published, so the collector the rewrite always constructs is simply discarded.
+     */
+    @SneakyThrows
+    public void testDoRewriteFused_whenNoExplanationConsumerAttached_thenLegsRunUnexplained() {
+        initClusterUtilWithMaxResultWindow(10000);
+        HybridQueryBuilder builder = fusedBuilder(new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"))));
+        QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+
+        java.util.concurrent.atomic.AtomicReference<
+            java.util.function.BiConsumer<org.opensearch.transport.client.Client, org.opensearch.core.action.ActionListener<?>>> captured =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        doAnswer(invocation -> {
+            captured.set(invocation.getArgument(0));
+            return null;
+        }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+
+        builder.doRewrite(ctx);
+
+        org.opensearch.transport.client.Client client = mock(org.opensearch.transport.client.Client.class);
+        java.util.concurrent.atomic.AtomicReference<org.opensearch.action.search.MultiSearchRequest> legRequests =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        doAnswer(invocation -> {
+            legRequests.set(invocation.getArgument(0));
+            org.opensearch.core.action.ActionListener<org.opensearch.action.search.MultiSearchResponse> l = invocation.getArgument(1);
+            l.onResponse(
+                new org.opensearch.action.search.MultiSearchResponse(
+                    new org.opensearch.action.search.MultiSearchResponse.Item[] { legItem(Map.of("1", 0.9f)), legItem(Map.of("2", 0.8f)) },
+                    10L
+                )
+            );
+            return null;
+        }).when(client).multiSearch(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+
+        java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean();
+        captured.get().accept(client, org.opensearch.core.action.ActionListener.wrap(r -> done.set(true), e -> fail(e.getMessage())));
+
+        assertTrue(done.get());
+        assertNull("no consumer, so no leg pays explanation's per-hit cost", legRequests.get().requests().get(0).source().explain());
     }
 
     /**

@@ -14,6 +14,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 
+import org.apache.lucene.search.Explanation;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.OpenSearchStatusException;
 import org.opensearch.action.search.MultiSearchRequest;
@@ -37,6 +38,8 @@ import org.opensearch.neuralsearch.processor.normalization.RRFScoreNormalizer;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationFactory;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationTechnique;
 import org.opensearch.neuralsearch.processor.combination.ScoreCombinationUtil;
+import org.opensearch.neuralsearch.processor.explain.ExplainableTechnique;
+import org.opensearch.neuralsearch.search.explain.FusedDocExplanations;
 import org.opensearch.neuralsearch.search.profile.FusedCoordinatorTimings;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -66,8 +69,6 @@ import lombok.NoArgsConstructor;
 final class HybridFusionOrchestrator {
 
     private static final ScoreCombinationFactory SCORE_COMBINATION_FACTORY = new ScoreCombinationFactory();
-    /** Separator for the composite _index+_id fusion key. Never parsed back — see computeRankedDocs. */
-    private static final String KEY_SEPARATOR = "#";
     /** The {@code _name} key as it appears in a rendered query — see {@link #anyLegNamed}. */
     private static final String QUERY_NAME_KEY = String.format(Locale.ROOT, "\"%s\":", AbstractQueryBuilder.NAME_FIELD.getPreferredName());
 
@@ -161,14 +162,23 @@ final class HybridFusionOrchestrator {
         FusionSpec fusion,
         int windowSize
     ) {
-        return buildFusedQuery(source, multiSearchResponse, legs, fusion, windowSize, new FusedCoordinatorTimings());
+        return buildFusedQuery(
+            source,
+            multiSearchResponse,
+            legs,
+            fusion,
+            windowSize,
+            new FusedCoordinatorTimings(),
+            new FusedDocExplanations()
+        );
     }
 
     /**
-     * As above, recording each fusion phase's span into {@code timings} for the coordinator profile entry. The timings
-     * instance is always present — never null-checked here — so that instrumentation costs the same handful of
-     * {@code nanoTime} calls whether or not the request asked to be profiled, and an unprofiled request simply discards
-     * what was measured. Phase boundaries are the method boundaries below, so a span is never attributed to two phases.
+     * As above, recording each fusion phase's span into {@code timings} for the coordinator profile entry and each window
+     * document's per-leg breakdown into {@code explanations} for the request's {@code explain}. Both instances are always
+     * present — never null-checked here — so that instrumentation costs the same handful of {@code nanoTime} calls whether
+     * or not the request asked to be profiled, and a request that asked for neither simply discards what was collected.
+     * Phase boundaries are the method boundaries below, so a span is never attributed to two phases.
      */
     static QueryBuilder buildFusedQuery(
         SearchSourceBuilder source,
@@ -176,13 +186,14 @@ final class HybridFusionOrchestrator {
         List<QueryBuilder> legs,
         FusionSpec fusion,
         int windowSize,
-        FusedCoordinatorTimings timings
+        FusedCoordinatorTimings timings,
+        FusedDocExplanations explanations
     ) {
         MultiSearchResponse.Item[] items = multiSearchResponse.getResponses();
         long windowMergeStart = System.nanoTime();
         SearchHit[][] legHits = groupLegHits(items, legs.size());
         timings.windowMergeNanos(System.nanoTime() - windowMergeStart);
-        RankedDocs ranked = computeRankedDocs(legHits, fusion, windowSize, timings);
+        RankedDocs ranked = computeRankedDocs(legHits, fusion, windowSize, timings, explanations);
         timings.rankedDocs(ranked.ids().length);
         if (ranked.ids().length == 0) {
             return new MatchNoneQueryBuilder();
@@ -314,18 +325,32 @@ final class HybridFusionOrchestrator {
      * may itself contain the separator, so the original identity is carried in a side map instead. To fusion and to every
      * normalizer the key stays opaque.
      */
-    private static RankedDocs computeRankedDocs(SearchHit[][] legHits, FusionSpec fusion, int windowSize, FusedCoordinatorTimings timings) {
+    private static RankedDocs computeRankedDocs(
+        SearchHit[][] legHits,
+        FusionSpec fusion,
+        int windowSize,
+        FusedCoordinatorTimings timings,
+        FusedDocExplanations explanations
+    ) {
         long fuseScoresStart = System.nanoTime();
         List<Map<String, Float>> legRawScores = new ArrayList<>(legHits.length);
+        // Parallel to legRawScores: the leg's own explanation of each hit's raw score, present only when the request asked
+        // to be explained (an unexplained leg carries none, so these stay empty and nothing is recorded below).
+        List<Map<String, Explanation>> legExplanations = new ArrayList<>(legHits.length);
         Map<String, SearchHit> identityByKey = new HashMap<>();
         for (SearchHit[] hits : legHits) {
             Map<String, Float> byKey = new LinkedHashMap<>();
+            Map<String, Explanation> explanationByKey = new HashMap<>();
             for (SearchHit hit : hits) {
                 String key = documentKey(hit);
                 byKey.put(key, hit.getScore());
+                if (Objects.nonNull(hit.getExplanation())) {
+                    explanationByKey.put(key, hit.getExplanation());
+                }
                 identityByKey.putIfAbsent(key, hit);
             }
             legRawScores.add(byKey);
+            legExplanations.add(explanationByKey);
         }
         ScoreCombinationTechnique combination = SCORE_COMBINATION_FACTORY.createCombination(
             fusion.combinationTechnique(),
@@ -335,12 +360,55 @@ final class HybridFusionOrchestrator {
         // ScalarNormalizers — no change here, rank-based rrf included. The caller already rejected out-of-scope
         // techniques at rewrite.
         ScalarNormalizer normalizer = ScalarNormalizers.forTechnique(fusion.normalizationTechnique(), normalizerParams(fusion));
-        Map<String, Float> combined = CoordinatorScoreFusion.fuse(legRawScores, normalizer, combination);
+        CoordinatorScoreFusion.FusionResult fused = CoordinatorScoreFusion.fuseDetailed(legRawScores, normalizer, combination);
         timings.fuseScoresNanos(System.nanoTime() - fuseScoresStart);
         long rankWindowStart = System.nanoTime();
-        RankedDocs ranked = toRankedDocs(combined, identityByKey, windowSize);
+        RankedDocs ranked = toRankedDocs(fused.fused(), identityByKey, windowSize);
         timings.rankWindowNanos(System.nanoTime() - rankWindowStart);
+        recordExplanations(explanations, ranked, fused, legExplanations, combination, normalizer);
         return ranked;
+    }
+
+    /**
+     * Record how each document in the window earned its fused score, for the request's {@code explain}. Runs after the
+     * window cut so only documents round 2 will actually rank are described, and is skipped entirely when no leg returned
+     * an explanation — which is every unexplained request, since a leg only explains when {@link CandidateScope} asked it
+     * to.
+     *
+     * <p>The descriptions are taken from the same two sources classic hybrid renders from — the combination technique's own
+     * {@link ExplainableTechnique#describe()} and the normalization technique's name — so an identical hit set produces
+     * identical wording on both paths. Classic's trailing {@code min_score} suffix has no counterpart here: fused mode does
+     * not propagate {@code min_score} to the legs, so there is no value to name.
+     */
+    private static void recordExplanations(
+        final FusedDocExplanations explanations,
+        final RankedDocs ranked,
+        final CoordinatorScoreFusion.FusionResult fused,
+        final List<Map<String, Explanation>> legExplanations,
+        final ScoreCombinationTechnique combination,
+        final ScalarNormalizer normalizer
+    ) {
+        if (legExplanations.stream().allMatch(Map::isEmpty)) {
+            return;
+        }
+        // Same format strings as classic: ScoreCombiner#explainByShard and ExplanationUtils#getDocIdAtQueryForNormalization.
+        explanations.combinationDescription(
+            String.format(Locale.ROOT, "%s combination of:", ((ExplainableTechnique) combination).describe())
+        ).normalizationDescription(String.format(Locale.ROOT, "%s normalization of:", normalizer.techniqueName()));
+        List<Map<String, Float>> legNormalizedScores = fused.legNormalizedScores();
+        for (int doc = 0; doc < ranked.ids().length; doc++) {
+            String key = FusedDocExplanations.documentKey(ranked.indices()[doc], ranked.ids()[doc]);
+            List<FusedDocExplanations.LegContribution> contributions = new ArrayList<>(legNormalizedScores.size());
+            for (int leg = 0; leg < legNormalizedScores.size(); leg++) {
+                Float normalizedScore = legNormalizedScores.get(leg).get(key);
+                if (Objects.isNull(normalizedScore)) {
+                    // The leg did not match this document. Classic renders no node for it either.
+                    continue;
+                }
+                contributions.add(new FusedDocExplanations.LegContribution(leg, normalizedScore, legExplanations.get(leg).get(key)));
+            }
+            explanations.addDocument(key, ranked.scores()[doc], contributions);
+        }
     }
 
     /**
@@ -358,7 +426,8 @@ final class HybridFusionOrchestrator {
      * is a limitation of how documents are addressed, not of how they are keyed.
      */
     private static String documentKey(SearchHit hit) {
-        return hit.getIndex() + KEY_SEPARATOR + hit.getId();
+        // Delegated so the rewrite and the response-side explanation attach build the same key from one definition.
+        return FusedDocExplanations.documentKey(hit.getIndex(), hit.getId());
     }
 
     /**
@@ -666,8 +735,8 @@ final class HybridFusionOrchestrator {
      *   <li>{@code explain} — the Tail cannot recover a fused explanation: the fused score is arithmetic the coordinator
      *       already did, and the clause carrying it into round 2 is a childless {@code constant_score} with nothing to
      *       descend into (the Tail explains as a non-scoring filter either way). Describing the fusion belongs on the
-     *       response side, where classic hybrid puts it too — tracked as a fused-mode parity follow-up, see
-     *       {@link CandidateScope.Disposition#NOT_PROPAGATED}.</li>
+     *       response side, where classic hybrid puts it too — the legs explain in round 1 and the fused tree is assembled
+     *       from those explanations on the response (see {@code FusedExplanationMerger}).</li>
      *   <li>{@code profile} — the legs report their own trees from round 1, where they execute as the queries the user
      *       wrote, each merged into the response under its own shard entry (see {@code FusedLegProfileMerger}); the
      *       response's own entry covers round 2, and a synthesized {@code [coordinator]} entry covers the fan-out and the
