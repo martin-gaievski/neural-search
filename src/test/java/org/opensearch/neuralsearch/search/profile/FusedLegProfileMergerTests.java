@@ -4,7 +4,9 @@
  */
 package org.opensearch.neuralsearch.search.profile;
 
+import java.lang.reflect.Constructor;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -13,10 +15,12 @@ import java.util.Set;
 import org.apache.lucene.search.TotalHits;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.ShardSearchFailure;
+import org.opensearch.neuralsearch.query.ext.RerankSearchExtBuilder;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.internal.InternalSearchResponse;
+import org.opensearch.search.pipeline.ProcessorExecutionDetail;
 import org.opensearch.search.profile.NetworkTime;
 import org.opensearch.search.profile.ProfileResult;
 import org.opensearch.search.profile.ProfileShardResult;
@@ -25,6 +29,7 @@ import org.opensearch.search.profile.aggregation.AggregationProfileShardResult;
 import org.opensearch.search.profile.fetch.FetchProfileShardResult;
 import org.opensearch.search.profile.query.CollectorResult;
 import org.opensearch.search.profile.query.QueryProfileShardResult;
+import org.opensearch.search.suggest.Suggest;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -147,47 +152,119 @@ public class FusedLegProfileMergerTests extends OpenSearchTestCase {
 
     /**
      * Merging rebuilds the response around a new profile section, which means every other section is copied by hand. A
-     * field dropped there would silently change an answer the search already got right, so pin them all.
+     * field dropped there would silently change an answer the search already got right, so pin every one of them — built
+     * through the widest constructors, with a distinct non-default value each, so that dropping any single one fails here.
      */
     public void testGetMergedResponse_whenRebuilt_thenEverySectionOutsideTheProfileIsPreserved() {
         FusedLegProfileMerger merger = new FusedLegProfileMerger();
         merger.forHybrid("hybrid_0").accept(0, Map.of(SHARD_KEY, shardResult(1)));
 
-        SearchHits hits = new SearchHits(new SearchHit[] { new SearchHit(1) }, new TotalHits(42L, TotalHits.Relation.EQUAL_TO), 1.5f);
-        InternalSearchResponse sections = new InternalSearchResponse(
-            hits,
-            InternalAggregations.EMPTY,
-            null,
-            new SearchProfileShardResults(Map.of(SHARD_KEY, shardResult(1))),
-            true,
-            true,
-            3
-        );
-        SearchResponse response = new SearchResponse(
-            sections,
-            "scroll-id",
-            5,
-            4,
-            1,
-            17L,
-            ShardSearchFailure.EMPTY_ARRAY,
-            SearchResponse.Clusters.EMPTY
-        );
-
+        SearchResponse response = responseWithEverything("scroll-id", null);
         SearchResponse merged = merger.getMergedResponse(response);
 
-        assertEquals("hits are the answer and must survive verbatim", 42L, merged.getHits().getTotalHits().value());
+        // SearchResponseSections, all of it but the profile results the merge exists to replace
+        assertSame("hits are the answer and must survive verbatim", response.getHits(), merged.getHits());
+        assertEquals(42L, merged.getHits().getTotalHits().value());
         assertEquals(1.5f, merged.getHits().getMaxScore(), 0.0f);
         assertSame("aggregations are handed over, not rebuilt", response.getAggregations(), merged.getAggregations());
-        assertEquals(Boolean.TRUE, merged.isTerminatedEarly());
+        assertSame("a suggest section belongs to the search, not to the profile", response.getSuggest(), merged.getSuggest());
         assertTrue(merged.isTimedOut());
+        assertEquals(Boolean.TRUE, merged.isTerminatedEarly());
         assertEquals(3, merged.getNumReducePhases());
+        assertEquals(
+            "ext sections are what a pipeline answers with",
+            response.getInternalResponse().getSearchExtBuilders(),
+            merged.getInternalResponse().getSearchExtBuilders()
+        );
+        assertEquals(
+            "and so is the processor execution detail a verbose pipeline request asked for",
+            response.getInternalResponse().getProcessorResult(),
+            merged.getInternalResponse().getProcessorResult()
+        );
+
+        // SearchResponse's own fields
         assertEquals("scroll-id", merged.getScrollId());
         assertEquals(5, merged.getTotalShards());
         assertEquals(4, merged.getSuccessfulShards());
         assertEquals(1, merged.getSkippedShards());
         assertEquals("took is the user's latency, not the merge's", 17L, merged.getTook().millis());
+        assertEquals("phase_took is the per-phase half of the same accounting", Map.of("query", 11L), phaseTookMap(merged));
+        assertEquals("a partial answer stays partial", 1, merged.getFailedShards());
+        assertSame(response.getShardFailures()[0], merged.getShardFailures()[0]);
         assertSame(SearchResponse.Clusters.EMPTY, merged.getClusters());
+    }
+
+    /**
+     * {@code pointInTimeId} shares the assertion above's fixture but not its response: core asserts a response carries at
+     * most one of {@code scrollId} and {@code pointInTimeId}, so the two can only be pinned one per response.
+     */
+    public void testGetMergedResponse_whenRebuilt_thenThePointInTimeIdIsPreserved() {
+        FusedLegProfileMerger merger = new FusedLegProfileMerger();
+        merger.forHybrid("hybrid_0").accept(0, Map.of(SHARD_KEY, shardResult(1)));
+
+        SearchResponse merged = merger.getMergedResponse(responseWithEverything(null, "pit-id"));
+
+        assertEquals("pit-id", merged.pointInTimeId());
+        assertNull("and the scroll id it excludes stays absent", merged.getScrollId());
+    }
+
+    /**
+     * The rebuild above is only complete while it calls the widest constructor core offers, and core widens a response by
+     * <i>adding</i> a constructor rather than changing one — the 7 → 8 → 9 and 8 → 9 → 10 ladders these two classes already
+     * carry are the evidence. So a new field arrives as a wider constructor, not as a compile error in the merger, and
+     * nothing above would fail. This is the assertion that does fail, and it names the fix.
+     */
+    public void testGetMergedResponse_whenCoreWidensAResponse_thenTheRebuildIsToldToCarryTheNewField() {
+        assertEquals(
+            "core widened InternalSearchResponse: FusedLegProfileMerger#getMergedResponse must pass the new field(s) too",
+            9,
+            widestPublicConstructorArity(InternalSearchResponse.class)
+        );
+        assertEquals(
+            "core widened SearchResponse: FusedLegProfileMerger#getMergedResponse must pass the new field(s) too",
+            10,
+            widestPublicConstructorArity(SearchResponse.class)
+        );
+    }
+
+    private static int widestPublicConstructorArity(final Class<?> type) {
+        return Arrays.stream(type.getConstructors()).mapToInt(Constructor::getParameterCount).max().orElse(0);
+    }
+
+    private static Map<String, Long> phaseTookMap(final SearchResponse response) {
+        return Objects.isNull(response.getPhaseTook()) ? null : response.getPhaseTook().getPhaseTookMap();
+    }
+
+    /**
+     * A response with a distinct non-default value in every field the rebuild has to carry, through the widest constructor
+     * each class offers. Only one of {@code scrollId} / {@code pointInTimeId} may be set, which core asserts.
+     */
+    private static SearchResponse responseWithEverything(final String scrollId, final String pointInTimeId) {
+        SearchHits hits = new SearchHits(new SearchHit[] { new SearchHit(1) }, new TotalHits(42L, TotalHits.Relation.EQUAL_TO), 1.5f);
+        InternalSearchResponse sections = new InternalSearchResponse(
+            hits,
+            InternalAggregations.EMPTY,
+            // core's Suggest sorts the list it is handed in place, so it cannot be an immutable one
+            new Suggest(new ArrayList<>()),
+            new SearchProfileShardResults(Map.of(SHARD_KEY, shardResult(1))),
+            true,
+            true,
+            3,
+            List.of(new RerankSearchExtBuilder(Map.of("query_text", "cat"))),
+            List.of(new ProcessorExecutionDetail("normalization-processor"))
+        );
+        return new SearchResponse(
+            sections,
+            scrollId,
+            5,
+            4,
+            1,
+            17L,
+            new SearchResponse.PhaseTook(Map.of("query", 11L)),
+            new ShardSearchFailure[] { new ShardSearchFailure(new IllegalStateException("shard 4 is unavailable")) },
+            SearchResponse.Clusters.EMPTY,
+            pointInTimeId
+        );
     }
 
     /**

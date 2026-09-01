@@ -34,8 +34,9 @@ import org.opensearch.search.profile.query.QueryProfileShardResult;
  * {@code hybrid} in the request, added to by the leg fan-out callback, read once when the response comes back.
  *
  * <p>Between them the entries account for a fused request end to end: {@code [fused:hybrid_N.leg_M]} for each leg as the
- * user wrote it, {@code [coordinator][fused:hybrid_N]} for the fan-out and the fusion, and {@code [fused:rewrite]} for the
- * query round 2 actually ran. Without the coordinator entry the fusion span is reportable from nowhere at all — core builds
+ * user wrote it, {@code [coordinator][fused:hybrid_N]} for the fan-out and the fusion, and {@code [fused:rewrite]} for round
+ * 2 — the substituted query, together with anything else the request asked of that shard alongside it, aggregations
+ * included. Without the coordinator entry the fusion span is reportable from nowhere at all — core builds
  * the request's {@code SearchTimeProvider} before {@code Rewriteable.rewriteAndFetch}, so it lands inside {@code took} but
  * outside every {@code phase_took} phase.
  *
@@ -64,6 +65,12 @@ public final class FusedLegProfileMerger {
      * Label for the response's own shard entries. They describe the query the fused rewrite <b>replaced</b> the hybrid
      * with — a {@code bool} over {@code _id} terms — not the hybrid the user wrote, so leaving them untagged next to the
      * labelled legs would read as if they were the user's query.
+     *
+     * <p>It names round 2, not the substituted hybrid alone. A shard key owns a whole {@link ProfileShardResult} — its
+     * {@code searches}, {@code aggregations} and {@code fetch} sections together — so an entry under this label is
+     * everything that shard did after the rewrite: an aggregation the request also asked for, or a sibling clause of an
+     * enclosing {@code bool}, is in here too. There is no sub-key to tag, so the label cannot be narrower than the entry it
+     * names, and it does not need to be: every node under it ran in round 2.
      */
     private static final String REWRITE_LABEL = "rewrite";
 
@@ -135,6 +142,13 @@ public final class FusedLegProfileMerger {
      * of what the rewritten query cost, and dropping them would hide the {@code _id} lookup and the Tail from the very
      * output that exists to account for time. Relabelling only happens when something was collected, so a classic or
      * unprofiled response is returned untouched.
+     *
+     * <p><b>Both argument lists below have to track their constructors.</b> Replacing the profile section means rebuilding
+     * the response around it — {@link SearchProfileShardResults} takes its map whole — and a field left off either list
+     * would be silently dropped from a profiled fused response while an unprofiled one kept it. So both calls use the
+     * widest constructor core offers, and {@code FusedLegProfileMergerTests} asserts every field is carried and that the
+     * arity called here is still the widest one available: core widens by adding a constructor and keeping the old ones,
+     * so a new field shows up as a wider constructor rather than as a compile error here.
      */
     public SearchResponse getMergedResponse(final SearchResponse response) {
         if (isEmpty()) {

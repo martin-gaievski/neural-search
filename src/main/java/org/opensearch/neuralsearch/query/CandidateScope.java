@@ -488,7 +488,7 @@ final class CandidateScope {
      * numbers a profiled run reports describe a profiled run. It lands inside the user's {@code timeout} like any other
      * leg work: a leg that exceeds a soft timeout returns the candidates it had, so the window can be narrower than an
      * unprofiled run's. That is not specific to profiling — a fused request under a soft timeout already reports no sign
-     * of a truncated leg, which is tracked as a fused-mode follow-up.
+     * of a truncated leg.
      */
     void enableLegProfiling() {
         this.legProfiling = true;

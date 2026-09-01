@@ -56,6 +56,7 @@ public class HybridQueryFusedModeProfileIT extends BaseNeuralSearchIT {
     private static final String NORM_PIPELINE = "fused-profile-norm-pipeline";
     private static final String TEXT_FIELD = "text";
     private static final String VECTOR_FIELD = "vec";
+    private static final String RANK_FIELD = "rank";
     private static final int TOTAL_DOCS = 6;
     private static final int WINDOW_SIZE = 10;
     private static final int SHARDS = 2;
@@ -303,6 +304,35 @@ public class HybridQueryFusedModeProfileIT extends BaseNeuralSearchIT {
         assertEquals("profiling the legs must not change the totals", totalHits(plain), totalHits(profiled));
     }
 
+    /**
+     * What {@code [fused:rewrite]} covers: round 2 on that shard, not the substituted hybrid alone. A shard key owns one
+     * whole profile entry — searches, aggregations and fetch together — so anything else the request asked of that shard
+     * is under the same label, and there is no sub-key that could name it more narrowly. Pinned rather than left to be
+     * discovered, because an aggregation written next to the hybrid is the case where that reads as surprising.
+     */
+    @SneakyThrows
+    public void testProfiledFusedHybridWithAggregation_thenTheAggregationIsInsideTheRewriteEntry() {
+        ensureDataset(INDEX, 1);
+
+        Map<String, Object> response = search(INDEX, profiledWithAggregation(fusedHybrid(knnLeg(), termLeg())));
+        Map<String, List<String>> aggregationTypes = aggregationNodeTypes(response);
+
+        String rewriteKey = onlyKeyEndingWith(aggregationTypes.keySet(), REWRITE_TAG);
+        assertTrue(
+            "the aggregation ran in round 2, so it is inside the entry labelled as round 2: " + aggregationTypes,
+            aggregationTypes.get(rewriteKey).stream().anyMatch(type -> type.contains("Aggregator"))
+        );
+        // Nothing else may claim it: a leg is asked for ids only, and the coordinator fuses rather than aggregates.
+        assertEquals(
+            "a leg reports no aggregation",
+            List.of(),
+            aggregationTypes.get(onlyKeyEndingWith(aggregationTypes.keySet(), legTag(0)))
+        );
+        assertEquals("nor does the other", List.of(), aggregationTypes.get(onlyKeyEndingWith(aggregationTypes.keySet(), legTag(1))));
+        assertEquals("nor the coordinator", List.of(), aggregationTypes.get(onlyKeyEndingWith(aggregationTypes.keySet(), COORDINATOR_TAG)));
+        assertNotNull("and the aggregation still answers", response.get("aggregations"));
+    }
+
     // ------------------------------------------------ request bodies ------------------------------------------------
 
     /** A materializable ANN leg: in the Tail it is replaced by an address of the hits it returned. */
@@ -334,6 +364,23 @@ public class HybridQueryFusedModeProfileIT extends BaseNeuralSearchIT {
         return "{\"query\":" + query + ",\"profile\":true,\"track_total_hits\":true}";
     }
 
+    /**
+     * The same, plus an aggregation the hybrid knows nothing about.
+     *
+     * <p>A metric aggregation on purpose. A bucket aggregation that builds its own {@code Weight} — {@code filter} is the
+     * short one — trips an assertion in core's {@code ConcurrentQueryProfileBreakdown} that has nothing to do with fused
+     * mode: it reproduces on a plain {@code match_all} with no hybrid anywhere. Reading doc values needs no weight, so a
+     * metric aggregation profiles what this test is here to pin without standing on that.
+     */
+    private String profiledWithAggregation(final String query) {
+        return "{\"query\":"
+            + query
+            + ",\"profile\":true,\"track_total_hits\":true,"
+            + "\"aggs\":{\"rank_total\":{\"sum\":{\"field\":\""
+            + RANK_FIELD
+            + "\"}}}}";
+    }
+
     // ------------------------------------------------ profile parsing -----------------------------------------------
 
     /** Node {@code type}s of every query tree of an entry, depth first, keyed by the entry's shard key in render order. */
@@ -362,6 +409,18 @@ public class HybridQueryFusedModeProfileIT extends BaseNeuralSearchIT {
             types.add(String.valueOf(node.get("type")));
             collectNodeTypes((List<Map<String, Object>>) node.get("children"), types);
         }
+    }
+
+    /** Node {@code type}s of an entry's aggregation section, depth first, keyed by the entry's shard key. */
+    @SuppressWarnings("unchecked")
+    private Map<String, List<String>> aggregationNodeTypes(final Map<String, Object> response) {
+        Map<String, List<String>> byShardKey = new LinkedHashMap<>();
+        for (Map<String, Object> shard : shardEntries(response)) {
+            List<String> types = new ArrayList<>();
+            collectNodeTypes((List<Map<String, Object>>) shard.get("aggregations"), types);
+            byShardKey.put(String.valueOf(shard.get("id")), types);
+        }
+        return byShardKey;
     }
 
     /** How many fetch nodes an entry reports, {@code -1} when the section is missing rather than empty. */
@@ -460,6 +519,8 @@ public class HybridQueryFusedModeProfileIT extends BaseNeuralSearchIT {
             + "\"}},\"mappings\":{\"properties\":{\""
             + TEXT_FIELD
             + "\":{\"type\":\"text\"},\""
+            + RANK_FIELD
+            + "\":{\"type\":\"integer\"},\""
             + VECTOR_FIELD
             + "\":{\"type\":\"knn_vector\",\"dimension\":2,"
             + "\"method\":{\"name\":\"hnsw\",\"space_type\":\"l2\",\"engine\":\"lucene\"}}}}}";
@@ -476,7 +537,19 @@ public class HybridQueryFusedModeProfileIT extends BaseNeuralSearchIT {
         for (int id = 1; id <= TOTAL_DOCS; id++) {
             Request request = new Request("PUT", "/" + index + "/_doc/" + id + "?refresh=true");
             request.setJsonEntity(
-                "{\"" + TEXT_FIELD + "\":\"hello world document " + id + "\",\"" + VECTOR_FIELD + "\":[1." + id + ",1.0]}"
+                "{\""
+                    + TEXT_FIELD
+                    + "\":\"hello world document "
+                    + id
+                    + "\",\""
+                    + RANK_FIELD
+                    + "\":"
+                    + id
+                    + ",\""
+                    + VECTOR_FIELD
+                    + "\":[1."
+                    + id
+                    + ",1.0]}"
             );
             Response response = client().performRequest(request);
             int code = response.getStatusLine().getStatusCode();
