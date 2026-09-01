@@ -66,6 +66,7 @@ import lombok.extern.log4j.Log4j2;
 import org.opensearch.neuralsearch.fusion.ScalarNormalizer;
 import org.opensearch.neuralsearch.fusion.ScalarNormalizers;
 import org.opensearch.neuralsearch.processor.normalization.ScoreNormalizationFactory;
+import org.opensearch.neuralsearch.search.FusedLegTimeoutMerger;
 import org.opensearch.neuralsearch.search.profile.FusedCoordinatorTimings;
 import org.opensearch.neuralsearch.search.profile.FusedLegProfileMerger;
 import org.opensearch.neuralsearch.stats.events.EventStatName;
@@ -158,6 +159,16 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      * {@link #doEquals}/{@link #doHashCode}.
      */
     private FusedLegProfileMerger.CoordinatorTimingConsumer fusionTimingConsumer;
+
+    /**
+     * Where to report that a leg of this fused hybrid was truncated by a soft {@code timeout}, so the response can say its
+     * answer is incomplete. Attached by {@code HybridQuerySearchRequestFilter} on a <b>different</b> condition from the two
+     * above: not "the request asked for a diagnostic" but "a soft timeout is possible at all", because a narrowed fusion
+     * window changes the ranking every client sees and not only what a profiled request reports. {@code null} means nothing
+     * reports it and the response carries core's own {@code timed_out} for round 2 alone. Never parsed, never serialized,
+     * absent from {@link #doEquals}/{@link #doHashCode}.
+     */
+    private FusedLegTimeoutMerger.LegTimeoutConsumer legTimeoutConsumer;
 
     public static final int MAX_NUMBER_OF_SUB_QUERIES = 5;
     private static final int LOWER_BOUND_OF_PAGINATION_DEPTH = 0;
@@ -634,6 +645,13 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                 try {
                     collectLegProfiles(multiSearchResponse);
                     collectLegTimings(multiSearchResponse, timings);
+                    // Reported here rather than after the fusion, because this one does not describe the fusion: it says the
+                    // candidate set fusion was given is short, which is already settled and stays true however the fusion
+                    // goes. Publishing it before fusion runs also means it is on the record for a response only fusion's own
+                    // failure could prevent, and such a request fails outright.
+                    if (Objects.nonNull(legTimeoutConsumer)) {
+                        legTimeoutConsumer.accept(timings.anyLegTimedOut());
+                    }
                     QueryBuilder fusedQuery = HybridFusionOrchestrator.buildFusedQuery(
                         searchRequest.source(),
                         multiSearchResponse,
@@ -714,8 +732,10 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      * coordinator's profile entry.
      *
      * <p>Unconditional, unlike {@link #collectLegProfiles}: these are four values read off a response already in hand, not a
-     * profile tree the legs had to be asked to build, so there is nothing to gate. A failed leg is skipped for the same
-     * reason as above — it has no response, and the request fails on it in {@code buildFusedQuery} anyway.
+     * profile tree the legs had to be asked to build, so there is nothing to gate. That is also what lets one of the four —
+     * each leg's {@code timed_out} — be reported on an unprofiled response, since it is collected whether or not anything
+     * asked for the profile entry it renders in. A failed leg is skipped for the same reason as above — it has no response,
+     * and the request fails on it in {@code buildFusedQuery} anyway.
      */
     private void collectLegTimings(final MultiSearchResponse multiSearchResponse, final FusedCoordinatorTimings timings) {
         MultiSearchResponse.Item[] items = multiSearchResponse.getResponses();

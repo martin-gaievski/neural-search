@@ -818,6 +818,76 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
         assertTrue("classic hybrid does not fan out at all", registered.isEmpty());
     }
 
+    // -------------------------------------------- soft-timeout reporting --------------------------------------------
+
+    /**
+     * The wiring the response's {@code timed_out} depends on: a leg that came back truncated has to be published out of the
+     * fan-out callback. Driven through core's own rewrite so it is the real callback doing the publishing, not a stub.
+     */
+    @SneakyThrows
+    public void testLegFanOut_whenALegWasTruncated_thenItIsPublishedOnce() {
+        HybridQueryBuilder hybrid = fused(new MatchQueryBuilder(TEXT_FIELD_NAME, "hello"), QueryBuilders.termQuery(TEXT_FIELD_NAME, "kw"));
+        List<Boolean> published = new ArrayList<>();
+        hybrid.legTimeoutConsumer(published::add);
+
+        drive(request(hybrid), Set.of(1));
+
+        assertEquals("published exactly once, when the fan-out came back", 1, published.size());
+        assertEquals("and it says the candidate set fusion was given is short", List.of(true), published);
+    }
+
+    /** The normal case has to be published too, and as {@code false}: a merger's OR is what turns that into nothing. */
+    @SneakyThrows
+    public void testLegFanOut_whenEveryLegCompleted_thenNothingIsClaimed() {
+        HybridQueryBuilder hybrid = fused(new MatchQueryBuilder(TEXT_FIELD_NAME, "hello"), QueryBuilders.termQuery(TEXT_FIELD_NAME, "kw"));
+        List<Boolean> published = new ArrayList<>();
+        hybrid.legTimeoutConsumer(published::add);
+
+        drive(request(hybrid));
+
+        assertEquals(List.of(false), published);
+    }
+
+    /** Which leg was cut short makes no difference to the answer: the window is short either way. */
+    @SneakyThrows
+    public void testLegFanOut_whenTheFirstLegWasTruncated_thenItIsPublishedTheSameWay() {
+        HybridQueryBuilder hybrid = fused(new MatchQueryBuilder(TEXT_FIELD_NAME, "hello"), QueryBuilders.termQuery(TEXT_FIELD_NAME, "kw"));
+        List<Boolean> published = new ArrayList<>();
+        hybrid.legTimeoutConsumer(published::add);
+
+        drive(request(hybrid), Set.of(0));
+
+        assertEquals(List.of(true), published);
+    }
+
+    /**
+     * Reported whether or not the request asked to be profiled — no {@code legProfileConsumer} is attached here, and the
+     * timings object the flag is read off is built regardless. This is the property that makes a truncated leg part of the
+     * answer rather than part of the instrumentation.
+     */
+    @SneakyThrows
+    public void testLegFanOut_whenTheRequestIsNotProfiled_thenATruncatedLegIsStillPublished() {
+        HybridQueryBuilder hybrid = fused(new MatchQueryBuilder(TEXT_FIELD_NAME, "hello"), QueryBuilders.termQuery(TEXT_FIELD_NAME, "kw"));
+        List<Boolean> published = new ArrayList<>();
+        hybrid.legTimeoutConsumer(published::add);
+
+        drive(request(hybrid), Set.of(0, 1));
+
+        assertNull("nothing is collecting leg profile trees", hybrid.legProfileConsumer());
+        assertEquals(List.of(true), published);
+    }
+
+    /** No consumer attached is the request that cannot time out, and the fan-out must not care that nobody is listening. */
+    @SneakyThrows
+    public void testLegFanOut_whenNoTimeoutConsumerIsAttached_thenATruncatedLegChangesNothing() {
+        HybridQueryBuilder hybrid = fused(new MatchQueryBuilder(TEXT_FIELD_NAME, "hello"), QueryBuilders.termQuery(TEXT_FIELD_NAME, "kw"));
+
+        FanOut fanOut = drive(request(hybrid), Set.of(0));
+
+        assertNull(hybrid.legTimeoutConsumer());
+        assertEquals("the fan-out is unchanged", List.of(2), fanOut.legCountPerMultiSearch());
+    }
+
     // ------------------------------------------------ harness ------------------------------------------------
 
     /** A chain {@code depth} fused hybrids deep, each holding the level below plus one term leg: 2 legs per level. */
@@ -922,8 +992,17 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
      */
     @SneakyThrows
     private FanOut drive(final SearchRequest searchRequest) {
+        return drive(searchRequest, Set.of());
+    }
+
+    /**
+     * As {@link #drive(SearchRequest)}, answering the given leg indexes the way a soft {@code timeout} does. The leg indexes
+     * are positions in the MultiSearch, which is the order the hybrid declared its legs in.
+     */
+    @SneakyThrows
+    private FanOut drive(final SearchRequest searchRequest, final Set<Integer> truncatedLegs) {
         List<Integer> legCountPerMultiSearch = new ArrayList<>();
-        QueryCoordinatorContext coordinatorContext = fanningOutContext(searchRequest, legCountPerMultiSearch);
+        QueryCoordinatorContext coordinatorContext = fanningOutContext(searchRequest, legCountPerMultiSearch, truncatedLegs);
 
         AtomicReference<QueryBuilder> settled = new AtomicReference<>();
         Rewriteable.rewriteAndFetch(searchRequest.source().query(), coordinatorContext, ActionListener.wrap(settled::set, e -> {
@@ -954,9 +1033,18 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
 
     /** A coordinator context that answers every fan-out registered on it from {@link #multiSearchingClient}, round by round. */
     private QueryCoordinatorContext fanningOutContext(final SearchRequest searchRequest, final List<Integer> legCountPerMultiSearch) {
+        return fanningOutContext(searchRequest, legCountPerMultiSearch, Set.of());
+    }
+
+    /** As above, with the given leg indexes answering the way a leg a soft {@code timeout} cut short does. */
+    private QueryCoordinatorContext fanningOutContext(
+        final SearchRequest searchRequest,
+        final List<Integer> legCountPerMultiSearch,
+        final Set<Integer> truncatedLegs
+    ) {
         List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
         QueryCoordinatorContext coordinatorContext = coordinatorContext(searchRequest, registered);
-        Client client = multiSearchingClient(legCountPerMultiSearch);
+        Client client = multiSearchingClient(legCountPerMultiSearch, truncatedLegs);
         when(coordinatorContext.hasAsyncActions()).thenAnswer(invocation -> registered.isEmpty() == false);
         doAnswer(invocation -> {
             List<BiConsumer<Client, ActionListener<?>>> thisRound = new ArrayList<>(registered);
@@ -972,14 +1060,14 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
     }
 
     /** Answers every leg with the same two hits, and records how many legs each MultiSearch carried. */
-    private Client multiSearchingClient(final List<Integer> legCountPerMultiSearch) {
+    private Client multiSearchingClient(final List<Integer> legCountPerMultiSearch, final Set<Integer> truncatedLegs) {
         Client client = mock(Client.class);
         doAnswer(invocation -> {
             MultiSearchRequest multiSearchRequest = invocation.getArgument(0);
             legCountPerMultiSearch.add(multiSearchRequest.requests().size());
             MultiSearchResponse.Item[] items = new MultiSearchResponse.Item[multiSearchRequest.requests().size()];
             for (int leg = 0; leg < items.length; leg++) {
-                items[leg] = legItem();
+                items[leg] = legItem(truncatedLegs.contains(leg));
             }
             ActionListener<MultiSearchResponse> listener = invocation.getArgument(1);
             listener.onResponse(new MultiSearchResponse(items, 10L));
@@ -988,10 +1076,14 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
         return client;
     }
 
-    private MultiSearchResponse.Item legItem() {
+    /**
+     * One leg's response. {@code timedOut} is what core sets on a leg a soft {@code timeout} cut short: the leg still
+     * answers, with the candidates it had collected, and says so on its own response rather than failing.
+     */
+    private MultiSearchResponse.Item legItem(final boolean timedOut) {
         SearchHit[] hits = new SearchHit[] { hit(0, "1", 0.9f), hit(1, "2", 0.5f) };
         SearchHits searchHits = new SearchHits(hits, new TotalHits(hits.length, TotalHits.Relation.EQUAL_TO), 1.0f);
-        SearchResponseSections sections = new SearchResponseSections(searchHits, null, null, false, false, null, 0);
+        SearchResponseSections sections = new SearchResponseSections(searchHits, null, null, timedOut, false, null, 0);
         return new MultiSearchResponse.Item(new SearchResponse(sections, null, 1, 1, 0, 10, null, null), null);
     }
 
