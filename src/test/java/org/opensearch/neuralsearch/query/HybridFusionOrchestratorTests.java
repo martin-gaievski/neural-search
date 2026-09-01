@@ -776,7 +776,8 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
             assertEquals("leg raw score", legNode.getDetails()[0].getDescription());
         }
         assertEquals(
-            "the described score is the one round 2 ranks by",
+            "the described score is the one fusion computed, which for an undegenerate document is also the one round 2 "
+                + "ranks by (see the floored case below, where the two differ)",
             fusedScoresById(fused).get("1"),
             tree.getValue().floatValue(),
             0.0f
@@ -1228,6 +1229,56 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         assertAddressedTo(((ConstantScoreQueryBuilder) self.should().get(3)).innerQuery(), INDEX, "4");
         assertEquals(HybridFusionOrchestrator.MIN_RANKED_SCORE, topClause(fused, 2).boost(), 0.0f);
         assertEquals(HybridFusionOrchestrator.MIN_RANKED_SCORE, topClause(fused, 3).boost(), 0.0f);
+    }
+
+    /**
+     * The combination node has to report the score fusion computed, not the floored score round 2 ranks by. Same input as
+     * the test above, run explained: documents 3 and 4 matched only the zero-weighted leg, so fusion produced exactly
+     * {@code 0.0} for them while their Top clause carries {@link HybridFusionOrchestrator#MIN_RANKED_SCORE}. Recording the
+     * floored value instead would label the combination node {@code 1e-30} over children that combine to {@code 0.0}, and
+     * because the hit's score is that same {@code 1e-30} the wrapper naming the floor would be suppressed
+     * ({@code FusedDocExplanations#explain} returns the combination node bare when the two agree) — so the tree would
+     * claim a number its own children do not produce, with nothing pointing at the floor.
+     *
+     * <p>The single rendered child is the caveat the fix does not remove: the zero-weighted leg's slot still counted its
+     * weight into the combiner's divisor while rendering no node, so the parent is deliberately not the mean of what is
+     * shown. Classic renders a partially-matched document the same way.
+     */
+    public void testBuildFusedQuery_whenAZeroFusedScoreIsFloored_thenTheCombinationNodeKeepsTheComputedScore() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        MultiSearchResponse ms = multiSearch(
+            explainedLegItem(new LinkedHashMap<>(Map.of("1", 5.0f, "2", 3.0f))),
+            explainedLegItem(new LinkedHashMap<>(Map.of("3", 7.0f, "4", 2.0f)))
+        );
+        FusedDocExplanations explanations = new FusedDocExplanations();
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(
+            new SearchSourceBuilder().explain(true),
+            ms,
+            legs,
+            minMaxWeighted(1.0f, 0.0f),
+            10,
+            new FusedCoordinatorTimings(),
+            explanations
+        );
+
+        // Round 2 ranks document 3 by the floored score: that is what its Top clause boost carries.
+        assertEquals(HybridFusionOrchestrator.MIN_RANKED_SCORE, fusedScoresById(fused).get("3"), 0.0f);
+
+        Explanation tree = explanations.explain(FusedDocExplanations.documentKey(INDEX, "3"), HybridFusionOrchestrator.MIN_RANKED_SCORE);
+        assertNotNull("the document is in the window, so it is described", tree);
+        assertEquals(
+            "the floor moved the score, so the top node names what round 2 returned rather than relabelling the combination",
+            "score of the fused hybrid query as round 2 returned it, computed from:",
+            tree.getDescription()
+        );
+        assertEquals(HybridFusionOrchestrator.MIN_RANKED_SCORE, tree.getValue().floatValue(), 0.0f);
+
+        assertEquals("the combination is its only child", 1, tree.getDetails().length);
+        Explanation combination = tree.getDetails()[0];
+        assertEquals(explanations.combinationDescription(), combination.getDescription());
+        assertEquals("the combination node reports what fusion computed, not the floor", 0.0f, combination.getValue().floatValue(), 0.0f);
+        assertEquals("only the leg that matched is rendered", 1, combination.getDetails().length);
     }
 
     /**

@@ -1209,6 +1209,12 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     /**
      * Combination techniques wired into the coordinator fusion path. Narrower than the classic compatibility matrix
      * while combination support is widened one technique at a time; widening this set is what admits a new combiner.
+     *
+     * <p>A technique added here must also implement {@code ExplainableTechnique}. The fused explain path casts to it
+     * unguarded to name the combination node ({@code HybridFusionOrchestrator#recordExplanations}), exactly as classic
+     * does in {@code ScoreCombiner#explainByShard} and {@code NormalizationProcessorWorkflow}. That cast can only ever
+     * see an admitted technique because this set gates it before the leg fan-out, so widening the set without the
+     * interface would turn explained requests into a {@code ClassCastException} while unexplained ones kept working.
      */
     private static final Set<String> FUSED_COMBINATION_TECHNIQUES = Set.of(FusionSpec.TECHNIQUE_ARITHMETIC_MEAN, FusionSpec.TECHNIQUE_RRF);
 

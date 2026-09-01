@@ -421,8 +421,12 @@ public class HybridQuerySearchRequestFilterTests extends OpenSearchQueryTestCase
 
     /**
      * {@code explain} writes onto the response's hits while {@code profile} replaces the response around them, so asking for
-     * both has to yield both. What this pins is that the one rebuild carries the very {@code SearchHit} instances over: a
-     * rebuild that copied them would drop the explanation written afterwards, silently and only for requests asking for both.
+     * both has to yield both — that outcome is what this pins.
+     *
+     * <p>It does not pin the order, and cannot: the mergers run profile-first, so the explanation is written onto whatever
+     * hits the rebuilt response carries, and a rebuild that copied them would receive the write on the copies and still
+     * pass here. What makes the order safe is that the profile rebuild passes {@code SearchHits} through by reference,
+     * which is pinned where it belongs, by the {@code assertSame} in {@code FusedLegProfileMergerTests}.
      */
     @SuppressWarnings("unchecked")
     public void testWrappedListener_whenExplainedAndProfiled_thenTheResponseCarriesBoth() {

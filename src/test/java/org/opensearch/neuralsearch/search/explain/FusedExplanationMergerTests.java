@@ -30,7 +30,7 @@ public class FusedExplanationMergerTests extends OpenSearchTestCase {
     private static final String INDEX = "test-index";
     private static final String COMBINATION = "arithmetic_mean combination of:";
     private static final String NORMALIZATION = "min_max normalization of:";
-    private static final String FINAL_SCORE = "score of the fused hybrid query after post-fusion scoring, computed from:";
+    private static final String FINAL_SCORE = "score of the fused hybrid query as round 2 returned it, computed from:";
 
     public void testGetMergedResponse_whenNothingCollected_thenResponseReturnedUntouched() {
         FusedExplanationMerger merger = new FusedExplanationMerger();

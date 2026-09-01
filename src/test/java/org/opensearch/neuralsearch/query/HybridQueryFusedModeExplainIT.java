@@ -53,7 +53,7 @@ public class HybridQueryFusedModeExplainIT extends BaseNeuralSearchIT {
     /** What each per-leg node is called: classic's {@code ExplanationUtils} format over the normalization technique's name. */
     private static final String NORMALIZATION_DESCRIPTION = "min_max normalization of:";
     /** The node inserted above the combination when the score round 2 returned is not the fused score. */
-    private static final String FINAL_SCORE_DESCRIPTION = "score of the fused hybrid query after post-fusion scoring, computed from:";
+    private static final String FINAL_SCORE_DESCRIPTION = "score of the fused hybrid query as round 2 returned it, computed from:";
     /** Floats survive one JSON round trip exactly; the tolerance is for the arithmetic asserted across nodes. */
     private static final double DELTA = 1e-5;
 
@@ -135,6 +135,40 @@ public class HybridQueryFusedModeExplainIT extends BaseNeuralSearchIT {
             value(explanation),
             DELTA
         );
+    }
+
+    /**
+     * A weight of {@code 0.0} zeroes its leg's contribution, so a document that reached fusion through that leg alone fuses
+     * to exactly {@code 0.0} and is floored away from the Tail before round 2 ranks it. The tree must then name what round 2
+     * returned and keep the score fusion computed underneath it — labelling the combination node with the floor would claim
+     * a number its own children do not produce.
+     *
+     * <p>{@code k=2} is load-bearing: on a dataset where every leg matches every document, min_max maps a zero-range leg to
+     * {@code 1.0} and no document fuses to {@code 0.0} at all, so the case would not arise. Bounding the ANN leg leaves four
+     * documents reaching fusion through the zero-weighted {@code term} leg alone. {@code size} covers them because they sort
+     * last, being the lowest-scored documents in the window.
+     */
+    @SneakyThrows
+    public void testExplainedFusedHybrid_whenALegWeightIsZero_thenTheFlooredScoreIsNamedAboveTheComputedOne() {
+        ensureDataset();
+
+        Map<String, Object> response = search(explained(zeroWeightedFusedHybrid(knnLeg(2), termLeg())));
+
+        List<Map<String, Object>> floored = new ArrayList<>();
+        for (Map<String, Object> hit : hits(response)) {
+            Map<String, Object> explanation = explanationOf(hit);
+            if (FINAL_SCORE_DESCRIPTION.equals(description(explanation))) {
+                floored.add(explanation);
+            }
+        }
+
+        assertEquals("the four documents the zero-weighted leg alone surfaced fused to 0.0 and were floored", 4, floored.size());
+        for (Map<String, Object> explanation : floored) {
+            List<Map<String, Object>> children = details(explanation);
+            assertEquals("the combination is the only child", 1, children.size());
+            assertEquals("the child reports what fusion computed, which is exactly zero", 0.0, value(children.get(0)), DELTA);
+            assertTrue("and the parent reports the floored score round 2 ranked by, which is above it", value(explanation) > 0.0);
+        }
     }
 
     /**
@@ -315,6 +349,32 @@ public class HybridQueryFusedModeExplainIT extends BaseNeuralSearchIT {
         assertEquals("explaining the legs must not change the totals", totalHits(plain), totalHits(explained));
     }
 
+    /**
+     * Both reports at once, over the wire. The two are merged by one listener and by different means — {@code profile}
+     * rebuilds the response around the hits while {@code explain} writes onto the hits themselves — so asking for both is
+     * the case where one could drop the other. Covered only through mocked consumers in a unit test until now.
+     */
+    @SneakyThrows
+    public void testFusedHybrid_whenExplainedAndProfiled_thenTheResponseCarriesBoth() {
+        ensureDataset();
+        String query = fusedHybrid(knnLeg(WINDOW_SIZE), termLeg());
+
+        Map<String, Object> response = search(
+            "{\"query\":" + query + ",\"explain\":true,\"profile\":true,\"track_total_hits\":true,\"size\":" + (TOTAL_DOCS + 1) + "}"
+        );
+
+        assertTrue(
+            "every ranked hit still carries its fused explanation",
+            hits(response).stream().allMatch(hit -> Objects.nonNull(hit.get("_explanation")))
+        );
+        assertEquals(
+            "and the fusion is still what the top node describes",
+            COMBINATION_DESCRIPTION,
+            description(explanationOf(hits(response).get(0)))
+        );
+        assertNotNull("while the profile section the rebuild carried is present too", response.get("profile"));
+    }
+
     // ------------------------------------------------ request bodies ------------------------------------------------
 
     private String knnLeg(final int k) {
@@ -333,6 +393,17 @@ public class HybridQueryFusedModeExplainIT extends BaseNeuralSearchIT {
         return "{\"hybrid\":{\"fusion\":{\"window_size\":"
             + windowSize
             + ",\"normalization\":{\"technique\":\"min_max\"},\"combination\":{\"technique\":\"arithmetic_mean\"}},"
+            + "\"queries\":["
+            + String.join(",", legs)
+            + "]}}";
+    }
+
+    /** Weights that zero the second leg entirely, so a document only that leg surfaced fuses to exactly {@code 0.0}. */
+    private String zeroWeightedFusedHybrid(final String... legs) {
+        return "{\"hybrid\":{\"fusion\":{\"window_size\":"
+            + WINDOW_SIZE
+            + ",\"normalization\":{\"technique\":\"min_max\"},"
+            + "\"combination\":{\"technique\":\"arithmetic_mean\",\"parameters\":{\"weights\":[1.0,0.0]}}},"
             + "\"queries\":["
             + String.join(",", legs)
             + "]}}";

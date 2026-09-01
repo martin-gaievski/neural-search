@@ -44,8 +44,12 @@ public final class FusedDocExplanations {
     /**
      * Description for the extra node inserted when the score round 2 returned is not the fused score. Naming the
      * combination node with the final score would claim the fusion produced a number it did not.
+     *
+     * <p>Worded for every reason the two can differ, not just {@code rescore}: the score is also moved when
+     * {@code HybridFusionOrchestrator#scoreAboveTail} floors a degenerate fused score away from {@code 0.0}, and when an
+     * enclosing {@code boost} scales it. So this says what round 2 returned rather than naming a cause.
      */
-    private static final String FINAL_SCORE_DESCRIPTION = "score of the fused hybrid query after post-fusion scoring, computed from:";
+    private static final String FINAL_SCORE_DESCRIPTION = "score of the fused hybrid query as round 2 returned it, computed from:";
 
     /**
      * What round 2 will be told, per document key, in leg order. Empty for an unexplained request, and absent for a
