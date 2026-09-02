@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 * In-query fusion in hybrid search. Support `rrf` in fused mode as a normalizer over ranks, computing rank scores through the same code as the score-ranker-processor, and read `rank_constant` from the place each config shape's own classic factory reads it — the `combination` clause for `score-ranker-processor`, `normalization.parameters` for `normalization-processor` ([#1948](https://github.com/opensearch-project/neural-search/pull/1948))
 * In-query fusion in hybrid search. Report `timed_out` when a soft `timeout` truncated a leg's sub-search, since the fusion then ranked an incomplete candidate set ([#1980](https://github.com/opensearch-project/neural-search/pull/1980))
 * In-query fusion in hybrid search. Support `explain` in fused mode: each ranked hit reports every leg's normalized contribution under the fused score, in classic hybrid's wording ([#1979](https://github.com/opensearch-project/neural-search/pull/1979))
+* In-query fusion in hybrid search. Search the fusion config parameters: read `rank_constant` from either the `combination` clause or `normalization.parameters`, and refuse min_max `lower_bounds`/`upper_bounds` with a validation error ([#1985](https://github.com/opensearch-project/neural-search/pull/1985))
 
 ### Bug Fixes
 * [SemanticHighlighter] Fix SemanticHighlighterExtBuilder.toXContent ([#1906](https://github.com/opensearch-project/neural-search/issues/1906)) (query-insights [#651](https://github.com/opensearch-project/query-insights/issues/651))

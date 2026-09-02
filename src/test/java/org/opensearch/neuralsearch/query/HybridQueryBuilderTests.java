@@ -458,6 +458,31 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
     }
 
     @SneakyThrows
+    public void testFromXContent_whenFusionCombinationIsAString_then400() {
+        // `"combination": "rrf"` reads like the supported shorthand one level up (`"fusion": "pipeline"`), and every reader
+        // in FusionSpec gates on instanceof Map — so before this check it parsed to the min_max + arithmetic_mean defaults
+        // and fused by a technique the user did not ask for, at HTTP 200.
+        setUpClusterService();
+        XContentBuilder xContentBuilder = hybridWithOneTermQuery().startObject("fusion")
+            .field("combination", "rrf")
+            .endObject()
+            .endObject();
+        ParsingException e = expectThrows(ParsingException.class, () -> HybridQueryBuilder.fromXContent(fusionTestParser(xContentBuilder)));
+        assertThat(e.getMessage(), containsString("[fusion.combination] must be an object"));
+    }
+
+    @SneakyThrows
+    public void testFromXContent_whenFusionNormalizationIsAString_then400() {
+        setUpClusterService();
+        XContentBuilder xContentBuilder = hybridWithOneTermQuery().startObject("fusion")
+            .field("normalization", "min_max")
+            .endObject()
+            .endObject();
+        ParsingException e = expectThrows(ParsingException.class, () -> HybridQueryBuilder.fromXContent(fusionTestParser(xContentBuilder)));
+        assertThat(e.getMessage(), containsString("[fusion.normalization] must be an object"));
+    }
+
+    @SneakyThrows
     public void testFromXContent_whenFusionWindowSizeNonPositive_then400() {
         setUpClusterService();
         XContentBuilder xContentBuilder = hybridWithOneTermQuery().startObject("fusion").field("window_size", 0).endObject().endObject();
@@ -724,8 +749,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         // normalization technique and lists the three means — it describes the normalization-processor and cannot speak to
         // this pairing. The exemption has to stop there: a normalization-processor combining rrf-normalized scores by rrf
         // resolves to the same two technique names, but is a pairing classic rejects through that very matrix, so admitting
-        // it would leave fused mode looser than classic (and, since that shape keeps rank_constant under
-        // `normalization.parameters`, would silently fuse at the default 60).
+        // it would leave fused mode looser than classic.
         HybridQueryBuilder.requireSupportedTechniques(
             new FusionSpec(
                 FusionSpec.Shape.SCORE_RANKER_PROCESSOR,
@@ -892,6 +916,30 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         QueryCoordinatorContext ctx = coordinatorContextFor(builder);
         IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.doRewrite(ctx));
         assertThat(e.getMessage(), containsString("requires a normalization or score-ranker processor"));
+        assertThat("the message must name the two ways out", e.getMessage(), containsString("Drop [source]"));
+    }
+
+    @SneakyThrows
+    public void testDoRewriteFused_whenNoTechniqueKeysAndNoPipeline_thenFusesWithBuiltInDefaults() {
+        // A fusion block naming neither a technique nor a source is the built-in-defaults form, not a pipeline read:
+        // with no pipeline resolvable at all it still fans out, rather than failing fast. `window_size` is a neutral key
+        // and does not turn the block into a delegation.
+        for (Map<String, Object> fusion : List.<Map<String, Object>>of(Map.of(), Map.of("window_size", 25))) {
+            initClusterUtilWithNoPipeline();
+            HybridQueryBuilder builder = fusedBuilder(new HashMap<>(fusion));
+            QueryCoordinatorContext ctx = coordinatorContextFor(builder);
+            java.util.concurrent.atomic.AtomicInteger asyncRegistered = new java.util.concurrent.atomic.AtomicInteger();
+            doAnswer(invocation -> {
+                asyncRegistered.incrementAndGet();
+                return null;
+            }).when(ctx).registerAsyncAction(org.mockito.ArgumentMatchers.any());
+
+            QueryBuilder rewritten = builder.doRewrite(ctx);
+
+            assertEquals("fusion " + fusion + " must fuse by the defaults, not resolve a pipeline", 1, asyncRegistered.get());
+            assertTrue(rewritten instanceof HybridQueryBuilder);
+            assertNotSame("round 1 returns a marker, not the original", builder, rewritten);
+        }
     }
 
     /** An outer fused hybrid whose first leg is itself a fused hybrid taking its config from the pipeline. */
@@ -899,7 +947,8 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         HybridQueryBuilder nested = new HybridQueryBuilder();
         nested.add(new MatchQueryBuilder(TEXT_FIELD_NAME, "inner-a"));
         nested.add(new MatchQueryBuilder(TEXT_FIELD_NAME, "inner-b"));
-        nested.fusion(new HashMap<>()); // fusion:{} → no inline config, must come from the pipeline
+        // fusion:{source: pipeline} → the one form that delegates, so the one form that needs projecting
+        nested.fusion(new HashMap<>(Map.of("source", "pipeline")));
         HybridQueryBuilder outer = new HybridQueryBuilder();
         outer.add(nested);
         outer.add(QueryBuilders.termQuery(TEXT_FIELD_NAME, TERM_QUERY_TEXT));
@@ -908,7 +957,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
     }
 
     @SneakyThrows
-    public void testProjectResolvedConfigOntoLegs_projectsOnlyFusedLegsWithoutInlineConfig() {
+    public void testProjectResolvedConfigOntoLegs_projectsOnlyPipelineDelegatingFusedLegs() {
         FusionSpec resolved = new FusionSpec(
             FusionSpec.Shape.NORMALIZATION_PROCESSOR,
             FusionSpec.TECHNIQUE_ARITHMETIC_MEAN,
@@ -917,7 +966,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
             new float[0]
         );
 
-        // A fused leg with no inline config is substituted by an equal-but-distinct copy carrying the resolved config.
+        // A fused leg that delegates to the pipeline is substituted by an equal-but-distinct copy carrying the config.
         List<QueryBuilder> legs = outerWithNestedFusedLeg().queries();
         List<QueryBuilder> projected = HybridQueryBuilder.projectResolvedConfigOntoLegs(legs, resolved);
         assertNotSame("a projectable leg forces a new list", legs, projected);
@@ -925,11 +974,19 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         assertEquals("the copy is wire/equality-identical to the original leg", legs.get(0), projected.get(0));
         assertSame("non-hybrid legs are left alone", legs.get(1), projected.get(1));
 
-        // Nothing to project: an inline-config fused leg and a plain leg both stay put, and the list is not copied.
+        // Nothing to project: a technique-naming leg, a defaults-form (`fusion:{}`) leg — which configures itself, so it
+        // must not inherit — and a plain leg all stay put, and the list is not copied.
         HybridQueryBuilder inlineNested = new HybridQueryBuilder();
         inlineNested.add(new MatchQueryBuilder(TEXT_FIELD_NAME, "inner"));
         inlineNested.fusion(new HashMap<>(Map.of("normalization", Map.of("technique", "min_max"))));
-        List<QueryBuilder> noneProjectable = List.of(inlineNested, QueryBuilders.termQuery(TEXT_FIELD_NAME, TERM_QUERY_TEXT));
+        HybridQueryBuilder defaultsNested = new HybridQueryBuilder();
+        defaultsNested.add(new MatchQueryBuilder(TEXT_FIELD_NAME, "inner"));
+        defaultsNested.fusion(new HashMap<>());
+        List<QueryBuilder> noneProjectable = List.of(
+            inlineNested,
+            defaultsNested,
+            QueryBuilders.termQuery(TEXT_FIELD_NAME, TERM_QUERY_TEXT)
+        );
         assertSame(
             "no projectable leg → the original list is reused",
             noneProjectable,
@@ -989,7 +1046,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
             IllegalArgumentException.class,
             () -> unprojected.requests().get(0).source().query().rewrite(bareCtx)
         );
-        assertThat(e.getMessage(), containsString("must carry an inline [fusion] config"));
+        assertThat(e.getMessage(), containsString("must not read from the pipeline"));
         assertThat(e.getMessage(), containsString("leg sub-search runs with the search pipeline disabled"));
     }
 

@@ -154,7 +154,7 @@ final class FusedRescoreScope {
                         "[%s] query [%s] cannot confine the request's [rescore] to the fused window: the [rescore] this "
                             + "coordinator rewrote is not the one being executed, so a rescore query could lift a document the "
                             + "fusion never ranked. Failing the request rather than answering it — remove the [rescore], or run "
-                            + "the query without an inline [%s] config",
+                            + "the query without a [%s] block",
                         HybridQueryBuilder.NAME,
                         FUSION,
                         FUSION
