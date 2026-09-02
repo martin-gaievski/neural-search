@@ -68,8 +68,10 @@ public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
     private static final String INDEX_NO_PIPELINE = "test-hybrid-fused-inline-config";
     private static final String INDEX_WITH_DEFAULT_RRF = "test-hybrid-fused-default-rrf";
     private static final String INDEX_RRF_PARITY = "test-hybrid-fused-rrf-parity";
+    private static final String INDEX_WITH_BOUNDED_NORM = "test-hybrid-fused-bounded-norm";
     private static final String NORM_PIPELINE = "fused-mode-norm-pipeline";
     private static final String RRF_PIPELINE = "fused-mode-rrf-pipeline";
+    private static final String BOUNDED_NORM_PIPELINE = "fused-mode-bounded-norm-pipeline";
     /** Candidate window for the parity test, comfortably above the match count so neither path truncates. */
     private static final int WINDOW = 50;
 
@@ -178,6 +180,106 @@ public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
             assertTrue("fused score must be > 0 for a matched doc", score > 0.0);
             previous = score;
         }
+    }
+
+    /**
+     * Every way of asking for the fused defaults without a pipeline: a bare {@code fusion:{}}, a window-only block, and a
+     * technique-less clause (mirroring classic hybrid's min_max + arithmetic_mean when a processor names no technique).
+     * Each must fuse identically to spelling both techniques out — a "does not throw" assertion would pass even if one of
+     * them silently resolved to something else.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenNoTechniqueNamed_thenDefaultsToMinMaxArithmeticMean() {
+        if (indexExists(INDEX_NO_PIPELINE) == false) {
+            createIndex(INDEX_NO_PIPELINE, indexConfigWithoutPipeline());
+            addFourDocs(INDEX_NO_PIPELINE);
+        }
+        List<Map<String, Object>> explicitHits = getNestedHits(search(INDEX_NO_PIPELINE, fusedTwoLegInlineConfigQuery(), 10));
+
+        for (Map<String, Object> fusion : List.<Map<String, Object>>of(
+            Map.of(),
+            Map.of("window_size", 10),
+            Map.of("normalization", Map.of())
+        )) {
+            HybridQueryBuilder defaulted = new HybridQueryBuilder().fusion(fusion);
+            defaulted.add(new MatchQueryBuilder(TEXT_FIELD, "hello"));
+            defaulted.add(new TermQueryBuilder(TEXT_FIELD, "place"));
+
+            List<Map<String, Object>> defaultedHits = getNestedHits(search(INDEX_NO_PIPELINE, defaulted, 10));
+
+            assertEquals("fusion " + fusion + " hit count", explicitHits.size(), defaultedHits.size());
+            for (int i = 0; i < explicitHits.size(); i++) {
+                assertEquals("fusion " + fusion + " hit " + i + " id", explicitHits.get(i).get("_id"), defaultedHits.get(i).get("_id"));
+                assertEquals(
+                    "fusion " + fusion + " hit " + i + " score",
+                    ((Number) explicitHits.get(i).get("_score")).floatValue(),
+                    ((Number) defaultedHits.get(i).get("_score")).floatValue(),
+                    0.0f
+                );
+            }
+        }
+    }
+
+    /**
+     * A {@code fusion} block naming neither a technique nor {@code source} is the built-in-defaults form: it fuses by
+     * min_max + arithmetic_mean, and does <b>not</b> read the attached pipeline. Reading the pipeline depends on request
+     * context the body does not show, so it is only ever done when the body says {@code source: pipeline}.
+     *
+     * <p>Pinned on an index whose default pipeline is rrf, which makes the two answers tell each other apart: the same
+     * query with {@code source: pipeline} fuses by rrf rank sums on this very index (asserted below), so scores equal to
+     * the inline min_max run are proof the defaults were applied rather than the pipeline silently chosen.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenNoTechniqueKeysButPipelineAttached_thenFusesByTheDefaultsNotThePipeline() {
+        createRRFSearchPipeline(RRF_PIPELINE, List.of(), RRFScoreNormalizer.DEFAULT_RANK_CONSTANT, false);
+        if (indexExists(INDEX_WITH_DEFAULT_RRF) == false) {
+            createIndex(INDEX_WITH_DEFAULT_RRF, indexConfigWithDefaultPipeline(RRF_PIPELINE));
+            addFourDocs(INDEX_WITH_DEFAULT_RRF);
+        }
+        // `window_size` is a neutral key: it tunes the candidate window without making the block a delegation.
+        HybridQueryBuilder windowOnly = new HybridQueryBuilder().fusion(Map.of("window_size", 10));
+        windowOnly.add(new MatchQueryBuilder(TEXT_FIELD, "hello"));
+        windowOnly.add(new TermQueryBuilder(TEXT_FIELD, "place"));
+
+        List<Map<String, Object>> hits = getNestedHits(search(INDEX_WITH_DEFAULT_RRF, windowOnly, 10));
+        List<Map<String, Object>> inlineMinMaxHits = getNestedHits(search(INDEX_WITH_DEFAULT_RRF, fusedTwoLegInlineConfigQuery(), 10));
+
+        assertEquals(3, hits.size());
+        assertEquals(inlineMinMaxHits.size(), hits.size());
+        for (int i = 0; i < inlineMinMaxHits.size(); i++) {
+            assertEquals("hit " + i + " id", inlineMinMaxHits.get(i).get("_id"), hits.get(i).get("_id"));
+            assertEquals(
+                "hit " + i + " score",
+                ((Number) inlineMinMaxHits.get(i).get("_score")).floatValue(),
+                ((Number) hits.get(i).get("_score")).floatValue(),
+                0.0f
+            );
+        }
+    }
+
+    /**
+     * The delegating form on the same rrf index: {@code source: pipeline} is what reads the attached pipeline, and it must
+     * still do so. Paired with the defaults test above — together they pin that the two forms resolve differently on one
+     * index, so neither assertion can pass by accident.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenSourcePipelineAndDefaultRrfPipeline_thenFusesByThePipeline() {
+        createRRFSearchPipeline(RRF_PIPELINE, List.of(), RRFScoreNormalizer.DEFAULT_RANK_CONSTANT, false);
+        if (indexExists(INDEX_WITH_DEFAULT_RRF) == false) {
+            createIndex(INDEX_WITH_DEFAULT_RRF, indexConfigWithDefaultPipeline(RRF_PIPELINE));
+            addFourDocs(INDEX_WITH_DEFAULT_RRF);
+        }
+        HybridQueryBuilder delegating = new HybridQueryBuilder().fusion(Map.of("source", "pipeline", "window_size", 10));
+        delegating.add(new MatchQueryBuilder(TEXT_FIELD, "hello"));
+        delegating.add(new TermQueryBuilder(TEXT_FIELD, "place"));
+
+        Map<String, Object> response = search(INDEX_WITH_DEFAULT_RRF, delegating, 10);
+
+        assertEquals(3, getHitCount(response));
+        List<Map<String, Object>> hits = getNestedHits(response);
+        assertEquals("2", hits.get(0).get("_id"));
+        // Exact rank-score sums: min_max + arithmetic_mean cannot produce these, so the pipeline's rrf is what ran.
+        assertScoresAreRrfRankSums(hits, RRFScoreNormalizer.DEFAULT_RANK_CONSTANT);
     }
 
     /**
@@ -978,6 +1080,55 @@ public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
     }
 
     @SneakyThrows
+    public void testFusedMode_whenInlineRrfRankConstantUnderNormalizationParameters_thenHonored() {
+        // The normalization-processor spelling of rank_constant, on a query whose combination technique makes it the
+        // score-ranker shape. Asserting against the k=1 formulas is what makes this a behavior test rather than a parse
+        // test: the k=60 scores are orders of magnitude smaller, so falling back to the default cannot pass.
+        if (indexExists(INDEX_NO_PIPELINE) == false) {
+            createIndex(INDEX_NO_PIPELINE, indexConfigWithoutPipeline());
+            addFourDocs(INDEX_NO_PIPELINE);
+        }
+        HybridQueryBuilder alternateSpelling = new HybridQueryBuilder().fusion(
+            Map.of(
+                "normalization",
+                Map.of("technique", "rrf", "parameters", Map.of("rank_constant", 1)),
+                "combination",
+                Map.of("technique", "rrf")
+            )
+        );
+        alternateSpelling.add(new MatchQueryBuilder(TEXT_FIELD, "hello"));
+        alternateSpelling.add(new TermQueryBuilder(TEXT_FIELD, "place"));
+
+        Map<String, Object> response = search(INDEX_NO_PIPELINE, alternateSpelling, 10);
+
+        assertEquals(3, getHitCount(response));
+        List<Map<String, Object>> hits = getNestedHits(response);
+        assertEquals("2", hits.get(0).get("_id"));
+        assertScoresAreRrfRankSums(hits, 1);
+    }
+
+    @SneakyThrows
+    public void testFusedMode_whenInlineRrfRankConstantInBothPlacesAndConflict_thenRejected() {
+        if (indexExists(INDEX_NO_PIPELINE) == false) {
+            createIndex(INDEX_NO_PIPELINE, indexConfigWithoutPipeline());
+            addFourDocs(INDEX_NO_PIPELINE);
+        }
+        HybridQueryBuilder conflicting = new HybridQueryBuilder().fusion(
+            Map.of(
+                "normalization",
+                Map.of("technique", "rrf", "parameters", Map.of("rank_constant", 1)),
+                "combination",
+                Map.of("technique", "rrf", "rank_constant", 60)
+            )
+        );
+        conflicting.add(new MatchQueryBuilder(TEXT_FIELD, "hello"));
+        conflicting.add(new TermQueryBuilder(TEXT_FIELD, "place"));
+
+        ResponseException e = expectThrows(ResponseException.class, () -> search(INDEX_NO_PIPELINE, conflicting, 10));
+        assertTrue(e.getMessage(), e.getMessage().contains("set it in one place only"));
+    }
+
+    @SneakyThrows
     public void testFusedMode_whenInlineRrfWithNormalizationTechnique_thenRejected() {
         // rrf is rank based; pairing it with a normalization technique is contradictory and must be rejected rather than
         // silently dropping the normalization clause.
@@ -995,5 +1146,41 @@ public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
         // Rejected by the classic compatibility matrix, not by a fused-mode-specific rule: classic maps min_max to the three
         // means, never to rrf. Only rrf + rrf short circuits ahead of that matrix.
         assertTrue(e.getMessage(), e.getMessage().contains("does not support combination [rrf] with normalization [min_max]"));
+    }
+
+    /**
+     * The zero-migration path carrying a config fused mode cannot honor. {@code min_max}'s {@code lower_bounds} live under
+     * {@code normalization.parameters}, and there is no coordinator-side implementation of them — so fusing this pipeline
+     * would answer the request at HTTP 200 with a ranking that differs from what the very same pipeline produces
+     * classically. Refused instead, at the pipeline entry point a user reaches without editing their query at all.
+     *
+     * <p>The second half is what makes this fused-mode-specific rather than a regression: the same pipeline, run
+     * classically over the same index, must still serve the query with its bounds honored shard-side.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenPipelineNormalizationCarriesBounds_thenRejectedWhileClassicStillServes() {
+        createSearchPipeline(
+            BOUNDED_NORM_PIPELINE,
+            "min_max",
+            // One bound per sub-query, which is what the classic technique validates against.
+            Map.of("lower_bounds", List.of(Map.of("mode", "apply", "min_score", "0.1"), Map.of("mode", "apply", "min_score", "0.1"))),
+            "arithmetic_mean",
+            Map.of(),
+            false
+        );
+        if (indexExists(INDEX_WITH_BOUNDED_NORM) == false) {
+            createIndex(INDEX_WITH_BOUNDED_NORM, indexConfigWithDefaultPipeline(BOUNDED_NORM_PIPELINE));
+            addFourDocs(INDEX_WITH_BOUNDED_NORM);
+        }
+
+        ResponseException e = expectThrows(ResponseException.class, () -> search(INDEX_WITH_BOUNDED_NORM, fusedTwoLegQuery(), 10));
+        assertTrue(e.getMessage(), e.getMessage().contains("[normalization.parameters] [lower_bounds] not supported"));
+        assertTrue(e.getMessage(), e.getMessage().contains("normalization [min_max] in fused mode"));
+
+        HybridQueryBuilder classic = new HybridQueryBuilder();
+        classic.add(new MatchQueryBuilder(TEXT_FIELD, "hello"));
+        classic.add(new TermQueryBuilder(TEXT_FIELD, "place"));
+        Map<String, Object> response = search(INDEX_WITH_BOUNDED_NORM, classic, 10);
+        assertEquals(3, getHitCount(response));
     }
 }

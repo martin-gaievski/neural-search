@@ -586,16 +586,18 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
             throw new IllegalArgumentException(
                 String.format(
                     Locale.ROOT,
-                    "[%s] query [%s] requires a normalization or score-ranker processor: the resolved search pipeline "
-                        + "(from ?search_pipeline= or index.search.default_pipeline) has none, and no inline fusion block "
-                        + "was provided (a missing pipeline id is rejected earlier by core). A fused [%s] nested inside "
-                        + "another compound query (for example [bool] or [dis_max]) within a leg of an enclosing fused [%s] "
-                        + "must carry an inline [%s] config, because a leg sub-search runs with the search pipeline disabled",
+                    "[%s] query [%s: %s] requires a normalization or score-ranker processor: the resolved search pipeline "
+                        + "(from ?search_pipeline= or index.search.default_pipeline) has none (a missing pipeline id is "
+                        + "rejected earlier by core). Drop [%s] to fuse with the built-in defaults, or name the techniques "
+                        + "inline. A fused [%s] nested inside another compound query (for example [bool] or [dis_max]) "
+                        + "within a leg of an enclosing fused [%s] must not read from the pipeline, because a leg "
+                        + "sub-search runs with the search pipeline disabled",
                     NAME,
-                    FUSION_FIELD.getPreferredName(),
+                    FUSION_KEY_SOURCE,
+                    FUSION_SOURCE_PIPELINE,
+                    FUSION_KEY_SOURCE,
                     NAME,
-                    NAME,
-                    FUSION_FIELD.getPreferredName()
+                    NAME
                 )
             );
         }
@@ -1127,12 +1129,14 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     /**
      * Resolve the fusion config for this rewrite, in precedence order:
      * <ol>
-     *   <li>an inline {@code fusion} block on this query body (explicit user intent, wins outright);</li>
+     *   <li>the {@code fusion} block on this query body, unless it delegates with {@code source: pipeline} — the block
+     *       configures the fusion (technique keys, or the built-in defaults when it names none), and wins outright;</li>
      *   <li>a config projected down by an enclosing fused hybrid ({@link #resolvedFusionSpec}) — this builder is one of
      *       its legs, and the leg request has no pipeline to read;</li>
      *   <li>the search pipeline attached to the request (inline body / {@code ?search_pipeline=} / index default).</li>
      * </ol>
-     * {@code null} when none of the three yields a config; the caller fails fast rather than emitting unfused scores.
+     * {@code null} when none of the three yields a config, which now means only a {@code source: pipeline} block with no
+     * pipeline carrying a phase-results processor; the caller fails fast rather than emitting unfused scores.
      */
     private FusionSpec resolveFusionSpec(final SearchRequest searchRequest) {
         if (Objects.nonNull(this.fusion) && hasInlineConfig(this.fusion)) {
@@ -1145,7 +1149,7 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     }
 
     /**
-     * Hand the already-resolved fusion config down to any leg that is itself a fused hybrid without an inline config.
+     * Hand the already-resolved fusion config down to any leg that is itself a fused hybrid delegating to the pipeline.
      *
      * <p>Legs are fanned out with {@code pipeline=_none} so that per-leg request/response processors do not run
      * ({@link HybridFusionOrchestrator#buildLegMultiSearch}); a nested fused hybrid would therefore resolve no config
@@ -1154,9 +1158,9 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      * and it is the same request and therefore the same pipeline.
      *
      * <p>Reaches direct legs only, at any nesting depth (each level projects onto its own legs). A fused hybrid buried
-     * inside a container query within a leg (e.g. {@code bool{must: hybrid{fusion}}}) is not reachable —
-     * {@link QueryBuilder} exposes no generic child accessor — and still fails, now with a message that names the real
-     * cause and the inline-config workaround.
+     * inside a container query within a leg (e.g. {@code bool{must: hybrid{fusion: {source: pipeline}}}}) is not
+     * reachable — {@link QueryBuilder} exposes no generic child accessor — and still fails, now with a message that names
+     * the real cause and the two workarounds (drop {@code source}, or name the techniques inline).
      *
      * @return the original list when nothing needed projecting (the common case), else a copy with legs substituted
      */
@@ -1201,9 +1205,17 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         return copy;
     }
 
-    /** True when the inline {@code fusion} block carries an actual config (not just {@code source: pipeline} / empty). */
+    /**
+     * True when the {@code fusion} block configures the fusion itself rather than delegating to the attached pipeline.
+     *
+     * <p>Keys on the absence of {@code source: pipeline}, not on the presence of a technique key: a block that names
+     * neither a technique nor a source ({@code fusion: {}}, {@code fusion: {"window_size": N}}) is the built-in-defaults
+     * form, and {@link FusionSpec#fromInlineFusion} fills in min_max + arithmetic_mean with equal weights. Reading the
+     * pipeline instead would depend on request context the query body does not show — which pipeline the request or the
+     * index happens to attach — so it is only ever done when the body asks for it.
+     */
     private static boolean hasInlineConfig(final Map<String, Object> fusion) {
-        return fusion.containsKey(FUSION_KEY_NORMALIZATION) || fusion.containsKey(FUSION_KEY_COMBINATION);
+        return fusion.containsKey(FUSION_KEY_SOURCE) == false;
     }
 
     /**
@@ -1430,6 +1442,10 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
      *   <li>{@code source: "pipeline"} alongside inline {@code normalization}/{@code combination} → 400 (contradiction:
      *       read-from-pipeline vs inline config);</li>
      *   <li>{@code source} present but not {@code "pipeline"} → 400;</li>
+     *   <li>{@code normalization}/{@code combination} present but not an object → 400 (a bare string would otherwise fall
+     *       through every {@code instanceof Map} gate in {@link FusionSpec} to the min_max + arithmetic_mean defaults, and
+     *       fuse by a technique the user did not ask for — the shorthand {@code "fusion": "pipeline"} one level up makes
+     *       {@code "combination": "rrf"} an easy thing to write);</li>
      *   <li>{@code window_size} non-positive → 400 (upper bound vs {@code index.max_result_window} is shard-side);</li>
      *   <li>{@code pagination_depth} co-set with {@code fusion} → 400 (fused pages over {@code window_size}).</li>
      * </ul>
@@ -1474,6 +1490,23 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                         FUSION_SOURCE_PIPELINE,
                         FUSION_KEY_NORMALIZATION,
                         FUSION_KEY_COMBINATION
+                    )
+                );
+            }
+        }
+
+        for (String clause : List.of(FUSION_KEY_NORMALIZATION, FUSION_KEY_COMBINATION)) {
+            Object value = fusion.get(clause);
+            if (Objects.nonNull(value) && (value instanceof Map) == false) {
+                throw new ParsingException(
+                    parser.getTokenLocation(),
+                    String.format(
+                        Locale.ROOT,
+                        "[%s] query [%s.%s] must be an object, got [%s]",
+                        NAME,
+                        FUSION_FIELD.getPreferredName(),
+                        clause,
+                        value
                     )
                 );
             }

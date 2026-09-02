@@ -8,6 +8,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.TreeSet;
 
 import lombok.AccessLevel;
 import lombok.Getter;
@@ -41,7 +43,8 @@ import org.opensearch.neuralsearch.processor.normalization.RRFScoreNormalizer;
  *       combination clause itself, NOT under {@code parameters} — that is where {@code RRFProcessorFactory} reads it) +
  *       optional {@code combination.parameters.weights}. RRF is rank-based, so this shape carries no normalization
  *       clause; it still resolves to {@code normalization = rrf}, because that is the normalization classic applies for
- *       it — see {@link #readNormalizationTechnique}.</li>
+ *       it — see {@link #readNormalizationTechnique}. An inline block may also spell {@code rank_constant} the other
+ *       shape's way, under {@code normalization.parameters} — see {@link #resolveScoreRankerRankConstant}.</li>
  * </ul>
  *
  * <p>Note that {@code rrf} appears in both, and means different things: under a {@code normalization-processor} it is
@@ -85,6 +88,14 @@ public final class FusionSpec {
     private static final String PARAMETERS_KEY = "parameters";
     private static final String WEIGHTS_KEY = "weights";
     private static final String RANK_CONSTANT_KEY = RRFScoreNormalizer.PARAM_NAME_RANK_CONSTANT;
+
+    /**
+     * The only {@code normalization.parameters} key fused mode honors, and only where {@code rrf} is the normalization
+     * technique. Every other parameter classic reads from that clause — min_max's {@code lower_bounds} and
+     * {@code upper_bounds} — has no coordinator-side implementation, so it is refused rather than accepted and dropped;
+     * see {@link #rejectUnhonoredNormalizationParameters}.
+     */
+    private static final Set<String> RRF_NORMALIZATION_PARAMETERS = Set.of(RANK_CONSTANT_KEY);
 
     private final Shape shape; // which processor shape this was read as
     private final String combinationTechnique; // rrf | arithmetic_mean
@@ -150,6 +161,8 @@ public final class FusionSpec {
         if (Objects.isNull(fusionConfig)) {
             return null;
         }
+        requireObjectClause(fusionConfig, NORMALIZATION_CLAUSE);
+        requireObjectClause(fusionConfig, COMBINATION_CLAUSE);
         if (fusionConfig.get(COMBINATION_CLAUSE) instanceof Map) {
             Object technique = ((Map<String, Object>) fusionConfig.get(COMBINATION_CLAUSE)).get(TECHNIQUE_KEY);
             if (Objects.nonNull(technique) && TECHNIQUE_RRF.equals(technique.toString().toLowerCase(Locale.ROOT))) {
@@ -162,6 +175,13 @@ public final class FusionSpec {
     @SuppressWarnings("unchecked")
     private static FusionSpec fromNormalizationProcessor(Map<String, Object> config) {
         String normalization = readNormalizationTechnique(config, NORMALIZATION_MIN_MAX);
+        // Before anything reads a value out of `normalization.parameters`, so that whichever parameters this shape does
+        // not honor are named in the error instead of being dropped on the floor.
+        rejectUnhonoredNormalizationParameters(
+            config,
+            normalization,
+            NORMALIZATION_RRF.equals(normalization) ? RRF_NORMALIZATION_PARAMETERS : Set.of()
+        );
         String combination = TECHNIQUE_ARITHMETIC_MEAN;
         float[] weights = new float[0];
         if (config.get(COMBINATION_CLAUSE) instanceof Map) {
@@ -184,7 +204,7 @@ public final class FusionSpec {
      *
      * <p>Only read for {@code rrf}, because it is an rrf parameter: resolving it for a score-based technique would answer
      * a stray {@code rank_constant} under {@code min_max} with a rank-constant range error instead of the unsupported-
-     * parameter error {@code ScoreNormalizationUtil} raises for it.
+     * parameter error {@link #rejectUnhonoredNormalizationParameters} raises for it first.
      */
     private static int readRankConstant(Map<String, Object> config, String normalization) {
         if (NORMALIZATION_RRF.equals(normalization) == false) {
@@ -208,32 +228,27 @@ public final class FusionSpec {
 
     @SuppressWarnings("unchecked")
     private static FusionSpec fromScoreRankerProcessor(Map<String, Object> config) {
-        int rankConstant = DEFAULT_RANK_CONSTANT;
+        String normalization = readNormalizationTechnique(config, NORMALIZATION_RRF);
+        rejectUnhonoredNormalizationParameters(
+            config,
+            normalization,
+            NORMALIZATION_RRF.equals(normalization) ? RRF_NORMALIZATION_PARAMETERS : Set.of()
+        );
+        Map<String, Object> combinationClause = Map.of();
         float[] weights = new float[0];
         if (config.get(COMBINATION_CLAUSE) instanceof Map) {
-            Map<String, Object> combinationClause = (Map<String, Object>) config.get(COMBINATION_CLAUSE);
+            combinationClause = (Map<String, Object>) config.get(COMBINATION_CLAUSE);
             rejectRankConstantUnderParameters(combinationClause);
-            // rank_constant sits on the combination clause itself, which is where RRFProcessorFactory reads it — NOT
-            // under `parameters`, whose only supported key is `weights`. Delegating to the shared resolver makes fused
-            // mode accept, reject and report exactly what classic does: absent -> default, non-integer -> "must be an
-            // integer", outside [1, 10000] -> the range error. Reading the value directly here would silently accept a
-            // negative, oversized or fractional rank constant that the score-ranker-processor rejects.
-            rankConstant = RRFScoreNormalizer.resolveRankConstant(combinationClause);
             weights = readWeights(combinationClause);
         }
+        int rankConstant = resolveScoreRankerRankConstant(combinationClause, readNormalizationParameters(config));
         // The score-ranker-processor has no normalization clause, so the default is what this shape almost always
         // resolves to. It is "rrf", not "none", because rank scoring IS this shape's normalization step — classic says so
         // itself: RRFProcessorFactory builds an RRFNormalizationTechnique for a processor with no normalization clause.
         // Naming it lets the coordinator resolve rrf through the same ScalarNormalizers lookup as every other technique.
         // An inline fusion block can still carry a normalization clause, and it is reported rather than dropped so the
         // caller's technique check rejects the contradictory pairing instead of silently ignoring what the user asked for.
-        return new FusionSpec(
-            Shape.SCORE_RANKER_PROCESSOR,
-            TECHNIQUE_RRF,
-            readNormalizationTechnique(config, NORMALIZATION_RRF),
-            rankConstant,
-            weights
-        );
+        return new FusionSpec(Shape.SCORE_RANKER_PROCESSOR, TECHNIQUE_RRF, normalization, rankConstant, weights);
     }
 
     /**
@@ -260,6 +275,96 @@ public final class FusionSpec {
         }
     }
 
+    /**
+     * Refuse a {@code normalization.parameters} key fused mode does not honor, rather than parsing the config as if it
+     * were not there. Every parameter classic reads from that clause changes the scores it produces, so accepting one and
+     * ignoring it answers the request with a different ranking at HTTP 200 — min_max's {@code lower_bounds}/
+     * {@code upper_bounds} being the case that matters, since they are the documented way to bound a score-based
+     * normalization and there is no coordinator-side implementation of them yet: {@code ScalarNormalizers} resolves
+     * min_max to a parameterless singleton, and the only parameter map the orchestrator ever builds carries
+     * {@code rank_constant}. Refusing is what leaves that honoring for later without a behavior change; a config classic
+     * accepts then fails fast in fused mode, which is a 400 the user can act on rather than silent divergence.
+     *
+     * <p>The honored set is the caller's, not this method's, because it is technique-dependent: {@code rank_constant} is
+     * an rrf parameter, so it is honored wherever rrf is the normalization and refused under a score-based one — which is
+     * also what keeps a stray {@code rank_constant} under {@code min_max} from being answered with a rank-constant range
+     * error instead of an unsupported-parameter one.
+     */
+    private static void rejectUnhonoredNormalizationParameters(
+        Map<String, Object> config,
+        String normalization,
+        Set<String> honoredParameters
+    ) {
+        Set<String> unhonored = new TreeSet<>(readNormalizationParameters(config).keySet());
+        unhonored.removeAll(honoredParameters);
+        if (unhonored.isEmpty()) {
+            return;
+        }
+        throw new IllegalArgumentException(
+            String.format(
+                Locale.ROOT,
+                "[%s.%s] %s not supported with normalization [%s] in fused mode; supported parameters are %s",
+                NORMALIZATION_CLAUSE,
+                PARAMETERS_KEY,
+                unhonored,
+                normalization,
+                new TreeSet<>(honoredParameters)
+            )
+        );
+    }
+
+    /**
+     * {@code rank_constant} for the {@code score-ranker-processor} shape, read from either place a user may reasonably
+     * spell it: the combination clause itself, which is where {@code RRFProcessorFactory} reads it, or
+     * {@code normalization.parameters}, which is where the {@code normalization-processor} shape keeps the very same
+     * parameter. Both name one rank constant for one rrf normalization, so honoring either is unambiguous — and the
+     * second spelling can only reach here from an inline {@code fusion} block, never from a pipeline: classic's
+     * {@code RRFProcessorFactory} reads no normalization clause at all, so a {@code score-ranker-processor} carrying one
+     * is rejected at pipeline creation. Honoring it therefore cannot make fused mode fuse a *pipeline* differently than
+     * classic would.
+     *
+     * <p>Given in both places with different values it is a contradiction, not a precedence question, so it is refused
+     * rather than resolved by a rule the user cannot see. Each location is resolved through the shared resolver, so a
+     * non-integer or out-of-range value is reported exactly as classic reports it whichever place it was written.
+     */
+    private static int resolveScoreRankerRankConstant(Map<String, Object> combinationClause, Map<String, Object> normalizationParameters) {
+        // Absent from the combination clause this is the default, which is also the right answer when neither place has it.
+        int fromCombination = RRFScoreNormalizer.resolveRankConstant(combinationClause);
+        if (normalizationParameters.containsKey(RANK_CONSTANT_KEY) == false) {
+            return fromCombination;
+        }
+        int fromNormalization = RRFScoreNormalizer.resolveRankConstant(normalizationParameters);
+        if (combinationClause.containsKey(RANK_CONSTANT_KEY) && fromCombination != fromNormalization) {
+            throw new IllegalArgumentException(
+                String.format(
+                    Locale.ROOT,
+                    "[%s] is set to [%d] on the [%s] clause and to [%d] under [%s.%s]; set it in one place only",
+                    RANK_CONSTANT_KEY,
+                    fromCombination,
+                    COMBINATION_CLAUSE,
+                    fromNormalization,
+                    NORMALIZATION_CLAUSE,
+                    PARAMETERS_KEY
+                )
+            );
+        }
+        return fromNormalization;
+    }
+
+    /**
+     * Refuse a {@code normalization}/{@code combination} value that is not an object. Every reader below gates on
+     * {@code instanceof Map}, so a bare string would fall through to the min_max + arithmetic_mean defaults and fuse by a
+     * technique the user did not ask for, at HTTP 200. The mistake is an easy one to make, because one level up the
+     * shorthand {@code "fusion": "pipeline"} <em>is</em> a bare string.
+     */
+    private static void requireObjectClause(Map<String, Object> fusionConfig, String clause) {
+        Object value = fusionConfig.get(clause);
+        if (Objects.isNull(value) || value instanceof Map) {
+            return;
+        }
+        throw new IllegalArgumentException(String.format(Locale.ROOT, "[%s] must be an object, got [%s]", clause, value));
+    }
+
     @SuppressWarnings("unchecked")
     private static String readNormalizationTechnique(Map<String, Object> config, String defaultTechnique) {
         if ((config.get(NORMALIZATION_CLAUSE) instanceof Map) == false) {
@@ -269,6 +374,15 @@ public final class FusionSpec {
         return Objects.isNull(technique) ? defaultTechnique : technique.toString().toLowerCase(Locale.ROOT);
     }
 
+    /**
+     * {@code combination.parameters.weights}, read the same way for both shapes — weights sit on the combination clause,
+     * so the normalization technique has no bearing on them.
+     *
+     * <p>A {@code weights} that is present but not a list is refused rather than read as absent. The orchestrator hands
+     * {@link org.opensearch.neuralsearch.processor.combination.ScoreCombinationUtil} a list it rebuilds from the parsed
+     * array, so classic's own type check ("must be a collection of numbers") can never see the malformed value and a
+     * scalar or string {@code weights} was fusing unweighted at HTTP 200 — the same request classic answers with a 400.
+     */
     @SuppressWarnings("unchecked")
     private static float[] readWeights(Map<String, Object> combinationClause) {
         if ((combinationClause.get(PARAMETERS_KEY) instanceof Map) == false) {
@@ -276,6 +390,11 @@ public final class FusionSpec {
         }
         Map<String, Object> parameters = (Map<String, Object>) combinationClause.get(PARAMETERS_KEY);
         if ((parameters.get(WEIGHTS_KEY) instanceof List) == false) {
+            if (parameters.containsKey(WEIGHTS_KEY)) {
+                throw new IllegalArgumentException(
+                    String.format(Locale.ROOT, "parameter [%s] must be a collection of numbers", WEIGHTS_KEY)
+                );
+            }
             return new float[0];
         }
         List<Object> raw = (List<Object>) parameters.get(WEIGHTS_KEY);
