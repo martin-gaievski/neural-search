@@ -54,10 +54,10 @@ import lombok.extern.log4j.Log4j2;
  *
  * This filter works transparently without any pipeline or query configuration.
  *
- * The same seam carries fused-mode per-leg profiling: a fused hybrid runs its legs as sub-searches during the
- * coordinator rewrite, and this is the one place that both sees the query as the user submitted it and still owns the
- * response listener, so it can hand the legs somewhere to publish their profile trees and merge those trees into the
- * response on the way out. See {@link #attachLegProfiling}.
+ * The same seam carries fused mode's coordinator-side reporting — per-leg profiling and a leg cut short by a soft
+ * {@code timeout}: a fused hybrid runs its legs as sub-searches during the coordinator rewrite, and this is the one place
+ * that both sees the query as the user submitted it and still owns the response listener, so it can hand the legs somewhere
+ * to publish what they know and merge it into the response on the way out. See {@link #attachFusedReporting}.
  *
  */
 @Log4j2
@@ -115,25 +115,36 @@ public class HybridQuerySearchRequestFilter implements ActionFilter {
                 }
             }
         }
-        chain.proceed(task, action, request, attachLegProfiling(action, request, listener));
+        chain.proceed(task, action, request, attachFusedReporting(action, request, listener));
     }
 
     /**
-     * The response listener to proceed with: when a request asks for {@code profile} and carries at least one fused
-     * {@code hybrid}, hand every such hybrid consumers writing into one request-scoped merger — one for its legs' profile
-     * trees, one for what the coordinator itself spent fanning them out and fusing them — and wrap the listener so what the
-     * merger collected ends up in the response's profile section. Otherwise the caller's own listener, unchanged.
+     * The response listener to proceed with: when a request carries at least one fused {@code hybrid} and there is something
+     * for it to report, hand the relevant hybrids consumers writing into request-scoped mergers — the legs' profile trees,
+     * what the coordinator itself spent fanning them out and fusing them, and whether a soft {@code timeout} truncated a leg
+     * — and wrap the listener so what those mergers collected reaches the response. Otherwise the caller's own listener,
+     * unchanged.
      *
      * <p>No side channel is needed: the {@link HybridQueryBuilder} instances reachable from {@code source().query()} here
-     * are the same instances rewrite round 1 runs on, so attaching to them directly is enough. Nothing happens when the
-     * request is not profiled, and nothing happens to the response when nothing was ever collected.
+     * are the same instances rewrite round 1 runs on, so attaching to them directly is enough. Nothing happens when there is
+     * nothing to report, and nothing happens to the response when nothing was ever collected.
      *
-     * <p>This runs before search request processors do, so it reports the legs of the hybrids the request carries <b>as
-     * submitted, with {@code profile} as submitted</b>. A pipeline that replaces the query — or changes {@code profile} —
-     * is outside that boundary: the request still answers correctly, it simply carries no leg detail.
+     * <p>The two reports attach on different conditions, because they answer to different things:
+     * <ul>
+     *   <li>{@code profile} — every fused hybrid the request fans out, since each gets its own labelled entry in the
+     *       profile section.</li>
+     *   <li>{@code timed_out} — every fused hybrid, and <b>not</b> conditional on the request having asked for a diagnostic:
+     *       a leg the timeout truncated narrows the window every client's ranking comes out of, so it is part of the answer
+     *       rather than part of the instrumentation. It is instead conditional on {@link #mayHitASoftTimeout}, so that a
+     *       request which cannot time out costs nothing.</li>
+     * </ul>
+     *
+     * <p>This runs before search request processors do, so it reports the hybrids the request carries <b>as submitted, with
+     * {@code profile} and {@code timeout} as submitted</b>. A pipeline that replaces the query — or changes either — is
+     * outside that boundary: the request still answers correctly, it simply carries no fused detail.
      */
     @SuppressWarnings("unchecked")
-    private <Request extends ActionRequest, Response extends ActionResponse> ActionListener<Response> attachLegProfiling(
+    private <Request extends ActionRequest, Response extends ActionResponse> ActionListener<Response> attachFusedReporting(
         final String action,
         final Request request,
         final ActionListener<Response> listener
@@ -142,7 +153,12 @@ public class HybridQuerySearchRequestFilter implements ActionFilter {
             return listener;
         }
         SearchSourceBuilder source = ((SearchRequest) request).source();
-        if (Objects.isNull(source) || source.profile() == false || Objects.isNull(source.query())) {
+        if (Objects.isNull(source) || Objects.isNull(source.query())) {
+            return listener;
+        }
+        boolean profiled = source.profile();
+        boolean mayTimeOut = mayHitASoftTimeout(source);
+        if (profiled == false && mayTimeOut == false) {
             return listener;
         }
         FusedHybridFinder finder = new FusedHybridFinder();
@@ -152,21 +168,62 @@ public class HybridQuerySearchRequestFilter implements ActionFilter {
         if (finder.found.isEmpty()) {
             return listener;
         }
-        FusedLegProfileMerger legProfileMerger = new FusedLegProfileMerger();
-        for (int i = 0; i < finder.found.size(); i++) {
-            // One label per hybrid, shared by both consumers: the legs' entries and the coordinator's entry for the same
-            // hybrid have to name it the same way for the profile section to read as one query.
-            String hybridLabel = String.format(Locale.ROOT, "hybrid_%d", i);
-            finder.found.get(i).legProfileConsumer(legProfileMerger.forHybrid(hybridLabel));
-            finder.found.get(i).fusionTimingConsumer(legProfileMerger.forHybridTiming(hybridLabel));
+        FusedLegProfileMerger legProfileMerger = null;
+        if (profiled) {
+            legProfileMerger = new FusedLegProfileMerger();
         }
+        FusedLegTimeoutMerger timeoutMerger = null;
+        if (mayTimeOut) {
+            timeoutMerger = new FusedLegTimeoutMerger();
+        }
+        for (int i = 0; i < finder.found.size(); i++) {
+            HybridQueryBuilder hybrid = finder.found.get(i);
+            if (Objects.nonNull(legProfileMerger)) {
+                // One label per hybrid, shared by both consumers: the legs' entries and the coordinator's entry for the same
+                // hybrid have to name it the same way for the profile section to read as one query.
+                String hybridLabel = String.format(Locale.ROOT, "hybrid_%d", i);
+                hybrid.legProfileConsumer(legProfileMerger.forHybrid(hybridLabel));
+                hybrid.fusionTimingConsumer(legProfileMerger.forHybridTiming(hybridLabel));
+            }
+            if (Objects.nonNull(timeoutMerger)) {
+                hybrid.legTimeoutConsumer(timeoutMerger.consumer());
+            }
+        }
+        final FusedLegProfileMerger profiles = legProfileMerger;
+        final FusedLegTimeoutMerger timeouts = timeoutMerger;
         return ActionListener.wrap(response -> {
             if ((response instanceof SearchResponse) == false) {
                 listener.onResponse(response);
                 return;
             }
-            listener.onResponse((Response) legProfileMerger.getMergedResponse((SearchResponse) response));
+            SearchResponse merged = (SearchResponse) response;
+            // One rebuild carrying both overrides, rather than one per report: each rebuild has to re-pass every field of
+            // the response it is replacing, so chaining them would multiply the places a newly-added core field could be
+            // dropped from. Never clears timed_out — the response's own flag is an input to the OR, not something to
+            // overwrite: round 2 can time out on its own.
+            merged = FusedResponseRebuilder.rebuild(
+                merged,
+                Objects.nonNull(profiles) ? profiles.mergedProfileResults(merged) : null,
+                merged.isTimedOut() || (Objects.nonNull(timeouts) && timeouts.anyLegTimedOut())
+            );
+            listener.onResponse((Response) merged);
         }, listener::onFailure);
+    }
+
+    /**
+     * Whether a leg of this request could be cut short by a soft {@code timeout}, and therefore whether it is worth walking
+     * the query to find fused hybrids to watch. False for the overwhelming majority of searches, which set no timeout at all
+     * — and that is the point: without this gate every search reaching this filter would pay a query-tree walk to discover
+     * something that could not have happened.
+     *
+     * <p>Reads the request's own {@code timeout} only. The cluster-wide {@code search.default_search_timeout} would apply to
+     * a leg sub-search as much as to any other search and is <b>not</b> covered here: it is unset by default, and consulting
+     * it means holding cluster settings and re-reading them per request on a path whose whole justification is that it is
+     * free. A cluster that sets it and a request that relies on it will see the response's own {@code timed_out} for round 2
+     * and no fused contribution — the behavior as it stands today, not a new gap.
+     */
+    private static boolean mayHitASoftTimeout(final SearchSourceBuilder source) {
+        return Objects.nonNull(source.timeout());
     }
 
     /**

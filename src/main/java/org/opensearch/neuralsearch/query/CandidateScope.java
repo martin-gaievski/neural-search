@@ -487,8 +487,9 @@ final class CandidateScope {
      * fan-out than the same request unprofiled — the ordinary observer effect of {@code profile}, and the reason the
      * numbers a profiled run reports describe a profiled run. It lands inside the user's {@code timeout} like any other
      * leg work: a leg that exceeds a soft timeout returns the candidates it had, so the window can be narrower than an
-     * unprofiled run's. That is not specific to profiling — a fused request under a soft timeout already reports no sign
-     * of a truncated leg.
+     * unprofiled run's. That is not specific to profiling, and it is visible: a fused response reports
+     * {@code timed_out} when any leg was truncated, whether or not the request asked to be profiled (see
+     * {@code FusedLegTimeoutMerger}).
      */
     void enableLegProfiling() {
         this.legProfiling = true;

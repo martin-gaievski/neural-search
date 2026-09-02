@@ -27,7 +27,8 @@ import lombok.experimental.Accessors;
  * <p>Mutable and single-writer: one instance per fused hybrid per request, written on the rewrite thread and on the leg
  * MultiSearch response thread (never both at once — the fan-out span is closed before the response callback writes
  * anything), then read once when the entry is synthesized. Always constructed, even when the request is not profiled, so
- * that the orchestrator never has to null-check; an unprofiled request simply throws the instance away.
+ * that the orchestrator never has to null-check; an unprofiled request throws away everything here except
+ * {@link #anyLegTimedOut()}, which is reported on the response itself rather than in the profile section.
  */
 @Getter
 @Setter
@@ -78,6 +79,17 @@ public final class FusedCoordinatorTimings {
     private final List<Map<String, Object>> legs = new ArrayList<>();
 
     /**
+     * Whether any leg was truncated by a soft {@code timeout}. Kept as its own field rather than derived from
+     * {@link #legs} because it is the one thing here that is reported <b>outside</b> the profile section — it sets the
+     * response's own {@code timed_out}, on profiled and unprofiled requests alike (see
+     * {@code org.opensearch.neuralsearch.search.FusedLegTimeoutMerger}) — so it must not be reachable only by parsing the
+     * rendering.
+     */
+    @Getter(lombok.AccessLevel.NONE)
+    @Setter(lombok.AccessLevel.NONE)
+    private boolean anyLegTimedOut;
+
+    /**
      * Record what one leg returned. {@code tookMillis} is the leg response's own {@code took}, which core reports in whole
      * milliseconds — coarse enough at small corpus sizes that it is a shape signal rather than a measurement.
      */
@@ -88,6 +100,12 @@ public final class FusedCoordinatorTimings {
         leg.put("hits", hits);
         leg.put("timed_out", timedOut);
         legs.add(leg);
+        anyLegTimedOut = anyLegTimedOut || timedOut;
+    }
+
+    /** Whether any leg recorded so far reported a soft timeout, so the response has to be marked incomplete. */
+    public boolean anyLegTimedOut() {
+        return anyLegTimedOut;
     }
 
     /** What fusing cost once the legs were back: everything the coordinator did that was not waiting on them. */

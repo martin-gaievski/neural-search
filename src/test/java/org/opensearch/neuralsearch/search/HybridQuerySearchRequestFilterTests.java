@@ -26,6 +26,7 @@ import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchType;
 import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.action.support.ActionFilterChain;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.index.query.BoolQueryBuilder;
@@ -352,7 +353,130 @@ public class HybridQuerySearchRequestFilterTests extends OpenSearchQueryTestCase
 
         assertNull(hybridQuery.legProfileConsumer());
         assertNull(hybridQuery.fusionTimingConsumer());
+        assertNull("and a request that cannot time out has no timeout to watch for either", hybridQuery.legTimeoutConsumer());
         assertSame(listener, proceedListener(searchRequest, listener));
+    }
+
+    /**
+     * A soft {@code timeout} is reported whether or not the request asked for a diagnostic: a truncated leg narrows the
+     * window the ranking comes out of, which is part of the answer rather than part of the instrumentation.
+     */
+    @SuppressWarnings("unchecked")
+    public void testApply_whenAFusedHybridRequestSetsATimeout_thenTheTimeoutReportAttachesWithoutProfiling() {
+        HybridQueryBuilder hybridQuery = fusedHybrid();
+
+        SearchRequest searchRequest = new SearchRequest("test_index");
+        searchRequest.source(new SearchSourceBuilder().query(hybridQuery).timeout(TimeValue.timeValueMillis(50)));
+
+        ActionListener<ActionResponse> listener = mock(ActionListener.class);
+        ActionListener<ActionResponse> proceeded = proceedListener(searchRequest, listener);
+
+        assertNotNull("a leg can be cut short, so it must have somewhere to say so", hybridQuery.legTimeoutConsumer());
+        assertNull("without profile there are still no leg trees to collect", hybridQuery.legProfileConsumer());
+        assertNotSame("and the listener has to be wrapped for the flag to reach the response", listener, proceeded);
+    }
+
+    /** The flag the truncation sets is the response's own {@code timed_out}, on a request that asked for nothing else. */
+    @SuppressWarnings("unchecked")
+    public void testWrappedListener_whenALegTimedOut_thenTheResponseSaysSo() {
+        HybridQueryBuilder hybridQuery = fusedHybrid();
+        SearchRequest searchRequest = new SearchRequest("test_index");
+        searchRequest.source(new SearchSourceBuilder().query(hybridQuery).timeout(TimeValue.timeValueMillis(50)));
+
+        ActionListener<ActionResponse> listener = mock(ActionListener.class);
+        ActionListener<ActionResponse> proceeded = proceedListener(searchRequest, listener);
+        hybridQuery.legTimeoutConsumer().accept(true);
+
+        SearchResponse merged = merge(proceeded, listener, responseWithoutProfile());
+
+        assertTrue("the fusion ranked an incomplete candidate set, and the client has to be able to tell", merged.isTimedOut());
+        assertTrue("and an unprofiled request must not grow a profile section on the way", merged.getProfileResults().isEmpty());
+    }
+
+    /** The overwhelmingly common case: the timeout was set, no leg hit it, and the response is handed back as it came. */
+    @SuppressWarnings("unchecked")
+    public void testWrappedListener_whenNoLegTimedOut_thenTheResponseIsNotRebuilt() {
+        HybridQueryBuilder hybridQuery = fusedHybrid();
+        SearchRequest searchRequest = new SearchRequest("test_index");
+        searchRequest.source(new SearchSourceBuilder().query(hybridQuery).timeout(TimeValue.timeValueMillis(50)));
+
+        ActionListener<ActionResponse> listener = mock(ActionListener.class);
+        ActionListener<ActionResponse> proceeded = proceedListener(searchRequest, listener);
+        hybridQuery.legTimeoutConsumer().accept(false);
+
+        SearchResponse response = responseWithoutProfile();
+        assertSame("nothing to report means nothing to rebuild", response, merge(proceeded, listener, response));
+    }
+
+    /**
+     * Round 2 can time out on its own, entirely apart from the legs. The response's own flag is therefore an input to the
+     * OR rather than something the fused report overwrites, and a fan-out that all completed must not clear it.
+     */
+    @SuppressWarnings("unchecked")
+    public void testWrappedListener_whenRoundTwoTimedOutButNoLegDid_thenTheFlagIsNotCleared() {
+        HybridQueryBuilder hybridQuery = fusedHybrid();
+        SearchRequest searchRequest = new SearchRequest("test_index");
+        searchRequest.source(new SearchSourceBuilder().query(hybridQuery).timeout(TimeValue.timeValueMillis(50)));
+
+        ActionListener<ActionResponse> listener = mock(ActionListener.class);
+        ActionListener<ActionResponse> proceeded = proceedListener(searchRequest, listener);
+        hybridQuery.legTimeoutConsumer().accept(false);
+
+        SearchResponse merged = merge(proceeded, listener, response(null, true));
+
+        assertTrue("the search's own truncation is not the fused report's to undo", merged.isTimedOut());
+    }
+
+    /** Two reports on one request are one rebuild, so asking for both must not cost either of them. */
+    @SuppressWarnings("unchecked")
+    public void testWrappedListener_whenProfiledAndALegTimedOut_thenOneResponseCarriesBoth() {
+        HybridQueryBuilder hybridQuery = fusedHybrid();
+        SearchRequest searchRequest = new SearchRequest("test_index");
+        searchRequest.source(new SearchSourceBuilder().query(hybridQuery).profile(true).timeout(TimeValue.timeValueMillis(50)));
+
+        ActionListener<ActionResponse> listener = mock(ActionListener.class);
+        ActionListener<ActionResponse> proceeded = proceedListener(searchRequest, listener);
+        hybridQuery.legProfileConsumer().accept(1, Map.of(SHARD_KEY, legProfile()));
+        hybridQuery.legTimeoutConsumer().accept(true);
+
+        SearchResponse merged = merge(proceeded, listener, responseWithProfile(Map.of(SHARD_KEY, legProfile())));
+
+        assertTrue(merged.isTimedOut());
+        assertEquals(Set.of(SHARD_KEY + "[fused:rewrite]", SHARD_KEY + "[fused:hybrid_0.leg_1]"), merged.getProfileResults().keySet());
+    }
+
+    /** One truncated hybrid makes the whole answer incomplete, so a completed sibling must not talk it back down. */
+    @SuppressWarnings("unchecked")
+    public void testWrappedListener_whenOnlyOneOfTwoFusedHybridsTimedOut_thenTheResponseStillSaysSo() {
+        HybridQueryBuilder first = fusedHybrid();
+        HybridQueryBuilder second = fusedHybrid();
+
+        SearchRequest searchRequest = new SearchRequest("test_index");
+        searchRequest.source(
+            new SearchSourceBuilder().query(new BoolQueryBuilder().should(first).should(second)).timeout(TimeValue.timeValueMillis(50))
+        );
+
+        ActionListener<ActionResponse> listener = mock(ActionListener.class);
+        ActionListener<ActionResponse> proceeded = proceedListener(searchRequest, listener);
+        first.legTimeoutConsumer().accept(true);
+        second.legTimeoutConsumer().accept(false);
+
+        assertTrue(merge(proceeded, listener, responseWithoutProfile()).isTimedOut());
+    }
+
+    /** A classic hybrid's sub-queries run inside the search phases, where core's own counters already see a timeout. */
+    @SuppressWarnings("unchecked")
+    public void testApply_whenAClassicHybridRequestSetsATimeout_thenNothingIsAttached() {
+        HybridQueryBuilder hybridQuery = new HybridQueryBuilder();
+        hybridQuery.add(new MatchQueryBuilder("field", "value"));
+
+        SearchRequest searchRequest = new SearchRequest("test_index");
+        searchRequest.source(new SearchSourceBuilder().query(hybridQuery).timeout(TimeValue.timeValueMillis(50)));
+
+        ActionListener<ActionResponse> listener = mock(ActionListener.class);
+
+        assertSame("a classic hybrid times out as it always has", listener, proceedListener(searchRequest, listener));
+        assertNull(hybridQuery.legTimeoutConsumer());
     }
 
     /**
@@ -605,12 +729,17 @@ public class HybridQuerySearchRequestFilterTests extends OpenSearchQueryTestCase
     }
 
     private static SearchResponse responseWithProfile(final Map<String, ProfileShardResult> profiles) {
+        return response(profiles, false);
+    }
+
+    /** A response as the search phases built it, carrying the given profile section and its own {@code timed_out}. */
+    private static SearchResponse response(final Map<String, ProfileShardResult> profiles, final boolean timedOut) {
         InternalSearchResponse sections = new InternalSearchResponse(
             SearchHits.empty(),
             InternalAggregations.EMPTY,
             null,
             Objects.isNull(profiles) ? null : new SearchProfileShardResults(profiles),
-            false,
+            timedOut,
             null,
             1
         );

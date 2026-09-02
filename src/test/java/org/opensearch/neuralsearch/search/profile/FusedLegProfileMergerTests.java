@@ -4,23 +4,17 @@
  */
 package org.opensearch.neuralsearch.search.profile;
 
-import java.lang.reflect.Constructor;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
-import org.apache.lucene.search.TotalHits;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.ShardSearchFailure;
-import org.opensearch.neuralsearch.query.ext.RerankSearchExtBuilder;
-import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.internal.InternalSearchResponse;
-import org.opensearch.search.pipeline.ProcessorExecutionDetail;
 import org.opensearch.search.profile.NetworkTime;
 import org.opensearch.search.profile.ProfileResult;
 import org.opensearch.search.profile.ProfileShardResult;
@@ -29,45 +23,52 @@ import org.opensearch.search.profile.aggregation.AggregationProfileShardResult;
 import org.opensearch.search.profile.fetch.FetchProfileShardResult;
 import org.opensearch.search.profile.query.CollectorResult;
 import org.opensearch.search.profile.query.QueryProfileShardResult;
-import org.opensearch.search.suggest.Suggest;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
  * Unit coverage for the two shaping rules the merger applies: the response's own entries are relabelled rather than left
  * to read as the user's query, and a leg's fetch section is emptied because a leg only fetches {@code _id}.
+ *
+ * <p>This class produces a profile section, not a response. Carrying it onto one is
+ * {@link org.opensearch.neuralsearch.search.FusedResponseRebuilder}'s job and is pinned in its own tests, including the
+ * canary for core widening a response constructor.
  */
 public class FusedLegProfileMergerTests extends OpenSearchTestCase {
 
     private static final String SHARD_KEY = "[node][index][0]";
 
-    public void testGetMergedResponse_whenNoLegReported_thenResponseReturnedUntouched() {
+    public void testMergedProfileResults_whenNoLegReported_thenResponseReturnedUntouched() {
         FusedLegProfileMerger merger = new FusedLegProfileMerger();
         SearchResponse response = responseWithProfile(Map.of(SHARD_KEY, shardResult(2)));
 
         assertTrue("nothing was collected", merger.isEmpty());
-        assertSame("an unprofiled or classic response must not be rebuilt", response, merger.getMergedResponse(response));
-        assertEquals("and its keys must not be relabelled", Set.of(SHARD_KEY), response.getProfileResults().keySet());
+        assertNull(
+            "with nothing collected there is no section to substitute, so nothing is rebuilt",
+            merger.mergedProfileResults(response)
+        );
+        assertEquals("and the response's own keys are not relabelled", Set.of(SHARD_KEY), response.getProfileResults().keySet());
     }
 
-    public void testGetMergedResponse_whenLegReported_thenRoundTwoIsRelabelledAndLegIsTagged() {
+    public void testMergedProfileResults_whenLegReported_thenRoundTwoIsRelabelledAndLegIsTagged() {
         FusedLegProfileMerger merger = new FusedLegProfileMerger();
         merger.forHybrid("hybrid_0").accept(1, Map.of(SHARD_KEY, shardResult(3)));
 
-        SearchResponse merged = merger.getMergedResponse(responseWithProfile(Map.of(SHARD_KEY, shardResult(2))));
+        Map<String, ProfileShardResult> merged = merger.mergedProfileResults(responseWithProfile(Map.of(SHARD_KEY, shardResult(2))))
+            .getShardResults();
 
         assertEquals(
             "round 2 keeps its tree under a label saying it is the rewritten query, not the user's",
             Set.of(SHARD_KEY + "[fused:rewrite]", SHARD_KEY + "[fused:hybrid_0.leg_1]"),
-            merged.getProfileResults().keySet()
+            merged.keySet()
         );
     }
 
-    public void testGetMergedResponse_whenLegReported_thenLegFetchIsStrippedAndTheRestIsKept() {
+    public void testMergedProfileResults_whenLegReported_thenLegFetchIsStrippedAndTheRestIsKept() {
         FusedLegProfileMerger merger = new FusedLegProfileMerger();
         merger.forHybrid("hybrid_0").accept(0, Map.of(SHARD_KEY, shardResult(3)));
 
-        Map<String, ProfileShardResult> merged = merger.getMergedResponse(responseWithProfile(Map.of(SHARD_KEY, shardResult(2))))
-            .getProfileResults();
+        Map<String, ProfileShardResult> merged = merger.mergedProfileResults(responseWithProfile(Map.of(SHARD_KEY, shardResult(2))))
+            .getShardResults();
 
         ProfileShardResult leg = merged.get(SHARD_KEY + "[fused:hybrid_0.leg_0]");
         assertEquals("a leg only fetches the _id it contributes", List.of(), leg.getFetchProfileResult().getFetchProfileResults());
@@ -91,8 +92,8 @@ public class FusedLegProfileMergerTests extends OpenSearchTestCase {
         merger.forHybrid("hybrid_0")
             .accept(0, Map.of(SHARD_KEY + "[fused:rewrite]", shardResult(1), SHARD_KEY + "[fused:hybrid_0.leg_1]", shardResult(1)));
 
-        Map<String, ProfileShardResult> merged = merger.getMergedResponse(responseWithProfile(Map.of(SHARD_KEY, shardResult(1))))
-            .getProfileResults();
+        Map<String, ProfileShardResult> merged = merger.mergedProfileResults(responseWithProfile(Map.of(SHARD_KEY, shardResult(1))))
+            .getShardResults();
 
         assertEquals(
             Set.of(
@@ -110,11 +111,11 @@ public class FusedLegProfileMergerTests extends OpenSearchTestCase {
         assertTrue("a leg that reported no profile must not force a rebuild", merger.isEmpty());
     }
 
-    public void testGetMergedResponse_whenResponseHasNoProfileSection_thenOnlyLegsAreReported() {
+    public void testMergedProfileResults_whenResponseHasNoProfileSection_thenOnlyLegsAreReported() {
         FusedLegProfileMerger merger = new FusedLegProfileMerger();
         merger.forHybrid("hybrid_0").accept(0, Map.of(SHARD_KEY, shardResult(1)));
 
-        Map<String, ProfileShardResult> merged = merger.getMergedResponse(responseWithProfile(null)).getProfileResults();
+        Map<String, ProfileShardResult> merged = merger.mergedProfileResults(responseWithProfile(null)).getShardResults();
 
         assertEquals(Set.of(SHARD_KEY + "[fused:hybrid_0.leg_0]"), merged.keySet());
     }
@@ -125,8 +126,8 @@ public class FusedLegProfileMergerTests extends OpenSearchTestCase {
         merger.forHybrid("hybrid_0").accept(0, Map.of(SHARD_KEY, shardResult(1)));
         merger.forHybrid("hybrid_1").accept(0, Map.of(SHARD_KEY, shardResult(1)));
 
-        Map<String, ProfileShardResult> merged = merger.getMergedResponse(responseWithProfile(Map.of(SHARD_KEY, shardResult(1))))
-            .getProfileResults();
+        Map<String, ProfileShardResult> merged = merger.mergedProfileResults(responseWithProfile(Map.of(SHARD_KEY, shardResult(1))))
+            .getShardResults();
 
         assertEquals(
             Set.of(SHARD_KEY + "[fused:rewrite]", SHARD_KEY + "[fused:hybrid_0.leg_0]", SHARD_KEY + "[fused:hybrid_1.leg_0]"),
@@ -135,12 +136,12 @@ public class FusedLegProfileMergerTests extends OpenSearchTestCase {
     }
 
     /** The query section is the whole point of a leg entry, so stripping the fetch section must leave it intact. */
-    public void testGetMergedResponse_whenLegReported_thenItsQuerySectionIsKeptWhole() {
+    public void testMergedProfileResults_whenLegReported_thenItsQuerySectionIsKeptWhole() {
         FusedLegProfileMerger merger = new FusedLegProfileMerger();
         merger.forHybrid("hybrid_0").accept(0, Map.of(SHARD_KEY, shardResult(2)));
 
-        Map<String, ProfileShardResult> merged = merger.getMergedResponse(responseWithProfile(Map.of(SHARD_KEY, shardResult(2))))
-            .getProfileResults();
+        Map<String, ProfileShardResult> merged = merger.mergedProfileResults(responseWithProfile(Map.of(SHARD_KEY, shardResult(2))))
+            .getShardResults();
 
         List<QueryProfileShardResult> query = merged.get(SHARD_KEY + "[fused:hybrid_0.leg_0]").getQueryProfileResults();
         assertEquals("one search per leg", 1, query.size());
@@ -148,123 +149,6 @@ public class FusedLegProfileMergerTests extends OpenSearchTestCase {
         assertEquals("type_0", query.get(0).getQueryResults().get(0).getQueryName());
         assertEquals("rewrite time is part of the leg's cost", 11L, query.get(0).getRewriteTime());
         assertEquals("and so is its collector", "leg_collector", query.get(0).getCollectorResult().getName());
-    }
-
-    /**
-     * Merging rebuilds the response around a new profile section, which means every other section is copied by hand. A
-     * field dropped there would silently change an answer the search already got right, so pin every one of them — built
-     * through the widest constructors, with a distinct non-default value each, so that dropping any single one fails here.
-     */
-    public void testGetMergedResponse_whenRebuilt_thenEverySectionOutsideTheProfileIsPreserved() {
-        FusedLegProfileMerger merger = new FusedLegProfileMerger();
-        merger.forHybrid("hybrid_0").accept(0, Map.of(SHARD_KEY, shardResult(1)));
-
-        SearchResponse response = responseWithEverything("scroll-id", null);
-        SearchResponse merged = merger.getMergedResponse(response);
-
-        // SearchResponseSections, all of it but the profile results the merge exists to replace
-        assertSame("hits are the answer and must survive verbatim", response.getHits(), merged.getHits());
-        assertEquals(42L, merged.getHits().getTotalHits().value());
-        assertEquals(1.5f, merged.getHits().getMaxScore(), 0.0f);
-        assertSame("aggregations are handed over, not rebuilt", response.getAggregations(), merged.getAggregations());
-        assertSame("a suggest section belongs to the search, not to the profile", response.getSuggest(), merged.getSuggest());
-        assertTrue(merged.isTimedOut());
-        assertEquals(Boolean.TRUE, merged.isTerminatedEarly());
-        assertEquals(3, merged.getNumReducePhases());
-        assertEquals(
-            "ext sections are what a pipeline answers with",
-            response.getInternalResponse().getSearchExtBuilders(),
-            merged.getInternalResponse().getSearchExtBuilders()
-        );
-        assertEquals(
-            "and so is the processor execution detail a verbose pipeline request asked for",
-            response.getInternalResponse().getProcessorResult(),
-            merged.getInternalResponse().getProcessorResult()
-        );
-
-        // SearchResponse's own fields
-        assertEquals("scroll-id", merged.getScrollId());
-        assertEquals(5, merged.getTotalShards());
-        assertEquals(4, merged.getSuccessfulShards());
-        assertEquals(1, merged.getSkippedShards());
-        assertEquals("took is the user's latency, not the merge's", 17L, merged.getTook().millis());
-        assertEquals("phase_took is the per-phase half of the same accounting", Map.of("query", 11L), phaseTookMap(merged));
-        assertEquals("a partial answer stays partial", 1, merged.getFailedShards());
-        assertSame(response.getShardFailures()[0], merged.getShardFailures()[0]);
-        assertSame(SearchResponse.Clusters.EMPTY, merged.getClusters());
-    }
-
-    /**
-     * {@code pointInTimeId} shares the assertion above's fixture but not its response: core asserts a response carries at
-     * most one of {@code scrollId} and {@code pointInTimeId}, so the two can only be pinned one per response.
-     */
-    public void testGetMergedResponse_whenRebuilt_thenThePointInTimeIdIsPreserved() {
-        FusedLegProfileMerger merger = new FusedLegProfileMerger();
-        merger.forHybrid("hybrid_0").accept(0, Map.of(SHARD_KEY, shardResult(1)));
-
-        SearchResponse merged = merger.getMergedResponse(responseWithEverything(null, "pit-id"));
-
-        assertEquals("pit-id", merged.pointInTimeId());
-        assertNull("and the scroll id it excludes stays absent", merged.getScrollId());
-    }
-
-    /**
-     * The rebuild above is only complete while it calls the widest constructor core offers, and core widens a response by
-     * <i>adding</i> a constructor rather than changing one — the 7 → 8 → 9 and 8 → 9 → 10 ladders these two classes already
-     * carry are the evidence. So a new field arrives as a wider constructor, not as a compile error in the merger, and
-     * nothing above would fail. This is the assertion that does fail, and it names the fix.
-     */
-    public void testGetMergedResponse_whenCoreWidensAResponse_thenTheRebuildIsToldToCarryTheNewField() {
-        assertEquals(
-            "core widened InternalSearchResponse: FusedLegProfileMerger#getMergedResponse must pass the new field(s) too",
-            9,
-            widestPublicConstructorArity(InternalSearchResponse.class)
-        );
-        assertEquals(
-            "core widened SearchResponse: FusedLegProfileMerger#getMergedResponse must pass the new field(s) too",
-            10,
-            widestPublicConstructorArity(SearchResponse.class)
-        );
-    }
-
-    private static int widestPublicConstructorArity(final Class<?> type) {
-        return Arrays.stream(type.getConstructors()).mapToInt(Constructor::getParameterCount).max().orElse(0);
-    }
-
-    private static Map<String, Long> phaseTookMap(final SearchResponse response) {
-        return Objects.isNull(response.getPhaseTook()) ? null : response.getPhaseTook().getPhaseTookMap();
-    }
-
-    /**
-     * A response with a distinct non-default value in every field the rebuild has to carry, through the widest constructor
-     * each class offers. Only one of {@code scrollId} / {@code pointInTimeId} may be set, which core asserts.
-     */
-    private static SearchResponse responseWithEverything(final String scrollId, final String pointInTimeId) {
-        SearchHits hits = new SearchHits(new SearchHit[] { new SearchHit(1) }, new TotalHits(42L, TotalHits.Relation.EQUAL_TO), 1.5f);
-        InternalSearchResponse sections = new InternalSearchResponse(
-            hits,
-            InternalAggregations.EMPTY,
-            // core's Suggest sorts the list it is handed in place, so it cannot be an immutable one
-            new Suggest(new ArrayList<>()),
-            new SearchProfileShardResults(Map.of(SHARD_KEY, shardResult(1))),
-            true,
-            true,
-            3,
-            List.of(new RerankSearchExtBuilder(Map.of("query_text", "cat"))),
-            List.of(new ProcessorExecutionDetail("normalization-processor"))
-        );
-        return new SearchResponse(
-            sections,
-            scrollId,
-            5,
-            4,
-            1,
-            17L,
-            new SearchResponse.PhaseTook(Map.of("query", 11L)),
-            new ShardSearchFailure[] { new ShardSearchFailure(new IllegalStateException("shard 4 is unavailable")) },
-            SearchResponse.Clusters.EMPTY,
-            pointInTimeId
-        );
     }
 
     /**
@@ -276,8 +160,8 @@ public class FusedLegProfileMergerTests extends OpenSearchTestCase {
         merger.forHybridTiming("hybrid_0").accept(timings());
 
         assertFalse("a published coordinator entry is worth a rebuild on its own", merger.isEmpty());
-        Map<String, ProfileShardResult> merged = merger.getMergedResponse(responseWithProfile(Map.of(SHARD_KEY, shardResult(1))))
-            .getProfileResults();
+        Map<String, ProfileShardResult> merged = merger.mergedProfileResults(responseWithProfile(Map.of(SHARD_KEY, shardResult(1))))
+            .getShardResults();
         assertEquals(
             "keyed off a stand-in for the node, because the coordinator's fusion is not a shard's work",
             Set.of(SHARD_KEY + "[fused:rewrite]", "[coordinator][fused:hybrid_0]"),
@@ -305,8 +189,8 @@ public class FusedLegProfileMergerTests extends OpenSearchTestCase {
         FusedLegProfileMerger merger = new FusedLegProfileMerger();
         merger.forHybridTiming("hybrid_0").accept(timings());
 
-        ProfileResult node = merger.getMergedResponse(responseWithProfile(null))
-            .getProfileResults()
+        ProfileResult node = merger.mergedProfileResults(responseWithProfile(null))
+            .getShardResults()
             .get("[coordinator][fused:hybrid_0]")
             .getQueryProfileResults()
             .get(0)
@@ -332,8 +216,8 @@ public class FusedLegProfileMergerTests extends OpenSearchTestCase {
         FusedLegProfileMerger merger = new FusedLegProfileMerger();
         merger.forHybridTiming("hybrid_0").accept(timings());
 
-        Map<String, Object> debug = merger.getMergedResponse(responseWithProfile(null))
-            .getProfileResults()
+        Map<String, Object> debug = merger.mergedProfileResults(responseWithProfile(null))
+            .getShardResults()
             .get("[coordinator][fused:hybrid_0]")
             .getQueryProfileResults()
             .get(0)
@@ -358,8 +242,8 @@ public class FusedLegProfileMergerTests extends OpenSearchTestCase {
         FusedLegProfileMerger merger = new FusedLegProfileMerger();
         merger.forHybridTiming("hybrid_0").accept(timings());
 
-        ProfileShardResult coordinator = merger.getMergedResponse(responseWithProfile(null))
-            .getProfileResults()
+        ProfileShardResult coordinator = merger.mergedProfileResults(responseWithProfile(null))
+            .getShardResults()
             .get("[coordinator][fused:hybrid_0]");
         assertEquals(List.of(), coordinator.getAggregationProfileResults().getProfileResults());
         assertEquals(List.of(), coordinator.getFetchProfileResult().getFetchProfileResults());
@@ -382,8 +266,8 @@ public class FusedLegProfileMergerTests extends OpenSearchTestCase {
         merger.forHybridTiming("hybrid_0").accept(timings());
         merger.forHybrid("hybrid_0").accept(0, Map.of("[coordinator][fused:hybrid_0]", shardResult(1)));
 
-        Map<String, ProfileShardResult> merged = merger.getMergedResponse(responseWithProfile(Map.of(SHARD_KEY, shardResult(1))))
-            .getProfileResults();
+        Map<String, ProfileShardResult> merged = merger.mergedProfileResults(responseWithProfile(Map.of(SHARD_KEY, shardResult(1))))
+            .getShardResults();
 
         assertEquals(
             Set.of(SHARD_KEY + "[fused:rewrite]", "[coordinator][fused:hybrid_0]", "[coordinator][fused:hybrid_0.leg_0][fused:hybrid_0]"),
@@ -397,7 +281,7 @@ public class FusedLegProfileMergerTests extends OpenSearchTestCase {
         merger.forHybridTiming("hybrid_0").accept(timings());
         merger.forHybridTiming("hybrid_1").accept(timings());
 
-        Map<String, ProfileShardResult> merged = merger.getMergedResponse(responseWithProfile(null)).getProfileResults();
+        Map<String, ProfileShardResult> merged = merger.mergedProfileResults(responseWithProfile(null)).getShardResults();
 
         assertEquals(Set.of("[coordinator][fused:hybrid_0]", "[coordinator][fused:hybrid_1]"), merged.keySet());
     }

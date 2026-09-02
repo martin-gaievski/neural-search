@@ -13,9 +13,6 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.opensearch.action.search.SearchResponse;
-import org.opensearch.action.search.SearchResponseSections;
-import org.opensearch.search.aggregations.InternalAggregations;
-import org.opensearch.search.internal.InternalSearchResponse;
 import org.opensearch.search.profile.NetworkTime;
 import org.opensearch.search.profile.ProfileResult;
 import org.opensearch.search.profile.ProfileShardResult;
@@ -40,11 +37,12 @@ import org.opensearch.search.profile.query.QueryProfileShardResult;
  * the request's {@code SearchTimeProvider} before {@code Rewriteable.rewriteAndFetch}, so it lands inside {@code took} but
  * outside every {@code phase_took} phase.
  *
- * <p>Shaped after core's {@code SearchResponseMerger}: entries are added as they arrive, and the
- * merged response is built once at the end. Merging is the only option available — {@link SearchProfileShardResults}
- * takes its map whole and never mutates it, so a coordinator-side component can add entries only by constructing a new
- * one and a new response around it. That is exactly what core does on its single-remote-cluster CCS path in
- * {@code TransportSearchAction}, and how {@code SearchResponseMerger} unions the profile maps of N sub-responses.
+ * <p>Shaped after core's {@code SearchResponseMerger}: entries are added as they arrive, and the merged section is built
+ * once at the end. Merging is the only option available — {@link SearchProfileShardResults} takes its map whole and never
+ * mutates it, so a coordinator-side component can add entries only by constructing a new one and a new response around
+ * it. That is exactly what core does on its single-remote-cluster CCS path in {@code TransportSearchAction}, and how
+ * {@code SearchResponseMerger} unions the profile maps of N sub-responses. The response itself is rebuilt by
+ * {@link org.opensearch.neuralsearch.search.FusedResponseRebuilder}, which this class hands its section to.
  *
  * <p>Added to on the leg-MultiSearch response thread and read on the response-listener thread, hence the concurrent map.
  */
@@ -135,24 +133,21 @@ public final class FusedLegProfileMerger {
     }
 
     /**
-     * The response with the collected entries merged into its profile section, or the response itself when nothing was ever
-     * collected.
+     * The profile section the response should carry: the collected entries plus the response's own, relabelled — or
+     * {@code null} when nothing was ever collected, meaning the response's own section stands as it is.
      *
      * <p>The response's own entries are relabelled {@code [fused:rewrite]} rather than dropped: they are the only record
      * of what the rewritten query cost, and dropping them would hide the {@code _id} lookup and the Tail from the very
      * output that exists to account for time. Relabelling only happens when something was collected, so a classic or
-     * unprofiled response is returned untouched.
+     * unprofiled response keeps its own section untouched.
      *
-     * <p><b>Both argument lists below have to track their constructors.</b> Replacing the profile section means rebuilding
-     * the response around it — {@link SearchProfileShardResults} takes its map whole — and a field left off either list
-     * would be silently dropped from a profiled fused response while an unprofiled one kept it. So both calls use the
-     * widest constructor core offers, and {@code FusedLegProfileMergerTests} asserts every field is carried and that the
-     * arity called here is still the widest one available: core widens by adding a constructor and keeping the old ones,
-     * so a new field shows up as a wider constructor rather than as a compile error here.
+     * <p>Returns the section rather than a rebuilt response so that a request reporting several things rebuilds once —
+     * see {@link org.opensearch.neuralsearch.search.FusedResponseRebuilder}, which owns the argument lists that have to
+     * track core's constructors.
      */
-    public SearchResponse getMergedResponse(final SearchResponse response) {
+    public SearchProfileShardResults mergedProfileResults(final SearchResponse response) {
         if (isEmpty()) {
-            return response;
+            return null;
         }
         Map<String, ProfileShardResult> merged = new HashMap<>();
         Map<String, ProfileShardResult> roundTwo = response.getProfileResults();
@@ -160,31 +155,7 @@ public final class FusedLegProfileMerger {
             roundTwo.forEach((shardKey, result) -> merged.put(retag(shardKey, REWRITE_LABEL), result));
         }
         merged.putAll(legProfiles);
-
-        SearchResponseSections sections = response.getInternalResponse();
-        InternalSearchResponse rebuilt = new InternalSearchResponse(
-            sections.hits(),
-            (InternalAggregations) sections.aggregations(),
-            sections.suggest(),
-            new SearchProfileShardResults(merged),
-            sections.timedOut(),
-            sections.terminatedEarly(),
-            sections.getNumReducePhases(),
-            sections.getSearchExtBuilders(),
-            sections.getProcessorResult()
-        );
-        return new SearchResponse(
-            rebuilt,
-            response.getScrollId(),
-            response.getTotalShards(),
-            response.getSuccessfulShards(),
-            response.getSkippedShards(),
-            response.getTook().millis(),
-            response.getPhaseTook(),
-            response.getShardFailures(),
-            response.getClusters(),
-            response.pointInTimeId()
-        );
+        return new SearchProfileShardResults(merged);
     }
 
     /**
