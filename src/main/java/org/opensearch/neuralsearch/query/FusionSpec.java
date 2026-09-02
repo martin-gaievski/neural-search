@@ -382,6 +382,12 @@ public final class FusionSpec {
      * {@link org.opensearch.neuralsearch.processor.combination.ScoreCombinationUtil} a list it rebuilds from the parsed
      * array, so classic's own type check ("must be a collection of numbers") can never see the malformed value and a
      * scalar or string {@code weights} was fusing unweighted at HTTP 200 — the same request classic answers with a 400.
+     *
+     * <p>The elements are checked too, and that half is <em>stricter</em> than classic rather than parity with it: the list
+     * check is the only one classic makes either ({@code ScoreCombinationUtil#validateParams}), and it then streams the
+     * elements through {@code Double::floatValue}, so a list holding a non-numeric or null element fails classic and fused
+     * mode alike with a cast failure at HTTP 500. Refused here with the reason instead — a request that cannot be served
+     * should say what to fix.
      */
     @SuppressWarnings("unchecked")
     private static float[] readWeights(Map<String, Object> combinationClause) {
@@ -391,17 +397,25 @@ public final class FusionSpec {
         Map<String, Object> parameters = (Map<String, Object>) combinationClause.get(PARAMETERS_KEY);
         if ((parameters.get(WEIGHTS_KEY) instanceof List) == false) {
             if (parameters.containsKey(WEIGHTS_KEY)) {
-                throw new IllegalArgumentException(
-                    String.format(Locale.ROOT, "parameter [%s] must be a collection of numbers", WEIGHTS_KEY)
-                );
+                throw weightsMustBeNumbers();
             }
             return new float[0];
         }
         List<Object> raw = (List<Object>) parameters.get(WEIGHTS_KEY);
         float[] weights = new float[raw.size()];
         for (int i = 0; i < raw.size(); i++) {
+            // Checked per element, because the cast is unchecked: a non-numeric or null element would otherwise fail the
+            // request with a ClassCastException or a NullPointerException, at HTTP 500, saying nothing about what to fix.
+            if ((raw.get(i) instanceof Number) == false) {
+                throw weightsMustBeNumbers();
+            }
             weights[i] = ((Number) raw.get(i)).floatValue();
         }
         return weights;
+    }
+
+    /** Classic's own wording for a malformed {@code weights}, so one request reads the same however it was refused. */
+    private static IllegalArgumentException weightsMustBeNumbers() {
+        return new IllegalArgumentException(String.format(Locale.ROOT, "parameter [%s] must be a collection of numbers", WEIGHTS_KEY));
     }
 }

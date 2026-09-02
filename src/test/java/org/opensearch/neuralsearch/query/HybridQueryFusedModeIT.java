@@ -7,6 +7,7 @@ package org.opensearch.neuralsearch.query;
 import static org.opensearch.neuralsearch.util.AggregationsTestUtils.getNestedHits;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -1146,6 +1147,39 @@ public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
         // Rejected by the classic compatibility matrix, not by a fused-mode-specific rule: classic maps min_max to the three
         // means, never to rrf. Only rrf + rrf short circuits ahead of that matrix.
         assertTrue(e.getMessage(), e.getMessage().contains("does not support combination [rrf] with normalization [min_max]"));
+    }
+
+    /**
+     * A {@code weights} list whose <em>elements</em> are not numbers. The type check one level up only sees whether the
+     * value is a list, so this reaches the element read — where an unchecked cast would answer a malformed request with an
+     * HTTP 500 instead of a validation error. Asserted on the status code, not only the message, because that is the whole
+     * difference: the request is refused either way, but only one of the two ways tells the caller what to fix.
+     *
+     * <p>Not a divergence from classic — classic casts the elements just as unguardedly ({@code ScoreCombinationUtil}
+     * checks the list and then streams it through {@code Double::floatValue}), so this is stricter than classic rather
+     * than restoring parity with it.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenInlineWeightsHasNonNumericElement_thenRejectedWithValidationError() {
+        if (indexExists(INDEX_NO_PIPELINE) == false) {
+            createIndex(INDEX_NO_PIPELINE, indexConfigWithoutPipeline());
+            addFourDocs(INDEX_NO_PIPELINE);
+        }
+        for (List<Object> weights : List.of(List.<Object>of("a", 0.5), Arrays.<Object>asList(0.5, null))) {
+            HybridQueryBuilder malformed = new HybridQueryBuilder().fusion(
+                Map.of("combination", Map.of("technique", "arithmetic_mean", "parameters", Map.of("weights", weights)))
+            );
+            malformed.add(new MatchQueryBuilder(TEXT_FIELD, "hello"));
+            malformed.add(new TermQueryBuilder(TEXT_FIELD, "place"));
+
+            ResponseException e = expectThrows(ResponseException.class, () -> search(INDEX_NO_PIPELINE, malformed, 10));
+            assertEquals(
+                "weights " + weights + " must be refused as a bad request, not fail the request",
+                RestStatus.BAD_REQUEST.getStatus(),
+                e.getResponse().getStatusLine().getStatusCode()
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("parameter [weights] must be a collection of numbers"));
+        }
     }
 
     /**

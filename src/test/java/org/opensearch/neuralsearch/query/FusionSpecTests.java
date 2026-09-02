@@ -4,6 +4,7 @@
  */
 package org.opensearch.neuralsearch.query;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -404,6 +405,36 @@ public class FusionSpecTests extends OpenSearchTestCase {
             FusionSpec.fromInlineFusion(
                 Map.of("normalization", Map.of("technique", "min_max"), "combination", Map.of("technique", "arithmetic_mean"))
             ).weights().length
+        );
+    }
+
+    public void testFromInlineFusion_whenWeightsHasNonNumericElement_thenRejected() {
+        // The list check one level up cannot see this, and the element read is an unchecked cast — so before this guard a
+        // non-numeric element was a ClassCastException and a null one a NullPointerException, both HTTP 500. Stricter than
+        // classic, which casts the elements just as unguardedly, rather than parity with it.
+        List<Object> withNull = new ArrayList<>();
+        withNull.add(0.5);
+        withNull.add(null);
+        for (Object malformed : List.<Object>of(List.of("a"), List.of("a", 0.5), List.of(0.5, "b"), List.of(0.5, Map.of()), withNull)) {
+            // Both shapes read weights through the same method, so both are pinned: rrf routes to the score-ranker shape.
+            for (String combination : List.of("arithmetic_mean", "rrf")) {
+                IllegalArgumentException e = assertThrows(
+                    combination + " " + malformed,
+                    IllegalArgumentException.class,
+                    () -> FusionSpec.fromInlineFusion(
+                        Map.of("combination", Map.of("technique", combination, "parameters", Map.of("weights", malformed)))
+                    )
+                );
+                assertTrue(e.getMessage(), e.getMessage().contains("parameter [weights] must be a collection of numbers"));
+            }
+        }
+        // An integer is a Number too — the guard must not reject a weights list a user wrote without decimal points.
+        assertArrayEquals(
+            new float[] { 1.0f, 0.0f },
+            FusionSpec.fromInlineFusion(
+                Map.of("combination", Map.of("technique", "arithmetic_mean", "parameters", Map.of("weights", List.of(1, 0))))
+            ).weights(),
+            0.0001f
         );
     }
 
