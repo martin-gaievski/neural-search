@@ -155,9 +155,9 @@ public class FusedResponseRebuilderTests extends OpenSearchTestCase {
     }
 
     /**
-     * The reconstruction above must not turn "this request was never profiled" into an empty {@code profile} block, which
-     * is what a section holding no entries renders as. Asserted on the rendering because that is the only place the
-     * difference is observable: {@code profile()} answers with an empty map either way.
+     * The reconstruction above must not turn "this response carries no profile section" into an empty {@code profile}
+     * block, which is what a section holding no entries renders as. Asserted on the rendering because that is the only
+     * place the difference is observable: {@code profile()} answers with an empty map either way.
      */
     public void testRebuild_whenTheResponseHasNoProfileSection_thenNoneIsInvented() throws IOException {
         SearchResponse response = responseWithProfile(null);

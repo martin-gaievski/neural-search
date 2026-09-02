@@ -85,12 +85,17 @@ public final class FusedResponseRebuilder {
      * The response's existing profile section, for a rebuild that is not replacing it.
      *
      * <p>Reconstructed from {@link SearchResponseSections#profile()} because the section itself is {@code protected} in
-     * core and unreachable from here. That round-trip is exact in every case this can be reached in: a rebuild that
-     * substitutes nothing is one driven by {@code timed_out} alone, which means the request was not profiled, which means
-     * core built no profile section at all. The one divergence it cannot express — a section that is present but holds no
-     * shard entries, which would render as an empty {@code profile} block and comes back as no block — needs a search
-     * pipeline to have switched profiling on after this plugin's {@code ActionFilter} already saw the request, and a
-     * profiled search that resolved to zero shards.
+     * core and unreachable from here. The round-trip is lossless for every section that carries entries, which is what
+     * makes it safe here: it maps a populated map back to an equivalent section, and answers {@code null} for a section
+     * that is absent or empty, which {@link #rebuild} then passes through as the response's own.
+     *
+     * <p>The one shape it cannot preserve is a section that is <i>present but holds no entries</i> — that renders as an
+     * empty {@code profile} block and comes back as no block at all. Reaching this method with such a section takes a
+     * profiled search that produced no shard entries, and reaching it at all requires the caller to have substituted no
+     * profile section while still changing something, i.e. a rebuild driven by {@code timed_out} alone. Note that "the
+     * caller substituted nothing" is <b>not</b> the same as "the request was not profiled": a search request processor
+     * runs after this plugin's {@code ActionFilter} has already decided whether to attach a profile merger, so a request
+     * this plugin saw as unprofiled can still be profiled by the time core builds the response.
      */
     private static SearchProfileShardResults ownProfileResults(final SearchResponseSections sections) {
         Map<String, ProfileShardResult> own = sections.profile();
