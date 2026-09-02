@@ -30,7 +30,6 @@ import org.opensearch.neuralsearch.processor.dto.NormalizeScoresDTO;
 import org.opensearch.neuralsearch.processor.explain.CombinedExplanationDetails;
 import org.opensearch.neuralsearch.processor.explain.DocIdAtSearchShard;
 import org.opensearch.neuralsearch.processor.explain.ExplanationDetails;
-import org.opensearch.neuralsearch.processor.explain.ExplainableTechnique;
 import org.opensearch.neuralsearch.processor.explain.ExplanationPayload;
 import org.opensearch.neuralsearch.processor.normalization.ScoreNormalizer;
 import org.opensearch.search.SearchHit;
@@ -181,7 +180,7 @@ public class NormalizationProcessorWorkflow {
             Sort sortForQuery = evaluateSortCriteria(request.getQuerySearchResults(), queryTopDocs);
             ExplainDTO explainDTO = ExplainDTO.builder()
                 .queryTopDocs(queryTopDocs)
-                .explainableTechnique((ExplainableTechnique) request.getNormalizationTechnique())
+                .explainableTechnique(request.getNormalizationTechnique())
                 .singleShard(isSingleShard)
                 .build();
             Map<DocIdAtSearchShard, ExplanationDetails> normalizationExplain = scoreNormalizer.explain(explainDTO);

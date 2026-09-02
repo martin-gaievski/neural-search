@@ -205,6 +205,12 @@ public class HybridQuerySearchRequestFilter implements ActionFilter {
             explanationMerger = new FusedExplanationMerger();
             finder.found.get(0).fusedExplanationConsumer(explanationMerger.consumer());
         }
+        // Passing the gate above is not the same as having something to report: an explained request whose fused hybrid is
+        // nested reaches here with no merger attached at all, since explain deliberately declines a hybrid that is not the
+        // request's own query. Hand the caller's listener back untouched rather than wrapping it to do nothing.
+        if (Objects.isNull(legProfileMerger) && Objects.isNull(timeoutMerger) && Objects.isNull(explanationMerger)) {
+            return listener;
+        }
         final FusedLegProfileMerger profiles = legProfileMerger;
         final FusedLegTimeoutMerger timeouts = timeoutMerger;
         final FusedExplanationMerger explanations = explanationMerger;

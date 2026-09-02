@@ -392,9 +392,8 @@ final class HybridFusionOrchestrator {
             return;
         }
         // Same format strings as classic: ScoreCombiner#explainByShard and ExplanationUtils#getDocIdAtQueryForNormalization.
-        explanations.combinationDescription(
-            String.format(Locale.ROOT, "%s combination of:", ((ExplainableTechnique) combination).describe())
-        ).normalizationDescription(String.format(Locale.ROOT, "%s normalization of:", normalizer.techniqueName()));
+        explanations.combinationDescription(String.format(Locale.ROOT, "%s combination of:", combination.describe()))
+            .normalizationDescription(String.format(Locale.ROOT, "%s normalization of:", normalizer.techniqueName()));
         List<Map<String, Float>> legNormalizedScores = fused.legNormalizedScores();
         for (int doc = 0; doc < ranked.ids().length; doc++) {
             String key = FusedDocExplanations.documentKey(ranked.indices()[doc], ranked.ids()[doc]);
