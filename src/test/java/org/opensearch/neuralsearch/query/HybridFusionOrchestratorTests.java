@@ -693,6 +693,101 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         assertTrue("an empty ANN leg must be match_none, never an empty bool", tail.should().get(1) instanceof MatchNoneQueryBuilder);
     }
 
+    // ---- the truncation bound: an address of the returned hits stands for the match set only if nothing was truncated ----
+
+    /**
+     * The bound that makes materialization sound, and the under-count it closes. A materialized leg stands for the documents
+     * it <i>returned</i>, which is {@code min(matches, window_size)} because {@code newLegRequest} caps every leg at
+     * {@code size = window_size}. So a leg that filled the window may have matched documents it never returned — and the
+     * Tail, being a {@code filter}, would leave those out of {@code total_hits} and out of every aggregation bucket, at
+     * HTTP 200, where classic hybrid counts them. Such a leg is therefore kept as the real query and counted properly.
+     *
+     * <p>The same leg one window wider is the control: it came back short, so it was not truncated and the address is exact.
+     * That is what makes the first half a truncation test rather than materialization being switched off.
+     */
+    public void testBuildFusedQuery_whenMaterializableLegFilledTheWindow_thenKeptAsTheRealQueryInTheTail() {
+        List<QueryBuilder> legs = List.of(legNamed("knn"));
+        Map<String, Float> twoHits = Map.of("2", 0.8f, "3", 0.7f);
+
+        QueryBuilder truncated = HybridFusionOrchestrator.buildFusedQuery(
+            sourceWithAggregation(),
+            multiSearch(legItemFromIndex(INDEX, twoHits)),
+            legs,
+            minMaxArithmetic(),
+            twoHits.size()
+        );
+        assertSame(
+            "a leg that returned as many hits as the window let it may have matched more, so it must be counted for real",
+            legs.get(0),
+            tailOf(truncated).should().get(0)
+        );
+
+        QueryBuilder exact = HybridFusionOrchestrator.buildFusedQuery(
+            sourceWithAggregation(),
+            multiSearch(legItemFromIndex(INDEX, twoHits)),
+            legs,
+            minMaxArithmetic(),
+            twoHits.size() + 1
+        );
+        assertAddressedTo(tailOf(exact).should().get(0), INDEX, "2", "3");
+    }
+
+    /**
+     * The defect the bound was added for. {@code neural} is a materializable <i>name</i>, but against a
+     * {@code rank_features} semantic embedding field a {@code neural} query rewrites into {@code neural_sparse}, whose match
+     * set is every document holding a query token — far larger than the window. Fused mode substitutes the Tail before the
+     * legs are rewritten, so the coordinator sees the same {@code neural} name for the sparse leg as for a dense one and
+     * cannot tell them apart. The truncation test is what stops the sparse leg from being materialized, because over a real
+     * corpus it fills the window.
+     */
+    public void testBuildFusedQuery_whenNeuralLegFilledTheWindow_thenKeptAsTheRealQueryInTheTail() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), legNamed("neural"));
+        MultiSearchResponse ms = multiSearch(
+            legItemFromIndex(INDEX, Map.of("1", 0.9f)),
+            legItemFromIndex(INDEX, Map.of("2", 0.8f, "3", 0.7f))
+        );
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(sourceWithAggregation(), ms, legs, minMaxArithmetic(), 2);
+
+        assertSame(
+            "a neural leg that filled the window may be a sparse one, whose match set the window truncated",
+            legs.get(1),
+            tailOf(fused).should().get(1)
+        );
+    }
+
+    /**
+     * The test is a necessary condition, not a sufficient one — the type check stays. A term-defined leg that came back
+     * short of the window is still kept as the real query: materializing it would be exact but pointless, since re-running
+     * it walks no graph, and it would replace whatever inner structure the leg compiles to on the shard.
+     */
+    public void testBuildFusedQuery_whenNonAnnLegCameBackShort_thenStillNotMaterialized() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"));
+        MultiSearchResponse ms = multiSearch(legItemFromIndex(INDEX, Map.of("1", 0.9f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(sourceWithAggregation(), ms, legs, minMaxArithmetic(), 10);
+
+        assertSame("only an ANN leg is worth materializing", legs.get(0), tailOf(fused).should().get(0));
+    }
+
+    /**
+     * The bound belongs to the Tail, not to the carried form. On the Top-only path there is no Tail by construction, so what
+     * a substitute addresses cannot reach {@code total_hits} or an aggregation — applying the bound there would buy a
+     * shard-side ANN compile (and, for {@code neural}, a second inference) for a reporting field alone. Both paths share one
+     * materializer, so this pins that the truncation test did not leak into the one where nothing counts.
+     */
+    public void testBuildFusedQuery_whenTopOnlyAndNamedLegFilledTheWindow_thenStillMaterializedForRegistration() {
+        List<QueryBuilder> legs = List.of(legNamed("knn").queryName("vector"));
+        MultiSearchResponse ms = multiSearch(legItemFromIndex(INDEX, Map.of("2", 0.8f, "3", 0.7f)));
+
+        QueryBuilder fused = HybridFusionOrchestrator.buildFusedQuery(topOnlySource(), ms, legs, minMaxArithmetic(), 2);
+
+        assertEquals("registration must not turn a Top-only query into Top+Tail", 0, tailFilterCount(fused));
+        QueryBuilder carried = namedOnlyLegsOf(fused).get(0);
+        assertEquals("vector", carried.queryName());
+        assertAddressedTo(carried, INDEX, "2", "3");
+    }
+
     // ---- weighted combination + highlight/totals tail triggers (explain/profile do NOT trigger the Tail) ----
 
     public void testBuildFusedQuery_withPerLegWeights_fusesWithoutError() {

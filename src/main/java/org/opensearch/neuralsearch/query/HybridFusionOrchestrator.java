@@ -208,7 +208,7 @@ final class HybridFusionOrchestrator {
             ranked.ids(),
             ranked.indices(),
             ranked.scores(),
-            tailNeeded ? legQueriesForTail(legs, legHits) : List.of(),
+            tailNeeded ? legQueriesForTail(legs, legHits, windowSize) : List.of(),
             innerHitsLegs(legs),
             tailNeeded ? List.of() : namedLegsForRegistration(legs, legHits)
         );
@@ -593,19 +593,39 @@ final class HybridFusionOrchestrator {
 
     /** The sub-query legs in their Tail form. groupLegHits fails fast on any leg failure, so every leg is present here
      *  (legHits.length == legs.size(), no null slots). A kNN/neural leg retrieves a bounded candidate set rather than a
-     *  term-defined one, so it is materialized as the documents it already retrieved rather than re-walking the HNSW graph
-     *  in the Tail purely to count; other legs are used as-is. See {@link #isMaterializableLeg} for the bound this relies
-     *  on and the one configuration where it under-counts. */
-    private static List<QueryBuilder> legQueriesForTail(List<QueryBuilder> legs, SearchHit[][] legHits) {
+     *  term-defined one, so — when the window did not truncate it — it is materialized as the documents it already
+     *  retrieved rather than re-walking the HNSW graph in the Tail purely to count; other legs are used as-is. See
+     *  {@link #isMaterializableLeg} for why the type alone is not enough. */
+    private static List<QueryBuilder> legQueriesForTail(List<QueryBuilder> legs, SearchHit[][] legHits, int windowSize) {
         List<QueryBuilder> tail = new ArrayList<>(legs.size());
         for (int legIndex = 0; legIndex < legs.size(); legIndex++) {
-            tail.add(legInTailForm(legs.get(legIndex), legHits[legIndex]));
+            tail.add(legInTailForm(legs.get(legIndex), legHits[legIndex], windowSize));
         }
         return tail;
     }
 
-    /** One leg in its Tail form: itself, or — for a kNN/neural leg — a direct address of the hits it already returned. */
-    private static QueryBuilder legInTailForm(QueryBuilder leg, SearchHit[] hits) {
+    /**
+     * One leg in its Tail form: itself, or — for a kNN/neural leg the window did not truncate — a direct address of the
+     * hits it already returned.
+     *
+     * <p>The Tail is a {@code filter}, so it <i>is</i> the match set {@code total_hits} and every aggregation are computed
+     * from, and an address of the returned hits stands for the real match set only when the leg returned all of it. That is
+     * decidable from the response alone: {@code newLegRequest} caps every leg at {@code size = window_size}, so a leg that
+     * came back with fewer hits than the window was not truncated and the address is exact — while one that filled the
+     * window may have matched documents it never returned, and is therefore kept as the real query and counted properly.
+     */
+    private static QueryBuilder legInTailForm(QueryBuilder leg, SearchHit[] hits, int windowSize) {
+        if (hits.length >= windowSize) {
+            return leg;
+        }
+        return legMaterializedIfWorthIt(leg, hits);
+    }
+
+    /**
+     * A leg replaced by an address of its returned hits when that is worth doing at all ({@link #isMaterializableLeg}), with
+     * no truncation test of its own — the caller applies that where the form has to stand for a match set.
+     */
+    private static QueryBuilder legMaterializedIfWorthIt(QueryBuilder leg, SearchHit[] hits) {
         if (isMaterializableLeg(leg) == false) {
             return leg;
         }
@@ -629,13 +649,19 @@ final class HybridFusionOrchestrator {
      * <p>Only legs that carry a name are carried. An unnamed leg has nothing to register, and carrying it would cost a
      * shard-side {@code toQuery} conversion — compiling a query a Top-only request would otherwise never compile — for no
      * reporting benefit.
+     *
+     * <p>An ANN leg is materialized here <b>whether or not the window truncated it</b>, which is where this path parts from
+     * {@link #legInTailForm}. Nothing counts on it: the Tail is absent by construction, so what a substitute addresses
+     * cannot reach {@code total_hits} or an aggregation bucket, and the reporting bound a materialized name already carries
+     * (the documents the leg returned) is the same either way. Applying the Tail's truncation test here would buy a
+     * shard-side ANN compile — and, for {@code neural}, a second inference — for a reporting field alone.
      */
     private static List<QueryBuilder> namedLegsForRegistration(List<QueryBuilder> legs, SearchHit[][] legHits) {
         List<QueryBuilder> namedLegs = new ArrayList<>();
         for (int legIndex = 0; legIndex < legs.size(); legIndex++) {
             QueryBuilder leg = legs.get(legIndex);
             if (carriesQueryName(leg)) {
-                namedLegs.add(legInTailForm(leg, legHits[legIndex]));
+                namedLegs.add(legMaterializedIfWorthIt(leg, legHits[legIndex]));
             }
         }
         return namedLegs;
@@ -704,23 +730,19 @@ final class HybridFusionOrchestrator {
     }
 
     /**
-     * Legs whose match set is bounded by their own retrieval depth rather than by the data, so re-running them in the Tail
-     * would be a redundant ANN pass (kNN/neural re-walk the HNSW graph). Only such legs are safe to replace with a direct
-     * address of the already-retrieved hits. A leg whose match set is NOT so bounded — e.g. {@code neural_sparse},
-     * whose match set is every doc containing a query token (far larger than the window) — must NOT be materialized, or
-     * the Tail would drop the rest and undercount total_hits/aggregations (and re-running it is cheap: no graph to walk).
+     * Legs for which materializing is <i>worth</i> it: an ANN leg re-run in the Tail re-walks the HNSW graph (and a
+     * {@code neural} one re-runs inference) purely to recount what the fan-out already retrieved, while a term-defined leg
+     * costs almost nothing to re-run. This is a cost filter only — whether an address of the returned hits is <i>correct</i>
+     * is decided per response by the truncation test in {@link #legInTailForm}, not here.
      *
-     * <p><b>Known limitation — materialization is exact only when the leg was not truncated.</b> A materialized leg stands
-     * for the documents it <i>returned</i>, which is {@code min(matches, window_size)}: {@code newLegRequest} sets the
-     * leg's {@code size} to the window. The leg's real match set is up to its own {@code k} per shard, which fused mode
-     * deliberately does not rewrite (see {@link #buildLegMultiSearch}), so with {@code k} × shards greater than
-     * {@code window_size} the leg matched documents it never returned, and the Tail — a {@code filter}, hence the match set
-     * — leaves them out of {@code total_hits} and out of every aggregation bucket. Classic hybrid counts them, so this is
-     * an under-count relative to classic in exactly that configuration. Default {@code k} (10) is below the default
-     * {@code window_size} (100), which is why the common case is exact; a leg that returned fewer than {@code window_size}
-     * hits is exact by construction, since it was not truncated. Raising {@code window_size} to at least {@code k} ×
-     * shards restores an exact count. The fix — using the original leg in the Tail when a materialized leg came back full —
-     * is deferred: it costs a second ANN walk in precisely the case a user chose a deep {@code k} for.
+     * <p>Keeping the two separate is what makes the rule safe for a leg whose writeable name does not determine its match
+     * set. {@code neural} is exactly that: against a {@code rank_features} semantic embedding field it rewrites into a
+     * {@code neural_sparse} query, whose match set is every document containing a query token — far larger than the window
+     * — and fused mode substitutes the Tail before the legs are rewritten, so the coordinator sees the same {@code neural}
+     * name either way and cannot tell dense from sparse. Materialized on the strength of the name alone, such a leg dropped
+     * everything past the window from {@code total_hits} and from every aggregation bucket, at HTTP 200. The truncation
+     * test refuses it for the same reason it refuses a deep-{@code k} dense leg: it filled the window, so what it returned
+     * is not known to be all it matched.
      */
     private static boolean isMaterializableLeg(QueryBuilder leg) {
         String name = leg.getWriteableName();
