@@ -251,6 +251,27 @@ public class CandidateScopeTests extends OpenSearchTestCase {
         );
     }
 
+    /**
+     * {@code explain} is the second OVERRIDDEN field fused mode decides after the scope is captured, and for the same
+     * reason as {@code profile}: the request's own flag never reaches a leg, and a leg runs explained only because the
+     * rewrite has a {@code FusedDocExplanations} to keep its explanations in. Inheriting the flag instead would make every
+     * leg of every explained request pay explanation's per-hit cost on the shards with nowhere for the result to go.
+     */
+    public void testExplainReachesALegOnlyWhenFusedModeAsksForIt() {
+        CandidateScope inherited = CandidateScope.from(new SearchRequest(INDEX).source(new SearchSourceBuilder().explain(true)));
+
+        assertNull("the outer explain flag is not inherited", inherited.newLegRequest(LEG, 50).source().explain());
+
+        CandidateScope enabled = CandidateScope.from(new SearchRequest(INDEX));
+        enabled.enableLegExplain();
+
+        assertEquals(
+            "fused mode explains the legs itself, so each one describes the raw score it contributed",
+            Boolean.TRUE,
+            enabled.newLegRequest(LEG, 50).source().explain()
+        );
+    }
+
     // ---- REJECTED: shapes fused mode cannot answer correctly, refused before the fan-out ----
 
     public void testRejectsTerminateAfter() {

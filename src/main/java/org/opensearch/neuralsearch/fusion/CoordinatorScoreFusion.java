@@ -80,6 +80,38 @@ public final class CoordinatorScoreFusion {
         final ScalarNormalizer normalizer,
         final ScoreCombinationTechnique combinationTechnique
     ) {
+        return fuseDetailed(legRawScores, normalizer, combinationTechnique).fused();
+    }
+
+    /**
+     * What fusion computed: the fused score per document, and the per-leg normalized scores it was computed from.
+     *
+     * <p>The normalized values are the only record of <i>how</i> a fused score was reached, and they exist nowhere else —
+     * a leg hit carries its raw score and round 2 carries the fused one, with the step between them entirely on the
+     * coordinator. Reporting them is what lets {@code explain} describe a fused score rather than merely restate it.
+     *
+     * @param fused               {@code key -> fused score} for the union of all legs' docs
+     * @param legNormalizedScores one entry per leg, in leg order, each a {@code key -> normalized score} map over that
+     *                            leg's own hits (a key absent from a leg's map did not match that leg)
+     */
+    public record FusionResult(Map<String, Float> fused, List<Map<String, Float>> legNormalizedScores) {
+    }
+
+    /**
+     * As {@link #fuse}, additionally reporting the per-leg normalized scores. Same arithmetic and same allocation —
+     * {@code fuse} is this method with the detail dropped — so there is no fast path to choose between and no way for the
+     * explained and unexplained paths to compute different scores.
+     *
+     * @param legRawScores         one entry per leg, each a {@code key -> raw score} map of that leg's hits
+     * @param normalizer           per-leg normalization step (e.g. {@code min_max})
+     * @param combinationTechnique cross-leg combination step (e.g. arithmetic_mean with weights)
+     * @return the fused scores and the per-leg normalized scores behind them
+     */
+    public static FusionResult fuseDetailed(
+        final List<Map<String, Float>> legRawScores,
+        final ScalarNormalizer normalizer,
+        final ScoreCombinationTechnique combinationTechnique
+    ) {
         final int legCount = legRawScores.size();
 
         // Normalize each leg independently. A leg's map is already the merged across-shard set, so the normalizer sees
@@ -107,6 +139,6 @@ public final class CoordinatorScoreFusion {
             }
             fused.put(key, combinationTechnique.combine(docScoresPerLeg));
         }
-        return fused;
+        return new FusionResult(fused, List.copyOf(legNormalizedScores));
     }
 }

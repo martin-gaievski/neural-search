@@ -17,6 +17,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
+import org.apache.lucene.search.Explanation;
+import org.apache.lucene.search.TotalHits;
 import org.mockito.ArgumentCaptor;
 import org.opensearch.action.bulk.BulkAction;
 import org.opensearch.action.bulk.BulkRequest;
@@ -25,17 +27,22 @@ import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchType;
 import org.opensearch.action.search.ShardSearchFailure;
+import org.opensearch.action.OriginalIndices;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.neuralsearch.query.HybridQueryBuilder;
 import org.opensearch.neuralsearch.query.OpenSearchQueryTestCase;
+import org.opensearch.neuralsearch.search.explain.FusedDocExplanations;
 import org.opensearch.neuralsearch.search.profile.FusedCoordinatorTimings;
+import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
+import org.opensearch.search.SearchShardTarget;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.internal.InternalSearchResponse;
@@ -355,6 +362,97 @@ public class HybridQuerySearchRequestFilterTests extends OpenSearchQueryTestCase
         assertNull(hybridQuery.fusionTimingConsumer());
         assertNull("and a request that cannot time out has no timeout to watch for either", hybridQuery.legTimeoutConsumer());
         assertSame(listener, proceedListener(searchRequest, listener));
+    }
+
+    /** The per-leg breakdown attaches when the request asks to be explained and the fused hybrid is its own query. */
+    @SuppressWarnings("unchecked")
+    public void testApply_whenAnExplainedFusedHybridIsTheRequestQuery_thenTheBreakdownIsAttached() {
+        HybridQueryBuilder hybridQuery = fusedHybrid();
+
+        SearchRequest searchRequest = new SearchRequest("test_index");
+        searchRequest.source(new SearchSourceBuilder().query(hybridQuery).explain(true));
+
+        ActionListener<ActionResponse> listener = mock(ActionListener.class);
+        ActionListener<ActionResponse> proceeded = proceedListener(searchRequest, listener);
+
+        assertNotNull("the legs have to have somewhere to publish what they explained", hybridQuery.fusedExplanationConsumer());
+        assertNull("explain alone collects no leg trees", hybridQuery.legProfileConsumer());
+        assertNotSame("and the listener has to be wrapped for the tree to reach the response", listener, proceeded);
+    }
+
+    /**
+     * A hit's explanation is one tree describing that hit's score. For a fused hybrid nested inside a container the fused
+     * score is an input to the enclosing query's scoring rather than the hit's score, so replacing the tree would describe
+     * the wrong thing — the request keeps core's own explanation of the query round 2 ran.
+     */
+    @SuppressWarnings("unchecked")
+    public void testApply_whenAnExplainedFusedHybridIsNestedInTheRequestQuery_thenNothingIsAttached() {
+        HybridQueryBuilder hybridQuery = fusedHybrid();
+
+        SearchRequest searchRequest = new SearchRequest("test_index");
+        searchRequest.source(
+            new SearchSourceBuilder().query(new BoolQueryBuilder().must(hybridQuery).filter(new MatchAllQueryBuilder())).explain(true)
+        );
+
+        ActionListener<ActionResponse> listener = mock(ActionListener.class);
+
+        assertNull("this hybrid's fused score is not the hit's score", hybridQuery.fusedExplanationConsumer());
+        assertSame("and with nothing to report the listener is handed on as it came", listener, proceedListener(searchRequest, listener));
+    }
+
+    /**
+     * The same reasoning, on the shape the identity check is actually written against: the finder stops at a fused hybrid,
+     * so two of them found means neither can be the request's own query, and neither may claim the hit's score.
+     */
+    @SuppressWarnings("unchecked")
+    public void testApply_whenTwoExplainedFusedHybridsAreSiblings_thenNothingIsAttached() {
+        HybridQueryBuilder first = fusedHybrid();
+        HybridQueryBuilder second = fusedHybrid();
+
+        SearchRequest searchRequest = new SearchRequest("test_index");
+        searchRequest.source(new SearchSourceBuilder().query(new BoolQueryBuilder().should(first).should(second)).explain(true));
+
+        ActionListener<ActionResponse> listener = mock(ActionListener.class);
+        proceedListener(searchRequest, listener);
+
+        assertNull(first.fusedExplanationConsumer());
+        assertNull("neither sibling's fused score is the hit's score", second.fusedExplanationConsumer());
+    }
+
+    /**
+     * {@code explain} writes onto the response's hits while {@code profile} replaces the response around them, so asking for
+     * both has to yield both — that outcome is what this pins.
+     *
+     * <p>It does not pin the order, and cannot: the mergers run profile-first, so the explanation is written onto whatever
+     * hits the rebuilt response carries, and a rebuild that copied them would receive the write on the copies and still
+     * pass here. What makes the order safe is that the profile rebuild passes {@code SearchHits} through by reference,
+     * which is pinned where it belongs, by the {@code assertSame} in {@code FusedLegProfileMergerTests}.
+     */
+    @SuppressWarnings("unchecked")
+    public void testWrappedListener_whenExplainedAndProfiled_thenTheResponseCarriesBoth() {
+        HybridQueryBuilder hybridQuery = fusedHybrid();
+        SearchRequest searchRequest = new SearchRequest("test_index");
+        searchRequest.source(new SearchSourceBuilder().query(hybridQuery).profile(true).explain(true));
+
+        ActionListener<ActionResponse> listener = mock(ActionListener.class);
+        ActionListener<ActionResponse> proceeded = proceedListener(searchRequest, listener);
+        hybridQuery.legProfileConsumer().accept(0, Map.of(SHARD_KEY, legProfile()));
+
+        FusedDocExplanations collected = new FusedDocExplanations();
+        collected.combinationDescription("arithmetic_mean combination of:").normalizationDescription("min_max normalization of:");
+        collected.addDocument(
+            FusedDocExplanations.documentKey("test_index", "1"),
+            0.75f,
+            List.of(new FusedDocExplanations.LegContribution(0, 0.5f, Explanation.match(2.0f, "leg")))
+        );
+        hybridQuery.fusedExplanationConsumer().accept(collected);
+
+        SearchResponse merged = merge(proceeded, listener, responseWithRankedHit());
+
+        assertEquals(Set.of(SHARD_KEY + "[fused:hybrid_0.leg_0]"), merged.getProfileResults().keySet());
+        Explanation explanation = merged.getHits().getHits()[0].getExplanation();
+        assertNotNull("the breakdown must survive the rebuild the profile section needed", explanation);
+        assertEquals("arithmetic_mean combination of:", explanation.getDescription());
     }
 
     /**
@@ -740,6 +838,25 @@ public class HybridQuerySearchRequestFilterTests extends OpenSearchQueryTestCase
             null,
             Objects.isNull(profiles) ? null : new SearchProfileShardResults(profiles),
             timedOut,
+            null,
+            1
+        );
+        return new SearchResponse(sections, null, 1, 1, 0, 3L, ShardSearchFailure.EMPTY_ARRAY, SearchResponse.Clusters.EMPTY);
+    }
+
+    /** A profiled response carrying one hit, for the reports that write onto the hits rather than around them. */
+    private static SearchResponse responseWithRankedHit() {
+        SearchHit hit = new SearchHit(0, "1", null, null);
+        // The shard target is what gives a hit its _index, which is half of the key the breakdown is correlated by.
+        hit.shard(new SearchShardTarget("node", new ShardId("test_index", "test_index-uuid", 0), null, OriginalIndices.NONE));
+        hit.score(0.75f);
+        SearchHits hits = new SearchHits(new SearchHit[] { hit }, new TotalHits(1, TotalHits.Relation.EQUAL_TO), 0.75f);
+        InternalSearchResponse sections = new InternalSearchResponse(
+            hits,
+            InternalAggregations.EMPTY,
+            null,
+            new SearchProfileShardResults(Map.of()),
+            false,
             null,
             1
         );
