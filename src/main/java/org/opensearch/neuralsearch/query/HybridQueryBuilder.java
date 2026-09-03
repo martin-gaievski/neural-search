@@ -674,6 +674,9 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                     if (Objects.nonNull(legTimeoutConsumer)) {
                         legTimeoutConsumer.accept(timings.anyLegTimedOut());
                     }
+                    // `this` goes onto the substitute as the query it replaced: core overwrites the request's source with
+                    // the rewritten query, so without it a response processor reading source().query() sees only the fused
+                    // window. Read in the response phase alone — see HybridFusionQueryBuilder#originalQuery().
                     QueryBuilder fusedQuery = HybridFusionOrchestrator.buildFusedQuery(
                         searchRequest.source(),
                         multiSearchResponse,
@@ -681,7 +684,8 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                         fusionSpec,
                         window,
                         timings,
-                        explanations
+                        explanations,
+                        this
                     );
                     // Hand the now-known window to the placeholders installed above. Mutates nothing the request holds:
                     // the placeholders are already in it, and core rewrites them into the window on its next pass.
