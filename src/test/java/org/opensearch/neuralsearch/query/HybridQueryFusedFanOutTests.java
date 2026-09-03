@@ -171,7 +171,11 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
         BoolQueryBuilder substituted = (BoolQueryBuilder) tail.should().get(0);
         assertEquals("the nested hybrid contributes its legs", List.of(innerMatch, innerTerm), substituted.should());
         assertNull("as a plain union — no minimum_should_match to satisfy", substituted.minimumShouldMatch());
-        assertEquals("and no fused hybrid is left to execute", 0, HybridQueryBuilder.countFusedLegSearches(fanOut.finalQuery()));
+        // Counted over what executes rather than over the substitute: the substitute carries the hybrid it replaced for the
+        // response phase and delegates visit() to it, so a walk of the substitute deliberately shows the user's fused
+        // hybrid again (see HybridFusionQueryBuilder#originalQuery). Nothing reads that in the query phase — the budget
+        // guard counts the request's own source, which core only overwrites once the rewrite has finished.
+        assertEquals("and no fused hybrid is left to execute", 0, HybridQueryBuilder.countFusedLegSearches(selfErased));
     }
 
     /**

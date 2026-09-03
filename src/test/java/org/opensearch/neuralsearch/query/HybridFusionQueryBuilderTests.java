@@ -166,6 +166,179 @@ public class HybridFusionQueryBuilderTests extends OpenSearchTestCase {
         assertEquals(2, ((HybridFusionQueryBuilder) rewritten).buildSelfErasedQuery().should().size());
     }
 
+    // ---- the carried original hybrid: read only by response processors on the coordinator that built this query ----
+
+    /**
+     * The whole reason the field exists: a response processor reads {@code source().query()} after core has overwritten it
+     * with the rewritten query, so the rewritten copy has to keep carrying the original. A neural leg rewrites on every
+     * request, so losing it here would restore the erasure for the common case.
+     */
+    public void testDoRewrite_whenSourceQueryRewrites_thenCarriesTheOriginalOntoTheCopy() throws Exception {
+        QueryBuilder alwaysRewrites = new MatchAllQueryBuilder() {
+            @Override
+            protected QueryBuilder doRewrite(QueryRewriteContext c) {
+                return new MatchAllQueryBuilder();
+            }
+        };
+        HybridQueryBuilder original = hybridWith("body", "alpha");
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
+            new String[] { "d1" },
+            new String[] { "idx" },
+            new float[] { 0.7f },
+            List.of(alwaysRewrites),
+            List.of(),
+            List.of(),
+            original
+        );
+
+        QueryBuilder rewritten = query.rewrite(mock(QueryRewriteContext.class));
+        assertNotSame("changed source → new copy", query, rewritten);
+        assertSame(original, ((HybridFusionQueryBuilder) rewritten).originalQuery());
+    }
+
+    /** Never on the wire: a wire copy is a shard copy, and no shard reads it. */
+    public void testSerializationRoundTrip_thenTheOriginalIsNotCarriedOver() throws Exception {
+        HybridFusionQueryBuilder original = new HybridFusionQueryBuilder(
+            new String[] { "d1" },
+            new String[] { "idx" },
+            new float[] { 0.9f },
+            List.of(new MatchQueryBuilder("title", "apple")),
+            List.of(),
+            List.of(),
+            hybridWith("body", "alpha")
+        );
+        assertNotNull(original.originalQuery());
+
+        BytesStreamOutput out = new BytesStreamOutput();
+        original.writeTo(out);
+        FilterStreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), namedWriteableRegistry());
+        HybridFusionQueryBuilder deserialized = new HybridFusionQueryBuilder(in);
+
+        assertNull("the original is coordinator-only state, so a wire copy carries none", deserialized.originalQuery());
+        assertEquals("and its absence must not change the wire format", 0, in.available());
+        assertEquals(original, deserialized);
+    }
+
+    /** Says nothing about what this query matches or scores, so it is not part of its identity. */
+    public void testEquals_whenOnlyTheCarriedOriginalDiffers_thenStillEqual() {
+        HybridFusionQueryBuilder withOriginal = new HybridFusionQueryBuilder(
+            new String[] { "d1" },
+            new String[] { "idx" },
+            new float[] { 0.9f },
+            List.of(),
+            List.of(),
+            List.of(),
+            hybridWith("body", "alpha")
+        );
+        HybridFusionQueryBuilder withADifferentOriginal = new HybridFusionQueryBuilder(
+            new String[] { "d1" },
+            new String[] { "idx" },
+            new float[] { 0.9f },
+            List.of(),
+            List.of(),
+            List.of(),
+            hybridWith("title", "beta")
+        );
+        HybridFusionQueryBuilder withNone = new HybridFusionQueryBuilder(
+            new String[] { "d1" },
+            new String[] { "idx" },
+            new float[] { 0.9f },
+            List.of()
+        );
+
+        assertEquals(withOriginal, withADifferentOriginal);
+        assertEquals(withOriginal, withNone);
+        assertEquals(withOriginal.hashCode(), withADifferentOriginal.hashCode());
+        assertEquals(withOriginal.hashCode(), withNone.hashCode());
+    }
+
+    /**
+     * A visitor over the rewritten query is asking about the user's query — batch semantic highlighting collects its
+     * {@code inner_hits} targets that way. Delegating wholesale makes what a visitor sees identical to classic hybrid;
+     * without it the inherited default accepts this builder alone and the legs are never reached.
+     */
+    public void testVisit_whenOriginalCarried_thenWalksItInsteadOfTheSubstitute() {
+        HybridQueryBuilder original = hybridWith("body", "alpha");
+        original.add(new MatchQueryBuilder("title", "beta"));
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
+            new String[] { "d1" },
+            new String[] { "idx" },
+            new float[] { 0.9f },
+            List.of(),
+            List.of(),
+            List.of(),
+            original
+        );
+
+        List<QueryBuilder> visitedThroughTheSubstitute = collectVisited(query);
+        assertEquals(
+            "what a visitor sees must be exactly what classic hybrid shows it",
+            collectVisited(original),
+            visitedThroughTheSubstitute
+        );
+        assertTrue(visitedThroughTheSubstitute.contains(original));
+        assertFalse("the substitute itself has nothing a visitor wants", visitedThroughTheSubstitute.contains(query));
+    }
+
+    /** Nothing carried (a wire copy): the inherited single-accept default, which is all there is to offer. */
+    public void testVisit_whenNoOriginalCarried_thenAcceptsItselfOnly() {
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
+            new String[] { "d1" },
+            new String[] { "idx" },
+            new float[] { 0.9f },
+            List.of(new MatchQueryBuilder("title", "apple"))
+        );
+        assertEquals(List.of(query), collectVisited(query));
+    }
+
+    /**
+     * {@code rerank}'s {@code query_text_path} resolves a path into the source rendered as XContent, so the rendered form
+     * has to be the query the path was written against.
+     */
+    public void testDoXContent_whenOriginalCarried_thenRendersTheHybridItReplaced() throws Exception {
+        HybridQueryBuilder original = hybridWith("body", "alpha");
+        HybridFusionQueryBuilder query = new HybridFusionQueryBuilder(
+            new String[] { "d1" },
+            new String[] { "idx" },
+            new float[] { 0.9f },
+            List.of(),
+            List.of(),
+            List.of(),
+            original
+        );
+
+        assertEquals(renderToJson(original), renderToJson(query));
+    }
+
+    private static HybridQueryBuilder hybridWith(String field, String text) {
+        HybridQueryBuilder hybrid = new HybridQueryBuilder();
+        hybrid.add(new MatchQueryBuilder(field, text));
+        return hybrid;
+    }
+
+    /** Every builder a {@link org.opensearch.index.query.QueryBuilderVisitor} is offered, in visit order. */
+    private static List<QueryBuilder> collectVisited(QueryBuilder query) {
+        List<QueryBuilder> visited = new java.util.ArrayList<>();
+        query.visit(new org.opensearch.index.query.QueryBuilderVisitor() {
+            @Override
+            public void accept(QueryBuilder qb) {
+                visited.add(qb);
+            }
+
+            @Override
+            public org.opensearch.index.query.QueryBuilderVisitor getChildVisitor(org.apache.lucene.search.BooleanClause.Occur occur) {
+                return this;
+            }
+        });
+        return visited;
+    }
+
+    private static String renderToJson(QueryBuilder query) throws Exception {
+        org.opensearch.core.xcontent.XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder();
+        query.toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+        return builder.toString();
+    }
+
     // ---- name-only legs: carried so matched_queries survives a Top-only query, never executed ----
 
     /** A leg whose conversion needs no mappings, so registration can be asserted against a mocked shard context. */

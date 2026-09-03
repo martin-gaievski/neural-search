@@ -189,6 +189,25 @@ final class HybridFusionOrchestrator {
         FusedCoordinatorTimings timings,
         FusedDocExplanations explanations
     ) {
+        return buildFusedQuery(source, multiSearchResponse, legs, fusion, windowSize, timings, explanations, null);
+    }
+
+    /**
+     * As above, and carrying {@code originalQuery} — the {@code hybrid} being self-erased — onto the substitute so that a
+     * search-pipeline response processor can still see the query the user sent. Nothing in the query phase reads it; see
+     * {@link HybridFusionQueryBuilder#originalQuery()} for what does and why. {@code null} is allowed and means the
+     * substitute carries nothing, which is the behavior every consumer falls back to.
+     */
+    static QueryBuilder buildFusedQuery(
+        SearchSourceBuilder source,
+        MultiSearchResponse multiSearchResponse,
+        List<QueryBuilder> legs,
+        FusionSpec fusion,
+        int windowSize,
+        FusedCoordinatorTimings timings,
+        FusedDocExplanations explanations,
+        HybridQueryBuilder originalQuery
+    ) {
         MultiSearchResponse.Item[] items = multiSearchResponse.getResponses();
         long windowMergeStart = System.nanoTime();
         SearchHit[][] legHits = groupLegHits(items, legs.size());
@@ -210,7 +229,8 @@ final class HybridFusionOrchestrator {
             ranked.scores(),
             tailNeeded ? legQueriesForTail(legs, legHits, windowSize) : List.of(),
             innerHitsLegs(legs),
-            tailNeeded ? List.of() : namedLegsForRegistration(legs, legHits)
+            tailNeeded ? List.of() : namedLegsForRegistration(legs, legHits),
+            originalQuery
         );
         timings.substituteBuildNanos(System.nanoTime() - substituteBuildStart);
         return substitute;

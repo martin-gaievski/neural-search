@@ -25,6 +25,7 @@ import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.InnerHitContextBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.QueryBuilderVisitor;
 import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.TermQueryBuilder;
@@ -122,6 +123,11 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
      * never both populated. See {@link #registerNamedOnlyQueries}.
      */
     private final List<QueryBuilder> namedOnlyQueries;
+    /**
+     * The {@code hybrid} query this substitute was self-erased from, carried for the response phase alone. {@code null}
+     * whenever it is not available — see {@link #originalQuery()} for what depends on it and why the absence is benign.
+     */
+    private final transient HybridQueryBuilder originalQuery;
 
     public HybridFusionQueryBuilder(
         String[] ids,
@@ -130,6 +136,18 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         List<QueryBuilder> tailQueries,
         List<QueryBuilder> innerHitsQueries,
         List<QueryBuilder> namedOnlyQueries
+    ) {
+        this(ids, indices, scores, tailQueries, innerHitsQueries, namedOnlyQueries, null);
+    }
+
+    public HybridFusionQueryBuilder(
+        String[] ids,
+        String[] indices,
+        float[] scores,
+        List<QueryBuilder> tailQueries,
+        List<QueryBuilder> innerHitsQueries,
+        List<QueryBuilder> namedOnlyQueries,
+        HybridQueryBuilder originalQuery
     ) {
         requireParallel(ids, indices, scores);
         assert Arrays.stream(indices).noneMatch(Objects::isNull)
@@ -140,6 +158,35 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         this.tailQueries = Objects.isNull(tailQueries) ? new ArrayList<>() : tailQueries;
         this.innerHitsQueries = Objects.isNull(innerHitsQueries) ? new ArrayList<>() : innerHitsQueries;
         this.namedOnlyQueries = Objects.isNull(namedOnlyQueries) ? new ArrayList<>() : namedOnlyQueries;
+        this.originalQuery = originalQuery;
+    }
+
+    /**
+     * The {@code hybrid} query this one replaced, or {@code null} when it was not carried.
+     *
+     * <p>A search-pipeline <b>response</b> processor runs on the coordinator that performed the rewrite, against the very
+     * {@code SearchRequest} instance whose source core overwrote with the rewritten query ({@code PipelinedRequest} is a
+     * {@code SearchRequest}, and the response listener is bound to it before the rewrite). So by the time a response
+     * processor reads {@code source().query()}, the user's {@code hybrid} is gone and this query is in its place — a window
+     * of {@code _id}s with no query text and no leg structure in it. A processor that has to look at what the user asked
+     * for then either fails the request or silently does nothing, where classic hybrid — which erases nothing — works:
+     *
+     * <ul>
+     *   <li>batch semantic highlighting extracts the query text from the main query
+     *       ({@code ProcessorUtils#extractQueryTextFromBuilder}) and collects {@code inner_hits} highlight targets by
+     *       walking it with a {@link QueryBuilderVisitor} — hence {@link #visit};</li>
+     *   <li>{@code rerank}'s {@code query_context.query_text_path} resolves a path into the request source rendered as
+     *       XContent — hence {@link #doXContent}.</li>
+     * </ul>
+     *
+     * <p>Never serialized and deliberately absent from {@link #doEquals}/{@link #doHashCode}, exactly like
+     * {@link HybridQueryBuilder}'s own coordinator-only fields: it says nothing about what this query matches or scores,
+     * and it is only ever read on the node that built it. It is therefore {@code null} on every shard copy (read from the
+     * wire) and on an instance built by a test, and each consumer falls back to the behavior it had before this field
+     * existed. Cross-cluster search is refused in fused mode, so a response processor never reads a wire copy.
+     */
+    public HybridQueryBuilder originalQuery() {
+        return originalQuery;
     }
 
     /** Convenience for a query with no name-only registrations — the Tail, where present, registers its own. */
@@ -246,6 +293,9 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         // No wire-version gate: this query is built only for a cluster whose every node supports fused mode (see
         // HybridQueryBuilder#requireClusterSupportsFusedMode), and it has never shipped in a released version.
         this.namedOnlyQueries = in.readNamedWriteableList(QueryBuilder.class);
+        // Not on the wire: a wire copy is a shard copy, and the original is only ever read by a response processor on the
+        // coordinator that built this query. See originalQuery().
+        this.originalQuery = null;
     }
 
     @Override
@@ -288,13 +338,17 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
             changed |= r != q;
         }
         if (changed) {
+            // originalQuery is carried over: the coordinator rewrite loop replaces the request's query with whatever the
+            // last round returned, so a response processor reads *this* instance — dropping it here would restore the very
+            // erasure the field exists to undo, on every request whose legs rewrite at all (a neural leg always does).
             HybridFusionQueryBuilder rewrittenBuilder = new HybridFusionQueryBuilder(
                 ids,
                 indices,
                 scores,
                 rewrittenTail,
                 rewrittenInnerHits,
-                rewrittenNamedOnly
+                rewrittenNamedOnly,
+                originalQuery
             );
             rewrittenBuilder.boost(boost());
             rewrittenBuilder.queryName(queryName());
@@ -464,6 +518,32 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         }
     }
 
+    /**
+     * Walk the {@code hybrid} this replaced, not the substitute.
+     *
+     * <p>A visitor over the coordinator's rewritten query is asking about the user's query — batch semantic highlighting
+     * collects its {@code inner_hits} highlight targets exactly that way — and there is nothing in the Top to find: it is
+     * an {@code _id} address, and the Tail is a match-set copy of the legs carried only when the request needs it. So the
+     * walk is delegated wholesale, which makes what a visitor sees identical to classic hybrid rather than merely closer to
+     * it. Without this the inherited default accepts this one builder and stops, so a visitor collecting from the legs
+     * finds nothing and whatever it drives is silently skipped.
+     *
+     * <p>Consequence worth knowing: a walk of this query therefore reports the original's fused legs again, so
+     * {@code HybridQueryBuilder#countFusedLegSearches} over the substitute is not zero. No guard reads it that way — the leg
+     * search budget counts the request's own {@code source().query()}, which core overwrites only once the whole rewrite has
+     * finished, so it never sees a substitute.
+     *
+     * <p>Falls back to that default when no original was carried, since there is then nothing better to offer.
+     */
+    @Override
+    public void visit(QueryBuilderVisitor visitor) {
+        if (Objects.isNull(originalQuery)) {
+            visitor.accept(this);
+            return;
+        }
+        originalQuery.visit(visitor);
+    }
+
     @Override
     protected boolean doEquals(HybridFusionQueryBuilder other) {
         return Arrays.equals(ids, other.ids)
@@ -491,8 +571,29 @@ public class HybridFusionQueryBuilder extends AbstractQueryBuilder<HybridFusionQ
         return NAME;
     }
 
+    /**
+     * Render the {@code hybrid} this replaced, when it was carried.
+     *
+     * <p>The rewritten source is rendered as XContent by anything that addresses the request by <i>path</i> —
+     * {@code rerank}'s {@code query_context.query_text_path} is resolved against exactly that map — and a path written
+     * against the query the user sent stops resolving the moment the query under it is a different one. Emitting the
+     * original keeps such a path resolving as it does in classic hybrid; it also means a logged or profiled request shows
+     * the query that was asked rather than the window it was answered from.
+     *
+     * <p>What has to be true for that to be safe is that nothing consumes this representation as a definition of what runs —
+     * the rendered form is a fused {@code hybrid}, so re-parsing it would fan out a second time. Nothing does: a shard
+     * receives the wire form ({@link #doWriteTo}), not XContent; the one thing in core that re-parses a rendered source in
+     * this process is cross-cluster search, which fused mode refuses outright ({@code CandidateScope}); and a non-search
+     * rewrite is refused before the self-erase, so {@code _validate/query} and {@code _explain} never produce this query at
+     * all. When nothing was carried, the informational form below is unparseable by construction
+     * ({@link #fromXContent} throws).
+     */
     @Override
     protected void doXContent(XContentBuilder builder, Params params) throws IOException {
+        if (Objects.nonNull(originalQuery)) {
+            originalQuery.doXContent(builder, params);
+            return;
+        }
         // Internal query; representation is informational only.
         builder.startObject(NAME);
         builder.field("fused_docs_count", ids.length);
