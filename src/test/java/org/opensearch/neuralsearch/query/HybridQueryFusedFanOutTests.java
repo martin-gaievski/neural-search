@@ -5,18 +5,21 @@
 package org.opensearch.neuralsearch.query;
 
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.not;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.opensearch.neuralsearch.common.MinClusterVersionUtil.MINIMAL_SUPPORTED_VERSION_FUSED_MODE_IN_HYBRID_QUERY;
 import static org.opensearch.neuralsearch.settings.NeuralSearchSettings.DEFAULT_MAX_FUSION_LEG_SEARCHES;
+import static org.opensearch.neuralsearch.settings.NeuralSearchSettings.HYBRID_FUSION_ENABLED;
 import static org.opensearch.neuralsearch.settings.NeuralSearchSettings.MAX_FUSION_LEG_SEARCHES;
 
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Objects;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
@@ -673,6 +676,152 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
         assertEquals("and it fans out its own legs from there", 1, legRegistered.size());
     }
 
+    // ------------------------------------------------- opt-in -------------------------------------------------
+
+    /**
+     * Fused mode is off until an operator turns it on, and a query carrying a {@code fusion}
+     * block on a cluster that has not is refused before anything is fanned out. The message has to name the setting: it
+     * is the only thing the user can act on, and nothing about their query is wrong.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenTurnedOffByClusterSetting_isRejectedBeforeAnyFanOut() {
+        initClusterUtil(Settings.builder().put(HYBRID_FUSION_ENABLED.getKey(), false).build());
+        QueryBuilder query = nestedChain(1);
+        List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+        QueryCoordinatorContext coordinatorContext = coordinatorContext(request(query), registered);
+
+        IllegalArgumentException error = expectThrows(IllegalArgumentException.class, () -> query.rewrite(coordinatorContext));
+
+        assertThat(
+            "the one thing the user can act on is the setting key",
+            error.getMessage(),
+            containsString(HYBRID_FUSION_ENABLED.getKey())
+        );
+        assertThat(error.getMessage(), containsString("is turned off on this cluster"));
+        assertThat("and the alternative that works today", error.getMessage(), containsString("use classic hybrid"));
+        assertTrue("refused before a fan-out the cluster never opted in to", registered.isEmpty());
+    }
+
+    /**
+     * Cluster settings that cannot be read resolve to the setting's own default, which for this one is off. That is the
+     * same value a cluster with nothing configured resolves, so an unreadable settings object refuses exactly where a
+     * cluster that never opted in does rather than opening the path on the way through — the opposite trade
+     * from the leg budget, whose default is permissive.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenClusterSettingsCannotBeRead_thenItIsRefused() {
+        initClusterUtilWithoutClusterSettings();
+        QueryBuilder query = nestedChain(1);
+        List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+        QueryCoordinatorContext coordinatorContext = coordinatorContext(request(query), registered);
+
+        IllegalArgumentException error = expectThrows(IllegalArgumentException.class, () -> query.rewrite(coordinatorContext));
+
+        assertThat(error.getMessage(), containsString(HYBRID_FUSION_ENABLED.getKey()));
+        assertTrue(registered.isEmpty());
+    }
+
+    /**
+     * When the cluster is both switched off and lagging, the switch is what the user is told about. Pins the order of the
+     * two refusals: the version message tells them to upgrade nodes, which is the wrong errand for a feature they never
+     * turned on — and the one they would still have to run afterwards.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenTurnedOffOnALaggingCluster_thenTheSettingRefusalWins() {
+        initClusterUtil(Settings.builder().put(HYBRID_FUSION_ENABLED.getKey(), false).build(), Version.V_3_7_0);
+        QueryBuilder query = nestedChain(1);
+        QueryCoordinatorContext coordinatorContext = coordinatorContext(request(query), new ArrayList<>());
+
+        IllegalArgumentException error = expectThrows(IllegalArgumentException.class, () -> query.rewrite(coordinatorContext));
+
+        assertThat(error.getMessage(), containsString(HYBRID_FUSION_ENABLED.getKey()));
+        assertThat("the upgrade errand is the wrong one to send them on", error.getMessage(), not(containsString("or later")));
+    }
+
+    /**
+     * The switch is read above the {@code SearchRequest} cast, like the version refusal and for the same reason:
+     * {@code _explain} and {@code _validate/query} rewrite on the coordinator with a non-search request and are dispatched
+     * still fused, so a cluster that has not opted in must refuse them too.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenTurnedOffAndTheRequestIsNotASearch_thenItIsStillRefused() {
+        initClusterUtil(Settings.builder().put(HYBRID_FUSION_ENABLED.getKey(), false).build());
+        QueryBuilder query = nestedChain(1);
+        QueryCoordinatorContext coordinatorContext = mock(QueryCoordinatorContext.class);
+        when(coordinatorContext.convertToCoordinatorContext()).thenReturn(coordinatorContext);
+        when(coordinatorContext.getSearchRequest()).thenReturn(mock(org.opensearch.action.IndicesRequest.class));
+
+        IllegalArgumentException error = expectThrows(IllegalArgumentException.class, () -> query.rewrite(coordinatorContext));
+
+        assertThat(error.getMessage(), containsString(HYBRID_FUSION_ENABLED.getKey()));
+    }
+
+    /**
+     * Below the match-set short-circuit, though. A fused hybrid rewritten for its match set only is a leg of an enclosing
+     * fused query whose own rewrite already passed the switch — it is contributing what its legs match to that query's
+     * Tail, not entering fused mode itself, so refusing here would fail a request the cluster did admit.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenTurnedOffAndOnlyTheMatchSetIsWanted_thenItStillContributes() {
+        initClusterUtil(Settings.builder().put(HYBRID_FUSION_ENABLED.getKey(), false).build());
+        MatchQueryBuilder match = new MatchQueryBuilder(TEXT_FIELD_NAME, "hello");
+        QueryBuilder term = QueryBuilders.termQuery(TEXT_FIELD_NAME, "kw");
+        HybridQueryBuilder hybrid = fused(match, term);
+        List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+        QueryCoordinatorContext coordinatorContext = coordinatorContext(request(hybrid), registered);
+
+        QueryBuilder rewritten = hybrid.rewrite(MatchSetRewriteContext.wrap(coordinatorContext));
+
+        assertEquals(new BoolQueryBuilder().should(match).should(term), rewritten);
+        assertTrue(registered.isEmpty());
+    }
+
+    /**
+     * And below the round-2 short-circuit, so a flip landing between the two rounds cannot strand a request whose legs
+     * have already run. The switch is a dynamic setting read per rewrite, so this is reachable: it turns off while the
+     * fan-out is in flight.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenTurnedOffAfterRoundOne_thenRoundTwoStillCompletes() {
+        MatchQueryBuilder match = new MatchQueryBuilder(TEXT_FIELD_NAME, "hello");
+        QueryBuilder term = QueryBuilders.termQuery(TEXT_FIELD_NAME, "kw");
+        HybridQueryBuilder hybrid = fused(match, term);
+        List<BiConsumer<Client, ActionListener<?>>> registered = new ArrayList<>();
+        QueryBuilder afterRoundOne = hybrid.rewrite(coordinatorContext(request(hybrid), registered));
+        assertEquals("round 1 fanned out while the cluster was still opted in", 1, registered.size());
+        registered.getFirst()
+            .accept(
+                multiSearchingClient(new ArrayList<>(), Set.of()),
+                ActionListener.wrap(response -> {}, e -> fail("leg fan-out failed: " + e.getMessage()))
+            );
+
+        initClusterUtil(Settings.builder().put(HYBRID_FUSION_ENABLED.getKey(), false).build());
+        QueryBuilder roundTwo = afterRoundOne.rewrite(coordinatorContext(request(hybrid), new ArrayList<>()));
+
+        assertFalse("round 2 hands over the query the legs already paid for", roundTwo instanceof HybridQueryBuilder);
+    }
+
+    /** The other branch: opted in, and it fans out. */
+    @SneakyThrows
+    public void testFusedMode_whenTurnedOnExplicitly_thenItFansOut() {
+        initClusterUtil(Settings.builder().put(HYBRID_FUSION_ENABLED.getKey(), true).build());
+
+        FanOut fanOut = drive(request(nestedChain(1)));
+
+        assertEquals(1, fanOut.multiSearches());
+        assertEquals(List.of(2), fanOut.legCountPerMultiSearch());
+    }
+
+    /**
+     * The shape of the switch itself. Off by default is what makes the feature opt-in rather than announced, and dynamic
+     * is what makes it a kill switch — an operator who has to restart nodes to turn it back off does not have one.
+     */
+    public void testFusedModeSetting_isOffByDefaultAndDynamic() {
+        assertEquals("plugins.neural_search.hybrid.fusion.enabled", HYBRID_FUSION_ENABLED.getKey());
+        assertFalse("fused mode ships off", HYBRID_FUSION_ENABLED.getDefault(Settings.EMPTY));
+        assertTrue("and has to be flippable without a restart, in both directions", HYBRID_FUSION_ENABLED.isDynamic());
+    }
+
     // ---------------------------------------------- version guard ----------------------------------------------
 
     /**
@@ -1110,6 +1259,18 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
      * setting's own default.
      */
     private void initClusterUtil(final Settings clusterSettings, final Version minNodeVersion) {
+        initClusterUtil(clusterSettings, minNodeVersion, true);
+    }
+
+    /**
+     * The same cluster, except its cluster settings cannot be read at all — what the fused rewrite sees when there is no
+     * running node behind the singleton. Fused mode then falls back to the setting's own default, i.e. off.
+     */
+    private void initClusterUtilWithoutClusterSettings() {
+        initClusterUtil(null, Version.CURRENT, false);
+    }
+
+    private void initClusterUtil(final Settings clusterSettings, final Version minNodeVersion, final boolean stubClusterSettings) {
         Metadata metadata = mock(Metadata.class);
         ClusterState clusterState = mock(ClusterState.class);
         clusterService = mock(ClusterService.class);
@@ -1120,8 +1281,16 @@ public class HybridQueryFusedFanOutTests extends OpenSearchQueryTestCase {
         when(clusterState.getNodes()).thenReturn(nodes);
         when(nodes.getMinNodeVersion()).thenReturn(minNodeVersion);
         when(metadata.custom(SearchPipelineMetadata.TYPE)).thenReturn(new SearchPipelineMetadata(Map.of()));
-        if (clusterSettings != null) {
-            when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(clusterSettings, Set.of(MAX_FUSION_LEG_SEARCHES)));
+        if (stubClusterSettings) {
+            // Fused mode is an opt-in, so it has to be turned on for this suite to fan out at all. The
+            // caller's own settings are layered on top, which lets a test turn it back off.
+            Settings settings = Settings.builder()
+                .put(HYBRID_FUSION_ENABLED.getKey(), true)
+                .put(Objects.isNull(clusterSettings) ? Settings.EMPTY : clusterSettings)
+                .build();
+            when(clusterService.getClusterSettings()).thenReturn(
+                new ClusterSettings(settings, Set.of(HYBRID_FUSION_ENABLED, MAX_FUSION_LEG_SEARCHES))
+            );
         }
         Index index = new Index(INDEX_NAME, "uuid-1");
         Settings indexSettings = Settings.builder()

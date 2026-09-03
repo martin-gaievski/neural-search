@@ -75,6 +75,7 @@ import org.opensearch.neuralsearch.stats.events.EventStatName;
 import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
 import org.opensearch.neuralsearch.stats.events.EventStatsManager;
 
+import static org.opensearch.neuralsearch.settings.NeuralSearchSettings.HYBRID_FUSION_ENABLED;
 import static org.opensearch.neuralsearch.settings.NeuralSearchSettings.MAX_FUSION_LEG_SEARCHES;
 import static org.opensearch.neuralsearch.common.MinClusterVersionUtil.MINIMAL_SUPPORTED_VERSION_FUSED_MODE_IN_HYBRID_QUERY;
 import static org.opensearch.neuralsearch.common.MinClusterVersionUtil.isClusterOnOrAfterMinReqVersionForPaginationInHybridQuery;
@@ -556,6 +557,9 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
         if (Objects.isNull(coordinatorContext)) {
             return this;
         }
+        // The operator's own switch ahead of the cluster's capability: on a cluster that is both lagging and switched off,
+        // the version refusal would send them to upgrade nodes for a feature they never turned on.
+        requireFusedModeIsEnabled();
         // Before anything about the request itself: a cluster that cannot run round 2 on every shard cannot run fused mode
         // at all. Ahead of the SearchRequest cast on purpose — _explain and _validate/query rewrite on the coordinator with
         // a non-search request and are dispatched still-fused, so they need the same refusal.
@@ -817,6 +821,40 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
     }
 
     /**
+     * Refuse fused mode unless the cluster has opted in to {@link NeuralSearchSettings#HYBRID_FUSION_ENABLED}.
+     *
+     * <p>Read live off the cluster settings, like the leg budget, so an operator's update takes effect on the next
+     * request. Falls back to the setting's own default when there is no cluster service to read: that is the same value
+     * an unconfigured cluster resolves, so an unreadable settings object refuses exactly where a cluster that never
+     * opted in does, instead of opening the path on the way through.
+     *
+     * <p>A refusal rather than a downgrade to classic hybrid, because the two are not the same query: the fusion config
+     * a fused request carries in its body has no classic equivalent without a search pipeline, so stripping it would
+     * answer 200 with un-normalized scores — and the pre-rewrite {@code HybridQuerySearchRequestFilter} has already
+     * decided not to apply classic hybrid's own workarounds to this request.
+     */
+    private static void requireFusedModeIsEnabled() {
+        ClusterService clusterService = NeuralSearchClusterUtil.instance().getClusterService();
+        boolean enabled = Objects.isNull(clusterService) || Objects.isNull(clusterService.getClusterSettings())
+            ? HYBRID_FUSION_ENABLED.getDefault(Settings.EMPTY)
+            : clusterService.getClusterSettings().get(HYBRID_FUSION_ENABLED);
+        if (enabled) {
+            return;
+        }
+        throw new IllegalArgumentException(
+            String.format(
+                Locale.ROOT,
+                "[%s] query [%s] is turned off on this cluster. Set [%s] to true to enable it, or drop the [%s] block and "
+                    + "use classic hybrid",
+                NAME,
+                FUSION_FIELD.getPreferredName(),
+                HYBRID_FUSION_ENABLED.getKey(),
+                FUSION_FIELD.getPreferredName()
+            )
+        );
+    }
+
+    /**
      * Refuse fused mode while any node in the cluster predates it.
      *
      * <p>Round 2 dispatches a {@link HybridFusionQueryBuilder} — a query type introduced together with fused mode — to
@@ -844,7 +882,7 @@ public final class HybridQueryBuilder extends AbstractQueryBuilder<HybridQueryBu
                     Locale.ROOT,
                     "[%s] query [%s] requires all nodes in the cluster to be on version [%s] or later, but the minimum node "
                         + "version is [%s], so the fused query cannot be dispatched to every shard. Upgrade the remaining "
-                        + "nodes, or drop the [%s] block and use classic hybrid with a normalization or score-ranker processor",
+                        + "nodes, or drop the [%s] block and use classic hybrid",
                     NAME,
                     FUSION_FIELD.getPreferredName(),
                     MINIMAL_SUPPORTED_VERSION_FUSED_MODE_IN_HYBRID_QUERY,
