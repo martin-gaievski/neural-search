@@ -23,10 +23,11 @@ import lombok.SneakyThrows;
 /**
  * End-to-end coverage of how a fused/resolver hybrid renders an ANN ({@code knn}/{@code neural}) leg in the Tail.
  *
- * <p>An ANN leg's Lucene match set IS the top-k it returned, so re-running it in the Tail would only re-walk the HNSW
- * graph to recount what the fan-out already retrieved. The coordinator therefore replaces such a leg with a direct address
- * of its returned hits — and because the Tail is a {@code filter}, that address decides the match set that
- * {@code total_hits}, every aggregation, and the score-0 region of the hit list are computed from.
+ * <p>An ANN leg the window did not truncate has returned its whole Lucene match set, so re-running it in the Tail would only
+ * re-walk the HNSW graph to recount what the fan-out already retrieved. The coordinator therefore replaces such a leg with a
+ * direct address of its returned hits — and because the Tail is a {@code filter}, that address decides the match set that
+ * {@code total_hits}, every aggregation, and the score-0 region of the hit list are computed from. A leg that <i>filled</i>
+ * the window may have matched documents it never returned, so it is kept as the real query and counted for real instead.
  *
  * <p>Addressed by {@code _id} alone, that set silently grew: on a multi-index search every same-{@code _id} document in a
  * sibling index passed the filter, so the numbers the Tail exists to make correct were the ones it inflated. This is not
@@ -320,24 +321,22 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
     }
 
     /**
-     * The recall bound a materialized leg accepts, made executable. {@code newLegRequest} caps every leg at
-     * {@code size = window_size}, so the substitute stands for {@code min(matches, window_size)} documents — while the leg's
-     * own {@code k} decides how many it actually matched. With {@code k} (3) above {@code window_size} (2) the ANN leg
-     * matches all three of index-a's documents and returns two, so a document that enters the fused window through the other
-     * leg carries no evidence that the ANN leg matched it.
+     * The truncation bound, made executable. {@code newLegRequest} caps every leg at {@code size = window_size}, so a
+     * substitute can only stand for {@code min(matches, window_size)} documents — while the leg's own {@code k}, which fused
+     * mode deliberately does not rewrite, decides how many it actually matched. With {@code k} (3) above
+     * {@code window_size} (2) the ANN leg matches all three of index-a's documents and returns two, so an address of what it
+     * returned is <i>not</i> its match set. That leg is therefore kept as the real query in the Tail and re-walked, and the
+     * document outside its returned set reports the ANN name exactly as classic hybrid does.
      *
-     * <p>Classic hybrid re-evaluates the named leg's weight per hit and would report the name; fused mode cannot without the
-     * graph walk materialization exists to avoid. This is a characterization test of that documented bound (see
-     * {@code HybridFusionOrchestrator#isMaterializableLeg}), not a parity assertion — raising {@code window_size} to at
-     * least {@code k} × shards removes the gap.
+     * <p>The window-wide run is the control: the leg came back short of the window, so it was not truncated, it <i>is</i>
+     * materialized, and the name still arrives — which is what makes the run above a truncation test rather than
+     * materialization being switched off. Doc 1 is the control in the other direction: it was inside the returned set at
+     * {@code window_size} 2 either way.
      *
-     * <p>The reciprocal owner leg ranks {@code 1/s}, i.e. doc 3 first, so doc 3 is returned even at {@code window_size} 2 and
-     * is the truncated case. The same query at a {@code window_size} above {@code k} is run as the control: the name comes
-     * back, which is what makes the absence a recall bound rather than a lost name. Doc 1 is the control in the other
-     * direction — the owner leg did not return it either, but that leg is <i>not</i> materialized, so it reaches the shard as
-     * the real query and its name is reported over its full match set.
+     * <p>The reciprocal owner leg ranks {@code 1/s}, i.e. doc 3 first, so doc 3 enters the fused window even at
+     * {@code window_size} 2.
      */
-    public void testFusedKnnTail_whenAnnLegMatchedBeyondItsWindow_thenTheTruncatedDocLosesTheAnnName() {
+    public void testFusedKnnTail_whenAnnLegMatchedBeyondItsWindow_thenTheTruncatedDocStillReportsTheAnnName() {
         ensureDataset();
         int annK = COLLIDING_IDS;              // the ANN leg matches every one of index-a's documents...
         int truncatingWindow = annK - 1;       // ...and window_size lets it return one fewer than it matched.
@@ -354,19 +353,19 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
         );
 
         assertEquals(
-            "doc 3 was matched by the ANN leg (k=3) but sat outside the two hits window_size=2 let it return, so the "
-                + "materialized substitute does not address it and the ANN name is absent — classic hybrid would report it",
-            List.of(OWNER_LEG_NAME),
-            truncated.get("3")
+            "doc 3 was matched by the ANN leg (k=3) but sat outside the two hits window_size=2 let it return, so that leg "
+                + "cannot be materialized and goes to the shard as the real query — reporting the name classic hybrid reports",
+            List.of(OWNER_LEG_NAME, VECTOR_LEG_NAME),
+            sorted(truncated.get("3"))
         );
         assertTrue(
-            "the same document keeps the ANN name once window_size >= k, which is what makes the absence above a recall "
-                + "bound of materialization and not a lost name, got "
+            "the control: at window_size >= k the leg was not truncated, so it IS materialized and the name still arrives — "
+                + "which is what makes the assertion above a truncation test and not materialization switched off, got "
                 + exact,
             exact.get("3").contains(VECTOR_LEG_NAME)
         );
         assertTrue(
-            "doc 1: a leg that is NOT materialized reaches the shard as the real query, so its name covers its whole "
+            "doc 1: a leg that is NOT materializable reaches the shard as the real query, so its name covers its whole "
                 + "match set and not just the hits it returned, got "
                 + truncated,
             truncated.get("1").contains(OWNER_LEG_NAME)
@@ -375,6 +374,67 @@ public class HybridQueryFusedModeKnnTailIT extends BaseNeuralSearchIT {
             "doc 1 was inside the ANN leg's returned set even at window_size=2, so it keeps that name, got " + truncated,
             truncated.get("1").contains(VECTOR_LEG_NAME)
         );
+    }
+
+    /**
+     * The silent wrong answer the bound closes, on the numbers rather than on a name. The Tail is a {@code filter}, so it
+     * <i>is</i> the match set {@code total_hits} and every aggregation bucket are computed from. With {@code k} (3) above
+     * {@code window_size} (2) the ANN leg matched all three of index-a's documents and returned two, and the other leg
+     * contributes only doc 1 — so while the truncated leg was materialized on the strength of its writeable name alone, the
+     * third document was in nobody's match set: {@code total_hits} read 2 and the {@code owner-a} bucket counted 2, at
+     * HTTP 200, where classic hybrid counts 3.
+     *
+     * <p>This is the shape a {@code neural} leg over a {@code rank_features} semantic field always has — it rewrites into
+     * {@code neural_sparse}, whose match set is every document holding a query token, and the coordinator cannot tell it
+     * from a dense leg because fused mode substitutes the Tail before the legs are rewritten. A {@code knn} leg with an
+     * explicit {@code k} reproduces it without needing a deployed model.
+     *
+     * <p>The window-wide run is the control: the leg was not truncated there, so it is still materialized and must reach the
+     * same numbers. Both runs agreeing is the parity claim; the pre-fix run disagreed by exactly the truncated document.
+     */
+    public void testFusedKnnTail_whenAnnLegMatchedBeyondItsWindow_thenTotalHitsAndAggsStillCountTheMatchSet() {
+        ensureDataset();
+        int annK = COLLIDING_IDS;
+        int truncatingWindow = annK - 1;
+
+        Map<String, Object> truncated = countingRun(annK, truncatingWindow);
+        Map<String, Object> exact = countingRun(annK, WINDOW_SIZE);
+
+        assertEquals(
+            "the ANN leg matched all three of index-a's documents, so all three are in the Tail's match set even though "
+                + "window_size=2 let the leg return only two",
+            (long) COLLIDING_IDS,
+            totalHits(truncated)
+        );
+        assertEquals("every counted document is index-a's", Map.of(OWNER_A, COLLIDING_IDS), ownerBuckets(truncated));
+        // The control run cannot be truncated, so it fixes the oracle: a window wide enough to hold the leg's whole match
+        // set must produce the same numbers, or the assertions above are pinning an accident of this window rather than the
+        // leg's match set.
+        assertEquals("a window wider than k must count the same match set", totalHits(exact), totalHits(truncated));
+        assertEquals(ownerBuckets(exact), ownerBuckets(truncated));
+    }
+
+    /**
+     * The fused query for the counting run: the ANN leg at an explicit {@code k}, plus a leg narrow enough that the ANN
+     * leg is the only thing that can bring the truncated document into the match set. {@code s} is {@code 100 - id} in
+     * index-a and {@code 50 - id} in index-b, so {@code s = 99} is index-a's doc 1 alone.
+     */
+    @SneakyThrows
+    private Map<String, Object> countingRun(int annK, int windowSize) {
+        String narrowLeg = "{\"term\":{\"" + SCORE_FIELD + "\":99}}";
+        String body = "{\"query\":"
+            + fusedHybrid(windowSize, knnLeg("", annK), narrowLeg)
+            + ",\"aggregations\":{\"by_owner\":{\"terms\":{\"field\":\""
+            + OWNER_FIELD
+            + "\",\"size\":10}}},\"track_total_hits\":true}";
+        return searchRaw(body, 20);
+    }
+
+    /** A copy of the list in a stable order, so an assertion on a name set does not depend on clause order. */
+    private List<String> sorted(List<String> names) {
+        List<String> copy = new ArrayList<>(names);
+        copy.sort(String::compareTo);
+        return copy;
     }
 
     /** {@code matched_queries} per returned document, for the two-named-leg fused query at a given {@code k} and window. */
