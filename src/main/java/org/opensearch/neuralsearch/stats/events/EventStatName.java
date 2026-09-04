@@ -17,7 +17,11 @@ import java.util.stream.Collectors;
 /**
  * Enum that contains all event stat names, paths, and types
  * WE SHOULD AVOID CHANGING THE ORDER OF THESE STAT ENUMS! The ordinal is used in StreamInput/Output.
- * Changing the order will break the mixed cluster version upgrade version case.
+ * Changing the order will break the mixed cluster version upgrade version case. Append a new stat at the end, never
+ * insert one: the coordinating node only sends the leading run of stats the oldest node in the cluster also has
+ * ({@code RestNeuralStatsAction#statsSupportedByAllNodes}), so an insertion silently cuts every stat after it out of the
+ * response on a mixed cluster. The version declares the release a stat's ordinal dates from, which is the release it was
+ * added in only as long as nothing was ever inserted before it.
  */
 @Getter
 public enum EventStatName implements StatName {
@@ -97,7 +101,7 @@ public enum EventStatName implements StatName {
         "agentic_query_translator_executions",
         "processors.search.agentic",
         EventStatType.TIMESTAMPED_EVENT_COUNTER,
-        Version.V_3_2_0
+        Version.V_3_3_0
     ),
     /** Tracks executions of the agentic context processor */
     AGENTIC_CONTEXT_PROCESSOR_EXECUTIONS(
@@ -254,7 +258,7 @@ public enum EventStatName implements StatName {
     RERANK_ML_PROCESSOR_EXECUTIONS("rerank_ml_executions", "processors.search", EventStatType.TIMESTAMPED_EVENT_COUNTER, Version.V_3_1_0),
 
     /** Counts agentic query requests */
-    AGENTIC_QUERY_REQUESTS("agentic_query_requests", "query.agentic", EventStatType.TIMESTAMPED_EVENT_COUNTER, Version.V_3_2_0),
+    AGENTIC_QUERY_REQUESTS("agentic_query_requests", "query.agentic", EventStatType.TIMESTAMPED_EVENT_COUNTER, Version.V_3_3_0),
 
     /** Counts seismic query requests */
     SEISMIC_QUERY_REQUESTS("seismic_query_requests", "query.neural_sparse", EventStatType.TIMESTAMPED_EVENT_COUNTER, Version.V_3_3_0),

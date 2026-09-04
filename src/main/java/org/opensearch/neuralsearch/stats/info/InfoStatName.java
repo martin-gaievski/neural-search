@@ -17,7 +17,11 @@ import java.util.stream.Collectors;
 /**
  * Enum that contains all info stat names, paths, and types
  * WE SHOULD AVOID CHANGING THE ORDER OF THESE STAT ENUMS! The ordinal is used in StreamInput/Output.
- * Changing the order will break the mixed cluster version upgrade version case.
+ * Changing the order will break the mixed cluster version upgrade version case. Append a new stat at the end, never
+ * insert one: the coordinating node only sends the leading run of stats the oldest node in the cluster also has
+ * ({@code RestNeuralStatsAction#statsSupportedByAllNodes}), so an insertion silently cuts every stat after it out of the
+ * response on a mixed cluster. The version declares the release a stat's ordinal dates from, which is the release it was
+ * added in only as long as nothing was ever inserted before it.
  */
 @Getter
 public enum InfoStatName implements StatName {
@@ -99,7 +103,7 @@ public enum InfoStatName implements StatName {
         "agentic_query_translator_processors",
         "processors.search.agentic",
         InfoStatType.INFO_COUNTER,
-        Version.V_3_2_0
+        Version.V_3_3_0
     ),
     /** Counts agentic context processors */
     AGENTIC_CONTEXT_PROCESSORS("agentic_context_processors", "processors.search.agentic", InfoStatType.INFO_COUNTER, Version.V_3_3_0);

@@ -6,8 +6,10 @@ package org.opensearch.neuralsearch.bwc.rolling;
 
 import java.io.IOException;
 import java.util.Map;
+import java.util.Optional;
 
 import org.apache.hc.core5.http.io.entity.EntityUtils;
+import org.junit.Before;
 import org.opensearch.Version;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -28,10 +30,9 @@ import static org.opensearch.neuralsearch.util.TestUtils.NODES_BWC_CLUSTER;
  * cluster is below {@link #FUSED_MODE_MIN_VERSION}.
  *
  * <p>The invariant asserted at every stage is therefore not "fused mode works" but the stronger, upgrade-safe one:
- * <b>a fused query is either served completely or refused with a 400 — never partially served</b>. Which of the two
- * applies is decided by the cluster's own observed minimum node version, not by the configured {@code bwc.version}, so
- * the test is correct both in CI (where the base cluster is a real released version below 3.8) and locally (where
- * {@code bwc.version} defaults to the current snapshot, so no stage is actually mixed and every stage must serve).
+ * <b>a fused query is either served completely or refused with a 400 — never partially served</b>. Which of the two applies
+ * is decided by the cluster's own observed minimum node version, which is a sound reading only once the base cluster is
+ * known to predate fused mode — see {@link #skipUnlessBaseClusterPredatesFusedMode()}.
  *
  * <p>On a mixed cluster either coordinator is acceptable and they say different things — a pre-3.8 node fails while parsing
  * the unknown {@code fusion} field, an upgraded one fails on the version guardrail, or on the opt-in if the
@@ -54,6 +55,27 @@ public class HybridSearchFusedModeIT extends AbstractRollingUpgradeTestCase {
     /** Documents 0..2 match at least one leg; document 3 matches neither. */
     private static final String[] DOCS = { "hello world hello", "hello there place", "welcome to the place", "nothing relevant at all" };
     private static final int MATCHING_DOCS = 3;
+
+    /**
+     * A rolling upgrade says something about a version-gated feature only when the base cluster predates it. Every
+     * {@code bwc_version} row CI runs is a real release below {@link #FUSED_MODE_MIN_VERSION}, but the local default is
+     * {@code systemProp.bwc.version=3.8.0-SNAPSHOT} ({@code gradle.properties}), and the base cluster is then a nightly
+     * distribution of that same version number carrying the plugin built from {@code main} — nodes reporting 3.8 whose
+     * plugin has neither the opt-in nor fused mode. No node version can tell those apart from the build under test, and
+     * neither branch of the invariant then holds: the coordinator's own guardrail is version-based too, so a mixed stage
+     * would hand a fused query to a shard that cannot read it. Pass a real released base to exercise this class locally,
+     * e.g. {@code -Dtests.bwc.version=3.7.0}.
+     */
+    @Before
+    public void skipUnlessBaseClusterPredatesFusedMode() {
+        Optional<String> baseVersion = getBWCVersion();
+        assumeTrue("no configured base version to compare against " + FUSED_MODE_MIN_VERSION, baseVersion.isPresent());
+        assumeTrue(
+            String.format(LOCALE, "needs a base version below %s, got [%s]", FUSED_MODE_MIN_VERSION, baseVersion.get()),
+            // Version.fromString rejects a snapshot qualifier outright, so strip it the way qa/build.gradle does.
+            Version.fromString(baseVersion.get().replace("-SNAPSHOT", "")).before(FUSED_MODE_MIN_VERSION)
+        );
+    }
 
     public void testFusedModeHybridQuery_E2EFlow() throws Exception {
         waitForClusterHealthGreen(NODES_BWC_CLUSTER);
