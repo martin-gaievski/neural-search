@@ -225,6 +225,63 @@ public class RestNeuralStatsActionTests extends InferenceProcessorTestCase {
         assertEquals(capturedInput.getInfoStatNames(), EnumSet.of(InfoStatName.TEXT_EMBEDDING_PROCESSORS, InfoStatName.CLUSTER_VERSION));
     }
 
+    /**
+     * A stat is only requested while every node in the cluster reads its ordinal as the same stat, so the request stops at
+     * the first stat the oldest node does not have rather than skipping it: 3.3.0 added event stats in the middle of the
+     * enum, which moved the ordinal of every event stat declared after them, and appended the agentic info stat.
+     */
+    public void test_execute_versionOlderThanEventStatOrdinalShift() throws Exception {
+        when(settingsAccessor.isStatsEnabled()).thenReturn(true);
+        when(clusterUtil.getClusterMinVersion()).thenReturn(Version.V_3_2_0);
+
+        RestNeuralStatsAction restNeuralStatsAction = new RestNeuralStatsAction(settingsAccessor, clusterUtil);
+
+        RestRequest request = getRestRequest();
+        restNeuralStatsAction.handleRequest(request, channel, client);
+
+        ArgumentCaptor<NeuralStatsRequest> argumentCaptor = ArgumentCaptor.forClass(NeuralStatsRequest.class);
+        verify(client, times(1)).execute(eq(NeuralStatsAction.INSTANCE), argumentCaptor.capture(), any());
+
+        NeuralStatsInput capturedInput = argumentCaptor.getValue().getNeuralStatsInput();
+        assertEquals(
+            EnumSet.range(
+                EventStatName.TEXT_EMBEDDING_PROCESSOR_EXECUTIONS,
+                EventStatName.SEMANTIC_HIGHLIGHTING_REQUEST_COUNT
+            ),
+            capturedInput.getEventStatNames()
+        );
+        assertEquals(
+            EnumSet.range(InfoStatName.CLUSTER_VERSION, InfoStatName.RERANK_ML_PROCESSORS),
+            capturedInput.getInfoStatNames()
+        );
+        assertEquals(EnumSet.noneOf(MetricStatName.class), capturedInput.getMetricStatNames());
+    }
+
+    /**
+     * 3.5.0 added an event stat ahead of the last one 3.3.0 had added, so a node on 3.3.x or 3.4.x has every event stat up
+     * to that one and none of the two after it, whatever version those two declare.
+     */
+    public void test_execute_versionOlderThanLastEventStatOrdinalShift() throws Exception {
+        when(settingsAccessor.isStatsEnabled()).thenReturn(true);
+        when(clusterUtil.getClusterMinVersion()).thenReturn(Version.V_3_4_0);
+
+        RestNeuralStatsAction restNeuralStatsAction = new RestNeuralStatsAction(settingsAccessor, clusterUtil);
+
+        RestRequest request = getRestRequest();
+        restNeuralStatsAction.handleRequest(request, channel, client);
+
+        ArgumentCaptor<NeuralStatsRequest> argumentCaptor = ArgumentCaptor.forClass(NeuralStatsRequest.class);
+        verify(client, times(1)).execute(eq(NeuralStatsAction.INSTANCE), argumentCaptor.capture(), any());
+
+        NeuralStatsInput capturedInput = argumentCaptor.getValue().getNeuralStatsInput();
+        assertEquals(
+            EnumSet.range(EventStatName.TEXT_EMBEDDING_PROCESSOR_EXECUTIONS, EventStatName.SEISMIC_QUERY_REQUESTS),
+            capturedInput.getEventStatNames()
+        );
+        assertEquals(EnumSet.allOf(InfoStatName.class), capturedInput.getInfoStatNames());
+        assertEquals(EnumSet.allOf(MetricStatName.class), capturedInput.getMetricStatNames());
+    }
+
     public void test_execute_statParameters() throws Exception {
         when(settingsAccessor.isStatsEnabled()).thenReturn(true);
         when(clusterUtil.getClusterMinVersion()).thenReturn(Version.CURRENT);

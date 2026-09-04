@@ -4,6 +4,7 @@
  */
 package org.opensearch.neuralsearch.query;
 
+import org.opensearch.neuralsearch.BaseNeuralSearchIT;
 import static org.opensearch.neuralsearch.settings.NeuralSearchSettings.DEFAULT_MAX_FUSION_LEG_SEARCHES;
 import static org.opensearch.neuralsearch.settings.NeuralSearchSettings.MAX_FUSION_LEG_SEARCHES;
 
@@ -19,7 +20,6 @@ import org.opensearch.client.ResponseException;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.rest.RestStatus;
-import org.opensearch.neuralsearch.BaseNeuralSearchIT;
 
 import lombok.SneakyThrows;
 

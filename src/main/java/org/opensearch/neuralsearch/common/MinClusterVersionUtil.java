@@ -89,10 +89,11 @@ public final class MinClusterVersionUtil {
     /**
      * Checks whether the given version is on or after the minimum required version for the fused (resolver) mode in the
      * hybrid query. What the caller passes in is the whole decision: for wire read/write gating pass the negotiated
-     * version of the specific peer stream, never the cluster minimum — see CR-290524846 for the mixed-version bug the
-     * cluster-based check causes in a coordinator/worker split. The coordinator's rewrite-time refusal is the opposite
-     * case and passes the cluster minimum, because it decides whether a path may be entered at all rather than how one
-     * known peer is addressed ({@code HybridQueryBuilder#requireClusterSupportsFusedMode}).
+     * version of the specific peer stream, never the cluster minimum — a cluster-based check reads the same for every
+     * peer, so on a mixed-version cluster it writes the fused wire form to a node that cannot read it. The coordinating
+     * node's rewrite-time refusal is the opposite case and passes the cluster minimum, because it decides whether a path
+     * may be entered at all rather than how one known peer is addressed
+     * ({@code HybridQueryBuilder#requireClusterSupportsFusedMode}).
      *
      * @param version The version to check
      * @return true if the version is on or after the minimum required version

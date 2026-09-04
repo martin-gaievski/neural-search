@@ -126,7 +126,8 @@ public class NeuralSearchTests extends OpenSearchQueryTestCase {
                 NeuralSearchSettings.NEURAL_STATS_ENABLED,
                 NeuralSearchSettings.NEURAL_CIRCUIT_BREAKER_LIMIT,
                 NeuralSearchSettings.NEURAL_CIRCUIT_BREAKER_OVERHEAD,
-                NeuralSearchSettings.SPARSE_ALGO_PARAM_INDEX_THREAD_QTY_SETTING
+                NeuralSearchSettings.SPARSE_ALGO_PARAM_INDEX_THREAD_QTY_SETTING,
+                NeuralSearchSettings.HYBRID_FUSION_ENABLED
             )
         );
         when(clusterService.getClusterSettings()).thenReturn(clusterSettings);
@@ -201,10 +202,12 @@ public class NeuralSearchTests extends OpenSearchQueryTestCase {
 
     public void testGetSettings() {
         List<Setting<?>> settings = plugin.getSettings();
-        assertEquals(9, settings.size());
+        assertEquals(10, settings.size());
         // A setting the plugin defines but never registers here cannot be set on a cluster at all, dynamically or in
-        // opensearch.yml — the fused fan-out budget would silently stay at its default.
+        // opensearch.yml — the fused fan-out budget would silently stay at its default, and fused mode's opt-in switch
+        // could never be turned on.
         assertTrue(settings.contains(NeuralSearchSettings.MAX_FUSION_LEG_SEARCHES));
+        assertTrue(settings.contains(NeuralSearchSettings.HYBRID_FUSION_ENABLED));
     }
 
     public void testRequestProcessors() {

@@ -574,7 +574,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
 
     @SneakyThrows
     public void testSerialization_whenPeerStreamOnPreFusionVersion_thenFusionGatedByStreamVersion() {
-        // Mixed-version wire safety (mirrors AOSS CR-290524846): even on a fused-capable cluster singleton, a stream
+        // Mixed-version wire safety: even on a fused-capable cluster singleton, a stream
         // pinned to a pre-fusion peer version must NOT read/write the fusion field — the gate keys off
         // StreamInput/StreamOutput#getVersion(), not the cluster-min-version singleton. An old peer that mistakenly
         // wrote the field would corrupt the classic wire form on the receiving node.
@@ -905,6 +905,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         // No concrete indices → resolveIndexDefaultPipelineId returns null → resolve() returns null.
         when(resolver.concreteIndices(any(org.opensearch.cluster.ClusterState.class), any(org.opensearch.action.IndicesRequest.class)))
             .thenReturn(new org.opensearch.core.index.Index[0]);
+        org.opensearch.neuralsearch.util.NeuralSearchClusterTestUtils.stubFusedModeEnabled(clusterService);
         org.opensearch.neuralsearch.util.NeuralSearchClusterUtil.instance().initialize(clusterService, resolver);
     }
 
@@ -1590,6 +1591,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
         );
         when(resolver.concreteIndices(any(org.opensearch.cluster.ClusterState.class), any(org.opensearch.action.IndicesRequest.class)))
             .thenReturn(indices);
+        org.opensearch.neuralsearch.util.NeuralSearchClusterTestUtils.stubFusedModeEnabled(clusterService);
         org.opensearch.neuralsearch.util.NeuralSearchClusterUtil.instance().initialize(clusterService, resolver);
     }
 
@@ -1618,6 +1620,7 @@ public class HybridQueryBuilderTests extends OpenSearchQueryTestCase {
             .put("index.max_result_window", maxResultWindow)
             .build();
         when(metadata.index(index)).thenReturn(IndexMetadata.builder("test-index").settings(settings).build());
+        org.opensearch.neuralsearch.util.NeuralSearchClusterTestUtils.stubFusedModeEnabled(clusterService);
         org.opensearch.neuralsearch.util.NeuralSearchClusterUtil.instance().initialize(clusterService, resolver);
     }
 

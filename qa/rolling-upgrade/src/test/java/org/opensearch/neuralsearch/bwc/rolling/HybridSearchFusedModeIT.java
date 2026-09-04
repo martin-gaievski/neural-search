@@ -6,8 +6,10 @@ package org.opensearch.neuralsearch.bwc.rolling;
 
 import java.io.IOException;
 import java.util.Map;
+import java.util.Optional;
 
 import org.apache.hc.core5.http.io.entity.EntityUtils;
+import org.junit.Before;
 import org.opensearch.Version;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -28,15 +30,14 @@ import static org.opensearch.neuralsearch.util.TestUtils.NODES_BWC_CLUSTER;
  * cluster is below {@link #FUSED_MODE_MIN_VERSION}.
  *
  * <p>The invariant asserted at every stage is therefore not "fused mode works" but the stronger, upgrade-safe one:
- * <b>a fused query is either served completely or refused with a 400 — never partially served</b>. Which of the two
- * applies is decided by the cluster's own observed minimum node version, not by the configured {@code bwc.version}, so
- * the test is correct both in CI (where the base cluster is a real released version below 3.8) and locally (where
- * {@code bwc.version} defaults to the current snapshot, so no stage is actually mixed and every stage must serve).
+ * <b>a fused query is either served completely or refused with a 400 — never partially served</b>. Which of the two applies
+ * is decided by the cluster's own observed minimum node version, which is a sound reading only once the base cluster is
+ * known to predate fused mode — see {@link #skipUnlessBaseClusterPredatesFusedMode()}.
  *
- * <p>On a mixed cluster either coordinator is acceptable and the two say different things — a pre-3.8 node fails while
- * parsing the unknown {@code fusion} field, an upgraded one fails on the version guardrail — so the assertions are
- * deliberately coordinator-agnostic: a 400, and no trace of the internal round-2 query name, which would mean the fused
- * query was dispatched and a shard rejected it.
+ * <p>On a mixed cluster either coordinator is acceptable and they say different things — a pre-3.8 node fails while parsing
+ * the unknown {@code fusion} field, an upgraded one fails on the version guardrail, or on the opt-in if the
+ * cluster-manager was too old to accept it — so the assertions are deliberately coordinator-agnostic: a 400, and no trace of
+ * the internal round-2 query name, which would mean the fused query was dispatched and a shard rejected it.
  *
  * <p>Deliberately not excluded for any {@code bwc_version} row in {@code qa/rolling-upgrade/build.gradle}: the convention
  * there is to exclude a new feature's test class for base versions predating the feature, which for a 3.8 feature would
@@ -54,6 +55,27 @@ public class HybridSearchFusedModeIT extends AbstractRollingUpgradeTestCase {
     /** Documents 0..2 match at least one leg; document 3 matches neither. */
     private static final String[] DOCS = { "hello world hello", "hello there place", "welcome to the place", "nothing relevant at all" };
     private static final int MATCHING_DOCS = 3;
+
+    /**
+     * A rolling upgrade says something about a version-gated feature only when the base cluster predates it. Every
+     * {@code bwc_version} row CI runs is a real release below {@link #FUSED_MODE_MIN_VERSION}, but the local default is
+     * {@code systemProp.bwc.version=3.8.0-SNAPSHOT} ({@code gradle.properties}), and the base cluster is then a nightly
+     * distribution of that same version number carrying the plugin built from {@code main} — nodes reporting 3.8 whose
+     * plugin has neither the opt-in nor fused mode. No node version can tell those apart from the build under test, and
+     * neither branch of the invariant then holds: the coordinator's own guardrail is version-based too, so a mixed stage
+     * would hand a fused query to a shard that cannot read it. Pass a real released base to exercise this class locally,
+     * e.g. {@code -Dtests.bwc.version=3.7.0}.
+     */
+    @Before
+    public void skipUnlessBaseClusterPredatesFusedMode() {
+        Optional<String> baseVersion = getBWCVersion();
+        assumeTrue("no configured base version to compare against " + FUSED_MODE_MIN_VERSION, baseVersion.isPresent());
+        assumeTrue(
+            String.format(LOCALE, "needs a base version below %s, got [%s]", FUSED_MODE_MIN_VERSION, baseVersion.get()),
+            // Version.fromString rejects a snapshot qualifier outright, so strip it the way qa/build.gradle does.
+            Version.fromString(baseVersion.get().replace("-SNAPSHOT", "")).before(FUSED_MODE_MIN_VERSION)
+        );
+    }
 
     public void testFusedModeHybridQuery_E2EFlow() throws Exception {
         waitForClusterHealthGreen(NODES_BWC_CLUSTER);
@@ -92,10 +114,20 @@ public class HybridSearchFusedModeIT extends AbstractRollingUpgradeTestCase {
      * @param expectedMatchedDocs documents matching at least one leg, used only when the cluster is expected to serve
      */
     private void assertFusedModeIsServedOrRefused(final int expectedMatchedDocs) throws Exception {
+        // Fused mode is an opt-in, off unless the cluster is switched on. Attempted even when this cluster is
+        // expected to refuse: on a mixed cluster whose elected cluster-manager is already upgraded the key is accepted, and
+        // that is what keeps the refusal below on the version guardrail this test exists for rather than on the setting.
+        // Swallowed there because a cluster-manager still running the old plugin rejects a key it has never heard of, and
+        // demanded once every node can run fused mode, so the positive branch fails on the switch rather than on a query.
+        if (minimumNodeVersion().onOrAfter(FUSED_MODE_MIN_VERSION)) {
+            enableFusedMode();
+        } else {
+            tryEnableFusedMode();
+        }
         // Once per node: the REST client rotates over the cluster's hosts, so this covers a coordinator of each version a
         // mixed cluster has. Which one answers decides *why* the query is refused, never whether — a pre-3.8 coordinator
-        // fails parsing `fusion`, an upgraded one on the version guardrail — and only the upgraded coordinator exercises
-        // the guardrail at all, so a single request could miss it entirely.
+        // fails parsing `fusion`, an upgraded one on the version guardrail or the opt-in — and only the upgraded coordinator
+        // exercises those at all, so a single request could miss them entirely.
         for (int node = 0; node < getClusterHosts().size(); node++) {
             assertFusedModeIsServedOrRefusedOnce(expectedMatchedDocs);
         }

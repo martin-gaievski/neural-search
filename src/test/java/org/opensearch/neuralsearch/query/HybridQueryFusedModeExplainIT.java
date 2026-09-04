@@ -4,6 +4,7 @@
  */
 package org.opensearch.neuralsearch.query;
 
+import org.opensearch.neuralsearch.BaseNeuralSearchIT;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -15,7 +16,6 @@ import org.opensearch.client.Response;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.rest.RestStatus;
-import org.opensearch.neuralsearch.BaseNeuralSearchIT;
 
 import lombok.SneakyThrows;
 

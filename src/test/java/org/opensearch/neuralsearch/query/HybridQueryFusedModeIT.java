@@ -4,6 +4,7 @@
  */
 package org.opensearch.neuralsearch.query;
 
+import org.opensearch.neuralsearch.BaseNeuralSearchIT;
 import static org.opensearch.neuralsearch.util.AggregationsTestUtils.getNestedHits;
 
 import java.util.ArrayList;
@@ -26,7 +27,6 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
-import org.opensearch.neuralsearch.BaseNeuralSearchIT;
 import org.opensearch.neuralsearch.processor.normalization.RRFScoreNormalizer;
 
 import lombok.SneakyThrows;
@@ -1216,5 +1216,53 @@ public class HybridQueryFusedModeIT extends BaseNeuralSearchIT {
         classic.add(new TermQueryBuilder(TEXT_FIELD, "place"));
         Map<String, Object> response = search(INDEX_WITH_BOUNDED_NORM, classic, 10);
         assertEquals(3, getHitCount(response));
+    }
+
+    /**
+     * The opt-in, from the operator's side. Fused mode ships off, so a cluster that has not set
+     * {@code plugins.neural_search.hybrid.fusion.enabled} must refuse a query carrying a {@code fusion} block instead of
+     * quietly answering it some other way — and the error has to name the setting, since nothing else in the response
+     * would tell a user why a documented query stopped working.
+     *
+     * <p>The second half is the scope check: the same two legs without the {@code fusion} block are classic hybrid, which
+     * this setting has nothing to do with, and must still be served. That is also why the refusal is a refusal rather than
+     * a downgrade — dropping the block would have answered 200 from this very path, with un-normalized scores.
+     *
+     * <p>Restored in a {@code finally}: the setting is persistent and {@link #cleanUp()} does not reset cluster settings,
+     * so a leak here would refuse every fused query in every later suite of the run.
+     */
+    @SneakyThrows
+    public void testFusedMode_whenTheClusterHasNotOptedIn_thenRefusedWhileClassicStillServes() {
+        if (indexExists(INDEX_NO_PIPELINE) == false) {
+            createIndex(INDEX_NO_PIPELINE, indexConfigWithoutPipeline());
+            addFourDocs(INDEX_NO_PIPELINE);
+        }
+        disableFusedMode();
+        try {
+            ResponseException e = expectThrows(
+                ResponseException.class,
+                () -> search(INDEX_NO_PIPELINE, fusedTwoLegInlineConfigQuery(), 10)
+            );
+            assertEquals(RestStatus.BAD_REQUEST.getStatus(), e.getResponse().getStatusLine().getStatusCode());
+            assertTrue(e.getMessage(), e.getMessage().contains("plugins.neural_search.hybrid.fusion.enabled"));
+            assertTrue(e.getMessage(), e.getMessage().contains("is turned off on this cluster"));
+
+            HybridQueryBuilder classic = new HybridQueryBuilder();
+            classic.add(new MatchQueryBuilder(TEXT_FIELD, "hello"));
+            classic.add(new TermQueryBuilder(TEXT_FIELD, "place"));
+            int classicHits = getHitCount(search(INDEX_NO_PIPELINE, classic, 10));
+            // And this is what a downgrade would have answered: served at HTTP 200, but nothing like the fused result.
+            // This index carries its whole fusion config in the query body, so classic hybrid here has no normalization
+            // processor to reduce with and reports the legs' raw concatenated candidate set instead of the three documents
+            // fused mode ranks. Asserted as a difference rather than an exact count because the number is classic hybrid's
+            // un-normalized behaviour, not anything this change defines.
+            assertNotEquals("dropping the fusion block does not answer what fused mode answers", 3, classicHits);
+        } finally {
+            enableFusedMode();
+        }
+
+        // And back on again without a restart, which is the point of a dynamic setting: the same query the cluster just
+        // refused now fans out.
+        assertEquals(3, getHitCount(search(INDEX_NO_PIPELINE, fusedTwoLegInlineConfigQuery(), 10)));
     }
 }
