@@ -110,6 +110,46 @@ final class FusionConfigResolver {
         return pipelines.get(0).getConfigAsMap();
     }
 
+    private static final String RESPONSE_PROCESSORS_KEY = "response_processors";
+
+    /**
+     * Whether the search pipeline this request will run — the same one {@link #resolve} reads fusion config from — declares
+     * any response processor. Those run inside {@code TransportSearchAction}, before the plugin's {@code ActionFilter}
+     * wrapper sees the response, so anything the wrapper puts on the response (a {@code hits.total} derived from the legs,
+     * say) is invisible to them; a caller that would otherwise hand a processor a number it is about to replace uses this
+     * to leave the response as core built it instead.
+     *
+     * <p>Answers {@code true} when it cannot tell: an inline pipeline body has been drained by core before rewrite (see
+     * {@link #resolve}), and a cluster state that is not available says nothing about the pipeline. Both are the
+     * fail-closed direction — the caller keeps today's behaviour. Never throws: the conflicting inline-plus-named shape is
+     * left for {@link #resolve} to report.
+     */
+    static boolean resolvedPipelineHasResponseProcessors(SearchRequest searchRequest) {
+        Map<String, Object> inlineConfig = Objects.isNull(searchRequest.source()) ? null : searchRequest.source().searchPipelineSource();
+        if (Objects.nonNull(inlineConfig)) {
+            // Drained to {} by core in the common case, which is indistinguishable from "no response processors"; treat any
+            // inline body as possibly carrying them.
+            return true;
+        }
+        ClusterService clusterService = NeuralSearchClusterUtil.instance().getClusterService();
+        if (Objects.isNull(clusterService)) {
+            return true;
+        }
+        String pipelineId = searchRequest.pipeline();
+        if (Objects.isNull(pipelineId)) {
+            pipelineId = resolveIndexDefaultPipelineId(searchRequest);
+        }
+        if (Objects.isNull(pipelineId) || NONE_PIPELINE_ID.equals(pipelineId)) {
+            return false;
+        }
+        Map<String, Object> config = pipelineConfigById(clusterService, pipelineId);
+        if (Objects.isNull(config)) {
+            return false;
+        }
+        Object responseProcessors = config.get(RESPONSE_PROCESSORS_KEY);
+        return responseProcessors instanceof List && ((List<?>) responseProcessors).isEmpty() == false;
+    }
+
     /**
      * Reproduce core's index-default resolution: scan the concrete indices' {@code index.search.default_pipeline}
      * settings — the first non-none default wins, but a second index with a different default collapses to
