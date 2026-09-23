@@ -97,6 +97,33 @@ public class HybridQueryFusedModeTotalHitsIT extends BaseNeuralSearchIT {
         return XContentHelper.convertToMap(XContentType.JSON.xContent(), EntityUtils.toString(response.getEntity()), false);
     }
 
+    /** The same body with a field-free aggregation, which keeps the Tail and refuses the fast path: the two-round twin. */
+    private static String withTailKept(String body) {
+        return "{\"aggs\":{\"n\":{\"filter\":{\"match_all\":{}}}}," + body.substring(1);
+    }
+
+    /** Shard fetch operations one request costs the index (from {@code _stats/search}); the fast path fetches only its legs. */
+    @SneakyThrows
+    private long fetchOpsOf(String body) {
+        long before = fetchOps();
+        search(body);
+        return fetchOps() - before;
+    }
+
+    @SneakyThrows
+    @SuppressWarnings("unchecked")
+    private long fetchOps() {
+        Response response = client().performRequest(new Request("GET", "/" + INDEX + "/_stats/search"));
+        Map<String, Object> stats = XContentHelper.convertToMap(
+            XContentType.JSON.xContent(),
+            EntityUtils.toString(response.getEntity()),
+            false
+        );
+        Map<String, Object> indices = (Map<String, Object>) stats.get("indices");
+        Map<String, Object> total = (Map<String, Object>) ((Map<String, Object>) indices.get(INDEX)).get("total");
+        return ((Number) ((Map<String, Object>) total.get("search")).get("fetch_total")).longValue();
+    }
+
     @SuppressWarnings("unchecked")
     private static Map<String, Object> total(Map<String, Object> response) {
         return (Map<String, Object>) ((Map<String, Object>) response.get("hits")).get("total");
@@ -233,7 +260,7 @@ public class HybridQueryFusedModeTotalHitsIT extends BaseNeuralSearchIT {
      * as before.
      */
     @SneakyThrows
-    public void testTotalHits_whenNoLegReachesTheThreshold_thenTheTailCountsTheUnionExactly() {
+    public void testTotalHits_whenNoLegReachesTheThreshold_thenTheUnionIsCountedExactlyFromRoundOne() {
         prepareIndex();
         String body = "{\"size\":" + WINDOW + ",\"track_total_hits\":" + (DOCS + 5) + ",\"query\":" + fusedQuery(WINDOW) + "}";
 
@@ -241,6 +268,67 @@ public class HybridQueryFusedModeTotalHitsIT extends BaseNeuralSearchIT {
 
         assertEquals(DOCS, total(response).get("value"));
         assertEquals("eq", total(response).get("relation"));
+        // The count came from the legs (own counts minus overlap), not from a Tail: no round 2 fetched anything, where the
+        // Tail-kept twin (an aggregation keeps the Tail and refuses the fast path) fetches its page in round 2.
+        assertTrue("derived: fewer fetch ops than the Tail-kept twin", fetchOpsOf(body) < fetchOpsOf(withTailKept(body)));
+    }
+
+    /**
+     * A union smaller than the corpus, with legs that overlap partially: {@code place} (the 6 odd documents) and the
+     * document whose text carries the token {@code 3} (odd, so inside {@code place}). Union = 6. The derived count has to
+     * equal what the Tail-kept path (forced by a field-free aggregation) reports for the same request.
+     */
+    public void testTotalHits_whenLegsOverlapPartially_thenTheDerivedCountMatchesTheTailKeptPath() {
+        prepareIndex();
+        String legs = "[{\"term\":{\"" + TEXT_FIELD + "\":\"place\"}},{\"term\":{\"" + TEXT_FIELD + "\":\"3\"}}]";
+        String query = "{\"hybrid\":{\"fusion\":{\"window_size\":"
+            + WINDOW
+            + ",\"normalization\":{\"technique\":\"min_max\"},\"combination\":{\"technique\":\"arithmetic_mean\"}},\"queries\":"
+            + legs
+            + "}}";
+        String derived = "{\"size\":" + WINDOW + ",\"track_total_hits\":" + (DOCS + 5) + ",\"query\":" + query + "}";
+        String tailKept = "{\"size\":"
+            + WINDOW
+            + ",\"track_total_hits\":"
+            + (DOCS + 5)
+            + ",\"aggs\":{\"n\":{\"filter\":{\"match_all\":{}}}},\"query\":"
+            + query
+            + "}";
+
+        Map<String, Object> derivedResponse = search(derived);
+        Map<String, Object> tailKeptResponse = search(tailKept);
+
+        assertEquals(6, total(derivedResponse).get("value"));
+        assertEquals("eq", total(derivedResponse).get("relation"));
+        assertEquals(total(tailKeptResponse), total(derivedResponse));
+        assertTrue("derived: fewer fetch ops than the Tail-kept twin", fetchOpsOf(derived) < fetchOpsOf(tailKept));
+    }
+
+    /**
+     * Three legs — {@code hello} (all), {@code place} (odd), {@code there} (even) — every document counted once although
+     * {@code place} and {@code there} each sit entirely inside {@code hello}: union = DOCS, derived, no Tail.
+     */
+    public void testTotalHits_whenThreeLegsOverlap_thenTheUnionIsCountedOnceFromRoundOne() {
+        prepareIndex();
+        String legs = "[{\"match\":{\""
+            + TEXT_FIELD
+            + "\":\"hello\"}},{\"term\":{\""
+            + TEXT_FIELD
+            + "\":\"place\"}},{\"term\":{\""
+            + TEXT_FIELD
+            + "\":\"there\"}}]";
+        String query = "{\"hybrid\":{\"fusion\":{\"window_size\":"
+            + WINDOW
+            + ",\"normalization\":{\"technique\":\"min_max\"},\"combination\":{\"technique\":\"arithmetic_mean\"}},\"queries\":"
+            + legs
+            + "}}";
+        String body = "{\"size\":" + WINDOW + ",\"track_total_hits\":" + (DOCS + 5) + ",\"query\":" + query + "}";
+
+        Map<String, Object> response = search(body);
+
+        assertEquals(DOCS, total(response).get("value"));
+        assertEquals("eq", total(response).get("relation"));
+        assertTrue("derived: fewer fetch ops than the Tail-kept twin", fetchOpsOf(body) < fetchOpsOf(withTailKept(body)));
     }
 
     /**
@@ -287,6 +375,9 @@ public class HybridQueryFusedModeTotalHitsIT extends BaseNeuralSearchIT {
             )
         );
         assertEquals(
+            "no leg reaches the threshold: profiled legs carry no overlap aggregation (core's profile breakdown asserts on a profiled "
+                + "aggregating search), so the profiled request keeps the Tail — the unprofiled request derives the count, see the "
+                + "fetch-op tests",
             Boolean.TRUE,
             tailBuilt(
                 search(

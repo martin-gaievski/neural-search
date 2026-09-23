@@ -28,6 +28,7 @@ import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.query.AbstractQueryBuilder;
+import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.InnerHitContextBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
@@ -48,6 +49,10 @@ import org.opensearch.neuralsearch.search.profile.FusedCoordinatorTimings;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.SearchService;
+import org.opensearch.search.aggregations.Aggregation;
+import org.opensearch.search.aggregations.AggregationBuilders;
+import org.opensearch.search.aggregations.Aggregations;
+import org.opensearch.search.aggregations.bucket.SingleBucketAggregation;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.ScoreSortBuilder;
@@ -153,10 +158,141 @@ final class HybridFusionOrchestrator {
      */
     static MultiSearchRequest buildLegMultiSearch(CandidateScope scope, List<QueryBuilder> legs, int windowSize) {
         MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
-        for (QueryBuilder leg : legs) {
-            multiSearchRequest.add(scope.newLegRequest(leg, windowSize));
+        int[] countingOrder = scope.legUnionCountAllowed() ? unionCountOrder(legs) : null;
+        for (int legIndex = 0; legIndex < legs.size(); legIndex++) {
+            SearchRequest legRequest = scope.newLegRequest(legs.get(legIndex), windowSize);
+            if (Objects.nonNull(countingOrder)) {
+                attachUnionCountAggregation(legRequest.source(), legIndex, legs, countingOrder);
+            }
+            multiSearchRequest.add(legRequest);
         }
         return multiSearchRequest;
+    }
+
+    // ---- exact hits.total from round 1: leg counts + per-leg overlap with the later legs ----
+
+    /** Name of the aggregation on leg {@code i} that counts its matches also matched by a later leg (counting order). */
+    static final String UNION_COUNT_AGG_PREFIX = "_fusion_overlap_with_later_legs_";
+    /** Above this many legs the aggregation filters grow past what a leg should carry; the Tail counts instead. */
+    static final int MAX_LEGS_FOR_UNION_COUNT = 8;
+
+    /**
+     * The order in which the legs are counted for the union, or null when the legs cannot be counted this way. Every leg
+     * hosts one aggregation whose filter is the disjunction of the legs AFTER it in this order; the union is then the sum
+     * over legs of (own count − overlap with later legs), each document counted exactly once by the first leg (in this
+     * order) that matches it. ANN legs go first: their match set is {@code k} per shard, so the filter — the other legs'
+     * queries — is evaluated over at most that many documents on each shard, and the lexical legs that follow host filters
+     * over lexical legs only. Were a lexical leg to host an ANN leg in its filter, the filter would re-walk the HNSW graph on
+     * every shard — the very cost the Tail pays and this path exists to avoid.
+     *
+     * <p>Null when there is only one leg, too many, or any leg carries a {@code _name}: the filter would register that name
+     * on the hosting leg's hits and change what {@code matched_queries} the fast path reports, which the Tail-form
+     * name-carrying already handles exactly; such a request keeps counting the way it did.
+     */
+    static int[] unionCountOrder(List<QueryBuilder> legs) {
+        if (legs.size() < 2 || legs.size() > MAX_LEGS_FOR_UNION_COUNT) {
+            return null;
+        }
+        for (QueryBuilder leg : legs) {
+            if (carriesQueryName(leg)) {
+                return null;
+            }
+        }
+        int[] order = new int[legs.size()];
+        int next = 0;
+        for (int legIndex = 0; legIndex < legs.size(); legIndex++) {
+            if (isMaterializableLeg(legs.get(legIndex))) {
+                order[next++] = legIndex;
+            }
+        }
+        for (int legIndex = 0; legIndex < legs.size(); legIndex++) {
+            if (isMaterializableLeg(legs.get(legIndex)) == false) {
+                order[next++] = legIndex;
+            }
+        }
+        return order;
+    }
+
+    /**
+     * Adds to leg {@code legIndex}'s request the aggregation counting how many of its matches a LATER leg (counting order)
+     * also matches. The last leg in that order counts nothing beyond itself and carries no aggregation. Aggregation
+     * collection is not subject to the top-{@code size} pruning of the hit collector, so the count is exact.
+     */
+    static void attachUnionCountAggregation(SearchSourceBuilder legSource, int legIndex, List<QueryBuilder> legs, int[] countingOrder) {
+        int position = -1;
+        for (int i = 0; i < countingOrder.length; i++) {
+            if (countingOrder[i] == legIndex) {
+                position = i;
+            }
+        }
+        if (position < 0 || position == countingOrder.length - 1) {
+            return;
+        }
+        QueryBuilder laterLegs;
+        if (position == countingOrder.length - 2) {
+            laterLegs = legs.get(countingOrder[position + 1]);
+        } else {
+            BoolQueryBuilder anyLater = new BoolQueryBuilder().minimumShouldMatch(1);
+            for (int i = position + 1; i < countingOrder.length; i++) {
+                anyLater.should(legs.get(countingOrder[i]));
+            }
+            laterLegs = anyLater;
+        }
+        legSource.aggregation(AggregationBuilders.filter(UNION_COUNT_AGG_PREFIX + legIndex, laterLegs));
+    }
+
+    /**
+     * The exact size of the legs' union, from round 1 alone: for each leg in counting order, its own exact count minus
+     * the documents a later leg also matched (its overlap aggregation), summed. Null unless every leg's count is exact
+     * ({@code eq} — a leg at {@code gte} is the threshold proof's case, see {@link #totalHitsFromLegs}) and every hosting
+     * leg returned its aggregation; a union at or past the threshold is reported the way core reports a capped count,
+     * {@code {threshold, gte}}.
+     */
+    static TotalHits exactUnionFromLegs(
+        SearchSourceBuilder source,
+        MultiSearchResponse.Item[] items,
+        List<QueryBuilder> legs,
+        int windowSize
+    ) {
+        Integer threshold = legTotalHitsThreshold(source, windowSize);
+        if (Objects.isNull(threshold) || Objects.isNull(items) || items.length != legs.size()) {
+            return null;
+        }
+        int[] countingOrder = unionCountOrder(legs);
+        if (Objects.isNull(countingOrder)) {
+            return null;
+        }
+        long union = 0;
+        for (int position = 0; position < countingOrder.length; position++) {
+            int legIndex = countingOrder[position];
+            MultiSearchResponse.Item item = items[legIndex];
+            if (Objects.isNull(item) || Objects.isNull(item.getResponse()) || Objects.isNull(item.getResponse().getHits())) {
+                return null;
+            }
+            TotalHits own = item.getResponse().getHits().getTotalHits();
+            if (Objects.isNull(own) || own.relation() != TotalHits.Relation.EQUAL_TO) {
+                return null;
+            }
+            long onlyThisLeg = own.value();
+            if (position < countingOrder.length - 1) {
+                Aggregations aggregations = item.getResponse().getAggregations();
+                Aggregation overlap = Objects.isNull(aggregations) ? null : aggregations.get(UNION_COUNT_AGG_PREFIX + legIndex);
+                if ((overlap instanceof SingleBucketAggregation) == false) {
+                    return null;
+                }
+                onlyThisLeg -= ((SingleBucketAggregation) overlap).getDocCount();
+                if (onlyThisLeg < 0) {
+                    // The aggregation saw more of this leg's documents than the leg counted: the two ran against different
+                    // reader states. Nothing here is trustworthy; let the Tail count.
+                    return null;
+                }
+            }
+            union += onlyThisLeg;
+        }
+        if (union >= threshold) {
+            return new TotalHits(threshold, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+        }
+        return new TotalHits(union, TotalHits.Relation.EQUAL_TO);
     }
 
     /**
@@ -258,7 +394,7 @@ final class HybridFusionOrchestrator {
         timings.rankedDocs(ranked.ids().length);
         // Not armed, so nothing here depends on the verdict — but a profiled request's report of its unprofiled twin
         // still needs what the legs decided, read off the same answers the unprofiled twin would have had.
-        decideFastPathAfterLegs(timings.fastPath(), source, items, ranked, windowSize);
+        decideFastPathAfterLegs(timings.fastPath(), source, items, legs, ranked, windowSize);
         return buildSubstitute(source, items, legHits, ranked, legs, windowSize, timings, originalQuery, totalHitsConsumer);
     }
 
@@ -297,6 +433,9 @@ final class HybridFusionOrchestrator {
             && onlyTotalsNeedTheTail(source, ranked.ids().length)
             && namedAnnLegFilledTheWindow(legs, legHits, windowSize) == false) {
             derivedTotalHits = totalHitsFromLegs(source, legTotalHits(items), windowSize);
+            if (Objects.isNull(derivedTotalHits)) {
+                derivedTotalHits = exactUnionFromLegs(source, items, legs, windowSize);
+            }
             tailNeeded = Objects.isNull(derivedTotalHits);
         }
         if (Objects.nonNull(totalHitsConsumer)) {
@@ -1263,6 +1402,7 @@ final class HybridFusionOrchestrator {
         FastPathDecision decision,
         SearchSourceBuilder source,
         MultiSearchResponse.Item[] items,
+        List<QueryBuilder> legs,
         RankedDocs ranked,
         int windowSize
     ) {
@@ -1276,7 +1416,8 @@ final class HybridFusionOrchestrator {
         Integer trackTotalHitsUpTo = source.trackTotalHitsUpTo();
         boolean totalsDisabled = Objects.nonNull(trackTotalHitsUpTo) && trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_DISABLED;
         boolean countSettled = totalsDisabled
-            || Objects.nonNull(totalHitsForFastPath(source, ranked.ids().length, legTotalHits(items), windowSize));
+            || Objects.nonNull(totalHitsForFastPath(source, ranked.ids().length, legTotalHits(items), windowSize))
+            || Objects.nonNull(exactUnionFromLegs(source, items, legs, windowSize));
         decision.countSettled(countSettled);
         int pageEnd = requestedPageEnd(source);
         if (pageEnd > ranked.ids().length) {
@@ -1409,7 +1550,7 @@ final class HybridFusionOrchestrator {
         // The verdict is recorded on the timings' decision (the profile's account of it) and read back here, so the
         // report and the behaviour cannot disagree.
         FastPathDecision decision = Objects.nonNull(timings.fastPath()) ? timings.fastPath() : new FastPathDecision();
-        decideFastPathAfterLegs(decision, source, items, ranked, windowSize);
+        decideFastPathAfterLegs(decision, source, items, legs, ranked, windowSize);
         if (ranked.ids().length == 0) {
             // Nothing fused: match_none either way, and the consumers learn nothing was derived or assembled.
             if (Objects.nonNull(totalHitsConsumer)) {
@@ -1428,6 +1569,9 @@ final class HybridFusionOrchestrator {
         Integer trackTotalHitsUpTo = source.trackTotalHitsUpTo();
         boolean totalsDisabled = Objects.nonNull(trackTotalHitsUpTo) && trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_DISABLED;
         TotalHits totalHits = totalsDisabled ? null : totalHitsForFastPath(source, ranked.ids().length, legTotalHits(items), windowSize);
+        if (Objects.isNull(totalHits) && totalsDisabled == false) {
+            totalHits = exactUnionFromLegs(source, items, legs, windowSize);
+        }
         long assembleStart = System.nanoTime();
         SearchHits page = assemblePage(ranked, source, totalHits);
         timings.substituteBuildNanos(System.nanoTime() - assembleStart);

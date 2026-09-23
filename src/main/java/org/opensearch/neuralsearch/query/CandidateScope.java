@@ -564,6 +564,19 @@ final class CandidateScope {
     }
 
     /**
+     * Whether the legs may carry the union-count aggregation that lets the rewrite derive an EXACT {@code hits.total} from
+     * round 1 when no leg reaches the threshold (see {@code HybridFusionOrchestrator#exactUnionFromLegs}). Needs the legs
+     * to be counting in the first place, and a shape in which an aggregation on a leg counts the same documents the leg's
+     * own total counts: a {@code post_filter} applies to hits but not to aggregations, and a {@code slice} changes what a
+     * leg sees, so either keeps the Tail. Profiled legs carry no aggregation either: core's concurrent-segment profile
+     * breakdown asserts on a profiled search that also aggregates (a pre-existing core defect that takes a test node down),
+     * so a profiled request counts the way it did — the profile describes the Tail-kept path, not this one.
+     */
+    boolean legUnionCountAllowed() {
+        return Objects.nonNull(legTotalHitsThreshold) && Objects.isNull(postFilter) && Objects.isNull(slice) && legProfiling == false;
+    }
+
+    /**
      * Ask every leg built from here on to fetch the user's requested fields for the documents it returns, because the
      * response page will be assembled from the leg hits with no round 2 to fetch it — the fast path.
      *

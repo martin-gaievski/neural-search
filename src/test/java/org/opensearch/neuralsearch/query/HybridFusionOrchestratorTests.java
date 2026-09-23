@@ -45,6 +45,10 @@ import org.opensearch.neuralsearch.search.profile.FusedCoordinatorTimings;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.aggregations.AggregationBuilders;
+import org.opensearch.search.aggregations.InternalAggregation;
+import org.opensearch.search.aggregations.InternalAggregations;
+import org.opensearch.search.aggregations.bucket.InternalSingleBucketAggregation;
+import org.opensearch.search.aggregations.bucket.filter.FilterAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.collapse.CollapseBuilder;
 import org.opensearch.search.fetch.subphase.highlight.HighlightBuilder;
@@ -2516,4 +2520,204 @@ public class HybridFusionOrchestratorTests extends OpenSearchTestCase {
         assertNull(refusedEarly.fastPath().countSettled());
     }
 
+    // ---- L9: exact hits.total from round 1 (leg counts + overlap aggregations) ----
+
+    /** A stand-in for the {@code filter} aggregation's result: a single bucket with a document count. */
+    private static InternalAggregation overlapAggregation(String name, long docCount) {
+        return new InternalSingleBucketAggregation(name, docCount, InternalAggregations.EMPTY, Map.of()) {
+            @Override
+            protected InternalSingleBucketAggregation newAggregation(String n, long dc, InternalAggregations subAggregations) {
+                return overlapAggregationInternal(n, dc);
+            }
+
+            @Override
+            public String getWriteableName() {
+                return "test-overlap";
+            }
+        };
+    }
+
+    private static InternalSingleBucketAggregation overlapAggregationInternal(String name, long docCount) {
+        return (InternalSingleBucketAggregation) overlapAggregation(name, docCount);
+    }
+
+    /** A leg item with an exact ({@code eq}) or capped ({@code gte}) total and, optionally, its overlap aggregation. */
+    private MultiSearchResponse.Item countingLegItem(TotalHits total, InternalAggregation overlap) {
+        SearchHits searchHits = new SearchHits(new SearchHit[0], total, 1.0f);
+        InternalAggregations aggregations = overlap == null ? null : InternalAggregations.from(List.of(overlap));
+        SearchResponseSections sections = new SearchResponseSections(searchHits, aggregations, null, false, false, null, 0);
+        SearchResponse response = new SearchResponse(sections, null, 1, 1, 0, 10, ShardSearchFailure.EMPTY_ARRAY, null);
+        return new MultiSearchResponse.Item(response, null);
+    }
+
+    private static String overlapName(int legIndex) {
+        return HybridFusionOrchestrator.UNION_COUNT_AGG_PREFIX + legIndex;
+    }
+
+    public void testUnionCountOrder_annLegsFirst_refusedForOneLegOrNamedLegs() {
+        QueryBuilder lexical = new MatchQueryBuilder("text", "hello");
+        QueryBuilder ann = new KNNQueryBuilder("vec", new float[] { 1f, 2f }, 10);
+        QueryBuilder term = new TermQueryBuilder("text", "place");
+
+        assertArrayEquals(new int[] { 1, 0, 2 }, HybridFusionOrchestrator.unionCountOrder(List.of(lexical, ann, term)));
+        assertArrayEquals(new int[] { 0, 1 }, HybridFusionOrchestrator.unionCountOrder(List.of(lexical, term)));
+        assertNull("one leg has no union to count", HybridFusionOrchestrator.unionCountOrder(List.of(lexical)));
+        assertNull(
+            "a named leg would register its name from the filter",
+            HybridFusionOrchestrator.unionCountOrder(List.of(lexical, new TermQueryBuilder("text", "place").queryName("p")))
+        );
+    }
+
+    public void testBuildLegMultiSearch_countingLegsCarryOneOverlapAggregationEachExceptTheLast() {
+        QueryBuilder lexical = new MatchQueryBuilder("text", "hello");
+        QueryBuilder ann = new KNNQueryBuilder("vec", new float[] { 1f, 2f }, 10);
+        QueryBuilder term = new TermQueryBuilder("text", "place");
+        List<QueryBuilder> legs = List.of(lexical, ann, term);
+        CandidateScope scope = CandidateScope.from(new SearchRequest(INDEX).source(new SearchSourceBuilder().trackTotalHitsUpTo(500)));
+        scope.enableLegTotalHits(500);
+
+        MultiSearchRequest ms = HybridFusionOrchestrator.buildLegMultiSearch(scope, legs, 50);
+
+        // counting order is ann (1), lexical (0), term (2): ann hosts "lexical OR term", lexical hosts "term", term hosts nothing
+        FilterAggregationBuilder onAnn = (FilterAggregationBuilder) ms.requests()
+            .get(1)
+            .source()
+            .aggregations()
+            .getAggregatorFactories()
+            .iterator()
+            .next();
+        assertEquals(overlapName(1), onAnn.getName());
+        assertTrue(onAnn.getFilter() instanceof BoolQueryBuilder);
+        assertEquals(List.of(lexical, term), ((BoolQueryBuilder) onAnn.getFilter()).should());
+        assertEquals("1", ((BoolQueryBuilder) onAnn.getFilter()).minimumShouldMatch());
+        FilterAggregationBuilder onLexical = (FilterAggregationBuilder) ms.requests()
+            .get(0)
+            .source()
+            .aggregations()
+            .getAggregatorFactories()
+            .iterator()
+            .next();
+        assertEquals(overlapName(0), onLexical.getName());
+        assertEquals(term, onLexical.getFilter());
+        assertNull("the last leg in counting order counts nothing beyond itself", ms.requests().get(2).source().aggregations());
+        for (SearchRequest leg : ms.requests()) {
+            assertEquals("the legs still count to the threshold", Integer.valueOf(500), leg.source().trackTotalHitsUpTo());
+        }
+    }
+
+    public void testBuildLegMultiSearch_noOverlapAggregationWithoutLegCounting_orWithAPostFilter() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+
+        MultiSearchRequest notCounting = HybridFusionOrchestrator.buildLegMultiSearch(
+            CandidateScope.from(new SearchRequest(INDEX)),
+            legs,
+            50
+        );
+        for (SearchRequest leg : notCounting.requests()) {
+            assertNull(leg.source().aggregations());
+        }
+
+        CandidateScope postFiltered = CandidateScope.from(
+            new SearchRequest(INDEX).source(new SearchSourceBuilder().trackTotalHitsUpTo(500).postFilter(new TermQueryBuilder("text", "x")))
+        );
+        postFiltered.enableLegTotalHits(500);
+        assertFalse(postFiltered.legUnionCountAllowed());
+        for (SearchRequest leg : HybridFusionOrchestrator.buildLegMultiSearch(postFiltered, legs, 50).requests()) {
+            assertNull("a post_filter applies to hits but not to aggregations, so the counts would disagree", leg.source().aggregations());
+        }
+    }
+
+    public void testExactUnionFromLegs_twoLegs_isOwnPlusOtherMinusOverlap() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        SearchSourceBuilder source = new SearchSourceBuilder().trackTotalHitsUpTo(10_000);
+        // |hello| = 4899, |place| = 2000, |hello ∩ place| = 1494 → 5405
+        MultiSearchResponse.Item[] items = {
+            countingLegItem(eq(4899), overlapAggregation(overlapName(0), 1494)),
+            countingLegItem(eq(2000), null) };
+
+        assertEquals(
+            new TotalHits(5405, TotalHits.Relation.EQUAL_TO),
+            HybridFusionOrchestrator.exactUnionFromLegs(source, items, legs, 100)
+        );
+    }
+
+    public void testExactUnionFromLegs_threeLegs_countsEachDocumentOnceInCountingOrder() {
+        QueryBuilder lexical = new MatchQueryBuilder("text", "hello");
+        QueryBuilder ann = new KNNQueryBuilder("vec", new float[] { 1f, 2f }, 10);
+        QueryBuilder term = new TermQueryBuilder("text", "place");
+        List<QueryBuilder> legs = List.of(lexical, ann, term);
+        SearchSourceBuilder source = new SearchSourceBuilder().trackTotalHitsUpTo(10_000);
+        // counting order ann(1), lexical(0), term(2): ann 800 of which 300 also in lexical-or-term; lexical 1200 of which 200
+        // also in term; term 500 → 500 + 1000 + 500 = 2000
+        MultiSearchResponse.Item[] items = {
+            countingLegItem(eq(1200), overlapAggregation(overlapName(0), 200)),
+            countingLegItem(eq(800), overlapAggregation(overlapName(1), 300)),
+            countingLegItem(eq(500), null) };
+
+        assertEquals(
+            new TotalHits(2000, TotalHits.Relation.EQUAL_TO),
+            HybridFusionOrchestrator.exactUnionFromLegs(source, items, legs, 100)
+        );
+    }
+
+    public void testExactUnionFromLegs_atOrPastTheThreshold_reportsTheCappedCount() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        SearchSourceBuilder source = new SearchSourceBuilder().trackTotalHitsUpTo(5000);
+        MultiSearchResponse.Item[] items = {
+            countingLegItem(eq(4899), overlapAggregation(overlapName(0), 1494)),
+            countingLegItem(eq(2000), null) };
+
+        assertEquals(
+            new TotalHits(5000, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO),
+            HybridFusionOrchestrator.exactUnionFromLegs(source, items, legs, 100)
+        );
+    }
+
+    public void testExactUnionFromLegs_refusesInexactCounts_missingAggregations_andImpossibleOverlaps() {
+        List<QueryBuilder> legs = List.of(new MatchQueryBuilder("text", "hello"), new TermQueryBuilder("text", "place"));
+        SearchSourceBuilder source = new SearchSourceBuilder().trackTotalHitsUpTo(10_000);
+
+        assertNull(
+            "a capped leg count is the threshold proof's case, not this one",
+            HybridFusionOrchestrator.exactUnionFromLegs(
+                source,
+                new MultiSearchResponse.Item[] {
+                    countingLegItem(gte(10_000), overlapAggregation(overlapName(0), 5)),
+                    countingLegItem(eq(3), null) },
+                legs,
+                100
+            )
+        );
+        assertNull(
+            "no aggregation on a hosting leg",
+            HybridFusionOrchestrator.exactUnionFromLegs(
+                source,
+                new MultiSearchResponse.Item[] { countingLegItem(eq(10), null), countingLegItem(eq(3), null) },
+                legs,
+                100
+            )
+        );
+        assertNull(
+            "overlap larger than the leg's own count: inconsistent readers",
+            HybridFusionOrchestrator.exactUnionFromLegs(
+                source,
+                new MultiSearchResponse.Item[] {
+                    countingLegItem(eq(10), overlapAggregation(overlapName(0), 11)),
+                    countingLegItem(eq(3), null) },
+                legs,
+                100
+            )
+        );
+        assertNull(
+            "totals disabled: nothing to derive",
+            HybridFusionOrchestrator.exactUnionFromLegs(
+                new SearchSourceBuilder().trackTotalHits(false),
+                new MultiSearchResponse.Item[] {
+                    countingLegItem(eq(10), overlapAggregation(overlapName(0), 1)),
+                    countingLegItem(eq(3), null) },
+                legs,
+                100
+            )
+        );
+    }
 }
