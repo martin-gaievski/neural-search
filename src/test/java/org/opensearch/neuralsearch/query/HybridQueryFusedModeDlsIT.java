@@ -58,6 +58,10 @@ public class HybridQueryFusedModeDlsIT extends BaseNeuralSearchIT {
     private static final String USER_NAME = "fused_hybrid_dls_test_user";
     private static final String USER_PASSWORD = "FusedHybridDlsTest1!";
     private static final String DLS_QUERY_JSON = "{\\\"term\\\":{\\\"access\\\":\\\"allowed\\\"}}";
+    /** FLS: a role that may read the index but never the {@code secret} field; the leg-assembled page must honour it too. */
+    private static final String FLS_ROLE_NAME = "fused_hybrid_fls_test_role";
+    private static final String FLS_USER_NAME = "fused_hybrid_fls_test_user";
+    private static final String SECRET_FIELD = "secret";
 
     /** Ids chosen so the allowed set's lexicographic order ("1","10","11","12","2","3") differs from insertion order. */
     private static final Set<String> ALLOWED_IDS = Set.of("1", "2", "3", "10", "11", "12");
@@ -110,6 +114,25 @@ public class HybridQueryFusedModeDlsIT extends BaseNeuralSearchIT {
                 String.format(Locale.ROOT, "{\"password\": \"%s\", \"opendistro_security_roles\": [\"%s\"]}", USER_PASSWORD, ROLE_NAME)
             )
         );
+        assertCreatedOrOk(adminRequest("PUT", "/_plugins/_security/api/roles/" + FLS_ROLE_NAME, String.format(Locale.ROOT, """
+            {
+              "cluster_permissions": ["indices:data/read/msearch"],
+              "index_permissions": [
+                {
+                  "index_patterns": ["%s"],
+                  "allowed_actions": ["read"],
+                  "fls": ["~%s"]
+                }
+              ]
+            }
+            """, INDEX_NAME, SECRET_FIELD)));
+        assertCreatedOrOk(
+            adminRequest(
+                "PUT",
+                "/_plugins/_security/api/internalusers/" + FLS_USER_NAME,
+                String.format(Locale.ROOT, "{\"password\": \"%s\", \"opendistro_security_roles\": [\"%s\"]}", USER_PASSWORD, FLS_ROLE_NAME)
+            )
+        );
     }
 
     @After
@@ -121,6 +144,8 @@ public class HybridQueryFusedModeDlsIT extends BaseNeuralSearchIT {
         for (String endpoint : List.of(
             "/_plugins/_security/api/internalusers/" + USER_NAME,
             "/_plugins/_security/api/roles/" + ROLE_NAME,
+            "/_plugins/_security/api/internalusers/" + FLS_USER_NAME,
+            "/_plugins/_security/api/roles/" + FLS_ROLE_NAME,
             "/_search/pipeline/" + PIPELINE_NAME,
             "/" + INDEX_NAME
         )) {
@@ -284,6 +309,99 @@ public class HybridQueryFusedModeDlsIT extends BaseNeuralSearchIT {
         assertTrue("hits stay inside the DLS scope", ALLOWED_IDS.containsAll(hitIds(restricted)));
     }
 
+    /**
+     * FLS on the leg-assembled page. In leg-only mode the page's {@code _source} is what the legs fetched on the shards,
+     * where the Security plugin applies FLS — so the excluded field must be absent there exactly as it is in round 2's
+     * fetch, and asking for it by name must not bring it back. Admin sees it on both paths (the control).
+     */
+    public void testFusedFastPathAndTwoRounds_whenFlsRestrictedUser_thenExcludedFieldNeverReachesThePage() {
+        for (String extras : List.of(
+            // leg-only: no count, page inside the window, whole source
+            "\"size\": 6, \"track_total_hits\": false, \"_source\": true",
+            // leg-only, asking for the excluded field by name
+            "\"size\": 6, \"track_total_hits\": false, \"_source\": [\"" + SECRET_FIELD + "\", \"text\"]",
+            // round 2 (exact totals need the Tail), whole source
+            "\"size\": 6, \"track_total_hits\": true, \"_source\": true"
+        )) {
+            String body = fusedBody(12, extras, "{\"term\": {\"tag\": \"same\"}}", "{\"term\": {\"tag2\": \"same\"}}");
+            Map<String, Object> restricted = searchAs(body, FLS_USER_NAME, false);
+            assertNoFailedShards(restricted);
+            assertFalse("the FLS user still gets a page: " + extras, hitIds(restricted).isEmpty());
+            for (Map<String, Object> hit : asList(hits(restricted).get("hits"))) {
+                Map<String, Object> source = asMap(hit.get("_source"));
+                assertNotNull("hit carries a _source: " + extras, source);
+                assertFalse("[" + extras + "] excluded field reached the page in hit " + hit.get("_id"), source.containsKey(SECRET_FIELD));
+            }
+            Map<String, Object> admin = searchAs(body, null, false);
+            assertTrue(
+                "control: admin sees the field on the same path: " + extras,
+                asList(hits(admin).get("hits")).stream().allMatch(hit -> asMap(hit.get("_source")).containsKey(SECRET_FIELD))
+            );
+        }
+    }
+
+    /**
+     * Nesting depth: a fused hybrid whose leg is itself a fused hybrid. The inner one is executed once as its parent's leg
+     * sub-search and appears in round 2's Tail as the union of its own legs; neither path may widen the DLS scope.
+     */
+    public void testNestedFusedHybrid_whenDlsRestrictedUser_thenBothPathsStayInScope() {
+        String inner = fusedQuery(12, "{\"term\": {\"tag\": \"same\"}}", "{\"match\": {\"text\": \"hello\"}}");
+        for (String extras : List.of(
+            "\"size\": 12, \"track_total_hits\": false, \"_source\": true",
+            "\"size\": 12, \"track_total_hits\": true, \"_source\": true"
+        )) {
+            String body = fusedBody(12, extras, inner, "{\"term\": {\"tag2\": \"same\"}}");
+            Map<String, Object> restricted = search(body, true, false);
+            assertHitIdSet(restricted, ALLOWED_IDS);
+            assertHitIdSet(search(body, false, false), ALL_IDS);
+        }
+    }
+
+    /**
+     * Tail present: a page that reaches beyond the fused window is finished by round 2's Tail (the union of the legs,
+     * unscored) when a count is wanted. Under DLS the Tail runs on the shards under the user's context too, so the page it
+     * completes must hold only visible documents and exactly as many as the user can see. Without a count the Tail is
+     * dropped and the page is capped at the window (measured: 3 of the 6 visible documents) — the "round 2 without a Tail"
+     * mode — and it cannot widen the scope either.
+     */
+    public void testFusedWithTail_whenDlsRestrictedUserAndPageBeyondWindow_thenTailFillsOnlyWithVisibleDocuments() {
+        String withTail = fusedBody(
+            3,
+            "\"size\": 12, \"track_total_hits\": true, \"_source\": true",
+            "{\"term\": {\"tag\": \"same\"}}",
+            "{\"term\": {\"tag2\": \"same\"}}"
+        );
+        assertHitIdSet(search(withTail, true, false), ALLOWED_IDS);
+        assertHitIdSet(search(withTail, false, false), ALL_IDS);
+
+        String tailDropped = fusedBody(
+            3,
+            "\"size\": 12, \"track_total_hits\": false, \"_source\": true",
+            "{\"term\": {\"tag\": \"same\"}}",
+            "{\"term\": {\"tag2\": \"same\"}}"
+        );
+        Map<String, Object> restricted = search(tailDropped, true, false);
+        assertNoFailedShards(restricted);
+        assertEquals("without a count the page is the window", 3, hitIds(restricted).size());
+        assertTrue("and every document in it is visible", ALLOWED_IDS.containsAll(hitIds(restricted)));
+    }
+
+    /** A fused hybrid as a query clause, for nesting inside another one. */
+    private String fusedQuery(int windowSize, String... legs) {
+        return String.format(Locale.ROOT, """
+            {
+              "hybrid": {
+                "fusion": {
+                  "window_size": %d,
+                  "normalization": { "technique": "min_max" },
+                  "combination": { "technique": "arithmetic_mean" }
+                },
+                "queries": [%s]
+              }
+            }
+            """, windowSize, String.join(",", legs));
+    }
+
     private String fusedBody(int windowSize, String extras, String... legs) {
         return String.format(Locale.ROOT, """
             {
@@ -319,6 +437,7 @@ public class HybridQueryFusedModeDlsIT extends BaseNeuralSearchIT {
                   "group": { "type": "keyword" },
                   "tag": { "type": "keyword" },
                   "tag2": { "type": "keyword" },
+                  "secret": { "type": "keyword" },
                   "text": { "type": "text" }
                 }
               }
@@ -336,9 +455,10 @@ public class HybridQueryFusedModeDlsIT extends BaseNeuralSearchIT {
                     "/" + INDEX_NAME + "/_doc/" + id,
                     String.format(
                         Locale.ROOT,
-                        "{\"access\": \"%s\", \"group\": \"%s\", \"tag\": \"same\", \"tag2\": \"same\", \"text\": \"%s\"}",
+                        "{\"access\": \"%s\", \"group\": \"%s\", \"tag\": \"same\", \"tag2\": \"same\", \"secret\": \"s-%s\", \"text\": \"%s\"}",
                         access,
                         group,
+                        id,
                         text
                     )
                 )
@@ -349,14 +469,20 @@ public class HybridQueryFusedModeDlsIT extends BaseNeuralSearchIT {
 
     @SneakyThrows
     private Map<String, Object> search(String requestBody, boolean asDlsUser, boolean withPipeline) {
+        return searchAs(requestBody, asDlsUser ? USER_NAME : null, withPipeline);
+    }
+
+    /** {@code user == null} runs as the admin the test framework's client authenticates as. */
+    @SneakyThrows
+    private Map<String, Object> searchAs(String requestBody, String user, boolean withPipeline) {
         Request request = new Request("POST", "/" + INDEX_NAME + "/_search");
         if (withPipeline) {
             request.addParameter("search_pipeline", PIPELINE_NAME);
         }
         request.setJsonEntity(requestBody);
-        if (asDlsUser) {
+        if (user != null) {
             RequestOptions.Builder options = RequestOptions.DEFAULT.toBuilder();
-            String credentials = USER_NAME + ":" + USER_PASSWORD;
+            String credentials = user + ":" + USER_PASSWORD;
             options.addHeader(
                 HttpHeaders.AUTHORIZATION,
                 "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8))
